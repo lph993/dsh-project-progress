@@ -196,7 +196,26 @@
  * 代码"—— 而那正是这个数存在的唯一理由（见文件头）。所以这里恢复到"一个批号 = 一份可辨认
  * 的产物"：运行中的宿主仍是 72，重启后应看到 **73**。
  */
-export const HOST_BATCH = 73;
+/**
+ * ## 批次 74 的用途
+ *
+ * **骨架预算按顶层目录公平分配 + 如实报告截断**（承接批次 73）。
+ *
+ * 批次 73 把各生态的非代码产物排掉之后，真机上的树确实反映真项目了；但量下来仍有
+ * **6 个顶层目录一条都没进模型**（`server`/`docs`/`prototypes`/`review`/`scripts`/`uper`）——
+ * 因为 `collectSkeleton` 是"谁先被走到谁吃满"：`aitest`（2.3 万文件）+ `nrfunc`
+ * 吃掉了 **92%** 的预算（实测：800 条里 aitest 493、nrfunc 242）。
+ * 模型看不到的区域，树上当然不会有 —— 那不是判断错误，是**输入缺失**。
+ *
+ * 本批两处：
+ * 1. `allocateFairly()`：先给每个顶层保底 `floor(预算/顶层数)`，剩余**轮转**分配
+ *    （刻意不按体量比例 —— 体量大的已经靠"条目多"占过便宜了），任何项目都不会因为
+ *    某个子树特别大而整片消失。
+ * 2. `collectSkeleton` 带出 `coverage` 与 `droppedTops`，`collectAiSkeleton` 用
+ *    `debugBus.warn` 如实报告"哪些顶层没进模型"（走 FR-174 的警示通道 →
+ *    看板 alerts 与 `/pm/debug` 报同一个数）。
+ */
+export const HOST_BATCH = 74;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

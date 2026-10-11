@@ -6017,6 +6017,8 @@ export class ProjectService {
     truncated: boolean;
     skipped: number;
     projectName: string;
+    /** 有内容却一条都没进骨架的顶层目录（截断时如实带给上层）。 */
+    droppedTops: string[];
   }> {
     const walked = await scanWorkspaceEntries({
       root,
@@ -6034,6 +6036,21 @@ export class ProjectService {
     const collected = await collectSkeleton({ root, entries: walked.entries });
     if (collected.unreadable.length > 0) {
       debugBus.warn('ai', `有 ${collected.unreadable.length} 个关键文件读不到签名（已如实跳过）`);
+    }
+    /**
+     * **如实报告骨架截断**（FR-174 的警示通道 → 看板 alerts 与 `/pm/debug` 同一个数）。
+     *
+     * 为什么必须报：骨架被截断时，没进模型的顶层目录对模型**根本不存在**，
+     * 建出来的树上当然不会有它们。不报的话，用户看到"树里没有 server/"只能猜是模型判断错了
+     * （真机现场就是这么误判的 —— 实际上是 `aitest` + `nrfunc` 吃掉了 92% 的预算）。
+     */
+    if (collected.droppedTops.length > 0) {
+      debugBus.warn(
+        'ai',
+        `骨架被截断：${collected.droppedTops.length} 个顶层目录一条都没进模型` +
+          `（${collected.droppedTops.join('、')}）—— 建出来的树不会有它们。` +
+          '可用设置页的 scanExclude 收窄范围，或把不重要的子树排掉后重跑。',
+      );
     }
     const projectName = walked.packageName ?? walked.rootDirName;
     /**
@@ -6057,6 +6074,7 @@ export class ProjectService {
       truncated: collected.truncated,
       skipped: walked.skipped,
       projectName,
+      droppedTops: collected.droppedTops,
     };
   }
 
