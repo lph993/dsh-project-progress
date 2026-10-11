@@ -15,6 +15,7 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values';
 
 import type { ProjectService, ApplyResult } from '../service.ts';
 import type { SelfState } from '../shared/types.ts';
+import { refsFromPaths } from '../domain/identity.ts';
 import { describeConsolidation, planConsolidation } from '../domain/consolidate.ts';
 
 /** 工具返回的文本上限（FR-74：不污染模型上下文）。 */
@@ -171,6 +172,13 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             description: '功能点或任务点；默认 task',
           },
           description: { type: 'string', description: '详细说明（名称之外的说明放这里）' },
+          refs: {
+            type: 'array',
+            description:
+              '这个节点负责的工作区相对路径（目录或文件，含点视为文件）。**盲区提醒要求的正是它**：' +
+              '本回合改动的文件若不属于任何节点，就该建节点并把 refs 指过去 —— 否则下次还会被提醒（死循环）。',
+            items: { type: 'string' },
+          },
           addedMidway: { type: 'boolean', description: '是否标记为中途新增' },
         },
         output: {
@@ -185,6 +193,9 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             name: args.name,
             ...(args.kind !== undefined ? { kind: args.kind as 'feature' | 'task' } : {}),
             ...(args.description !== undefined ? { description: args.description } : {}),
+            ...(Array.isArray(args.refs) && args.refs.length > 0
+              ? { refs: refsFromPaths(args.refs as string[]) }
+              : {}),
             ...(args.addedMidway !== undefined ? { addedMidway: args.addedMidway } : {}),
             by: caller.by,
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
@@ -455,8 +466,9 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
       defineTool({
         name: 'pm_progress',
         description:
-          '推进节点进度或自身状态。注意：父节点不可写自身状态（会被拒绝），请改门控或子节点；' +
-          '已完成节点回退需要 force 且来源为 user。携带 rev 做 CAS，陈旧会返回最新 rev。',
+          '推进节点进度或自身状态；也可以用它**补/改节点的 refs**。注意：父节点不可写自身状态' +
+          '（会被拒绝），请改门控或子节点；已完成节点回退需要 force 且来源为 user。携带 rev 做 CAS，' +
+          '陈旧会返回最新 rev。',
         parameters: {
           nodeId: { type: 'string', required: true, description: '节点 id' },
           progress: { type: 'number', description: '自身完成度 0–1' },
@@ -464,6 +476,13 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             type: 'string',
             enum: ['pending', 'running', 'done', 'error'],
             description: '自身状态',
+          },
+          refs: {
+            type: 'array',
+            description:
+              '替换该节点的 refs（工作区相对路径，含点视为文件）。用于给**已有的**无 refs 节点补上归属；' +
+              '改完会重算身份键，若与别的活节点同身份会**拒绝**（避免造重复节点）。',
+            items: { type: 'string' },
           },
           rev: { type: 'number', description: 'CAS 版本号（从上次读取获得）' },
           force: { type: 'boolean', description: '回退/重开时需要（仅 user 来源有效）' },
@@ -476,6 +495,25 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         async execute(args, exec) {
           const sessionId = withRoot(exec);
           const caller = callerOf(exec);
+          /**
+           * refs 先写：它走的是**带查重**的专用路径（`updateRefs`），不是裸 patch。
+           * 只给 refs 不给进度时，这就等于"只补归属、不动数字"。
+           */
+          let refsResult: ApplyResult | undefined;
+          if (Array.isArray(args.refs) && args.refs.length > 0) {
+            refsResult = await service.updateRefs({
+              nodeId: args.nodeId,
+              paths: args.refs as string[],
+              by: caller.by,
+              ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+              ...(sessionId !== undefined ? { sessionId } : {}),
+            });
+            if (refsResult.status !== 'ok') return refsResult as unknown as JsonValue;
+          }
+          if (args.progress === undefined && args.selfState === undefined) {
+            // 只改 refs：把那次写入的结果原样返回
+            return (refsResult ?? { status: 'denied', reason: 'validation', code: 'E_NOTHING_TO_DO', message: '既没有 progress/selfState，也没有 refs' }) as unknown as JsonValue;
+          }
           const result = await service.progress({
             nodeId: args.nodeId,
             ...(args.progress !== undefined ? { progress: args.progress } : {}),

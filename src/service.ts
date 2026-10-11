@@ -55,6 +55,7 @@ import {
   findReusableNode,
   identityKeyOf,
   keyOfExisting,
+  refsFromPaths,
   refTokensOf,
   type IdentityNode,
 } from './domain/identity.ts';
@@ -1888,6 +1889,83 @@ export class ProjectService {
     } finally {
       endOperation();
     }
+  }
+
+  /**
+   * **补 / 改节点的 `refs`**（`pm_add` 与 `pm_progress` 的 refs 通道）。
+   *
+   * ## 为什么必须有这条路
+   *
+   * 插件的盲区提醒会告诉模型：「本回合改动的这些文件不属于任何已有节点…… 请用 `pm_add`
+   * 建一个（放在合适的枝下，**并把 refs 指向这些路径**）」。但在 2026-10-11 之前，
+   * **32 个工具里没有任何一个能设置 refs**：refs 只能由 AI 建树提议。于是那条提醒要求的是
+   * 一个**做不到**的动作 —— 检测出来 → 做不到 → 下一回合再报，永远闭环不了。
+   * 真机现场（本仓库自己的看板）：`pm_add` 建的中途节点**一个 refs 都没有**，
+   * 盲区提示反复出现 `.pm/commit-msg.txt` 之类的路径。
+   *
+   * ## 安全：refs 参与身份键，所以**不裸 patch**
+   *
+   * `identityKeyOf` 由 refs 派生（目录引用优先）。改了 refs 就可能与另一个节点**同身份** ——
+   * 那正是 FR-158 花力气避免的重复节点。所以这里先算新身份，**撞上别的活节点就拒绝并说清
+   * 撞的是谁**（要合并走 `pm_consolidate`）；不撞才连同新身份一起写回
+   * （否则会留下过期的 `identity`，让下次建树认错节点）。
+   */
+  async updateRefs(input: {
+    nodeId: string;
+    paths: readonly string[];
+    by?: 'user' | 'session' | 'subagent' | 'job';
+    actorId?: string;
+    sessionId?: string;
+  }): Promise<ApplyResult> {
+    await this.bindForCall(input.sessionId);
+    const { graph, derived } = await this.derive(input.sessionId);
+    const node = graph.nodes[input.nodeId];
+    if (node === undefined || derived.nodes.get(input.nodeId)?.derivedState === 'removed') {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_NOT_FOUND',
+        message: `节点 ${input.nodeId} 不存在`,
+      };
+    }
+
+    // 归一化 + 去重 + 判类型（转换规则只有一份：`refsFromPaths`，与身份键口径一致）
+    const refs = refsFromPaths(input.paths);
+    if (refs.length === 0) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_EMPTY_REFS',
+        message: 'refs 归一化后为空（路径都非法或重复），没有可写的内容',
+      };
+    }
+
+    const nextIdentity = identityKeyOf({ name: node.name, refs });
+    const clash = [...derived.nodes.values()].find(
+      (entry) =>
+        entry.node.id !== input.nodeId &&
+        entry.derivedState !== 'removed' &&
+        identityKeyOf({ name: entry.node.name, refs: entry.node.refs }) === nextIdentity,
+    );
+    if (clash !== undefined) {
+      return {
+        status: 'denied',
+        reason: 'validation',
+        code: 'E_IDENTITY_CLASH',
+        message:
+          `改完 refs 会与节点「${clash.node.name}」同身份（${nextIdentity}）—— 没有写入，避免造重复节点`,
+        hint: '要合并这两个节点用 pm_consolidate；要删一个用 pm_remove。',
+      };
+    }
+
+    return this.patchNode({
+      nodeId: input.nodeId,
+      patch: { refs, identity: nextIdentity },
+      by: input.by ?? 'session',
+      ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+      reason: '补/改 refs（盲区提醒的闭环动作）',
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+    });
   }
 
   /** 推进进度/状态（`pm_progress`）。 */

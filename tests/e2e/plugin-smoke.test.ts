@@ -5040,3 +5040,89 @@ test('二次装配：卸载后再 apply 一次必须成功（HMR partialReload �
   assert.ok(routes.length >= 1, '二次装配后 /pm 路由必须重新注册');
   ctx.disposeAll();
 });
+
+/**
+ * **refs 的写入通道**（2026-10-11 补）。
+ *
+ * ## 现场
+ *
+ * 插件的盲区提醒原文是：「本回合改动的这些文件**不属于任何已有节点**……请用 `pm_add`
+ * 建一个（放在合适的枝下，**并把 refs 指向这些路径**）」。可在这之前，
+ * **32 个工具里没有任何一个能设置 refs** —— refs 只能由 AI 建树提议。
+ * 于是那条提醒要求的是一个**做不到**的动作：检测出来 → 做不到 → 下一回合再报，
+ * 永远闭环不了（本仓库自己的看板上，中途建的节点一个 refs 都没有）。
+ *
+ * ## 判据
+ *
+ * ① `pm_add` 能带 refs 建节点（正是提醒里承诺的动作）；
+ * ② `pm_progress` 能给**已存在**的节点补/改 refs；
+ * ③ 改 refs 会重算身份键，**与别的活节点同身份就拒绝**（FR-158：不造重复节点）。
+ */
+test('refs 写入通道：pm_add 能带 refs、pm_progress 能补 refs、同身份会拒绝', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-refs-'));
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    nodeView(id: string): Promise<{ refs?: Array<{ type: string; target: string }> } | undefined>;
+  };
+  type Tool = {
+    execute(args: Record<string, unknown>, exec: unknown): Promise<Record<string, unknown>>;
+  };
+  const toolDefs = ctx.toolDefs as Map<string, Tool>;
+  const tool = (name: string): Tool => {
+    const found = toolDefs.get(name);
+    assert.ok(found, `${name} 应已注册`);
+    return found;
+  };
+  const exec = {
+    agent: { id: 'session-refs', session: { header: { cwd: workspace } } },
+    callId: 'e2e',
+  };
+
+  // ① pm_add 带 refs 建节点（目录 + 文件；重复路径要去重）
+  const added = await tool('pm_add').execute(
+    { name: '带引用的节点', refs: ['src/ai', 'src/ai/skeleton.ts', 'src/ai'] },
+    exec,
+  );
+  assert.equal(added['status'], 'ok', JSON.stringify(added));
+  const nodeId = added['nodeId'] as string;
+  assert.deepEqual(
+    (await service.nodeView(nodeId))?.refs?.map((ref) => [ref.type, ref.target]),
+    [
+      ['dir', 'src/ai'],
+      ['code', 'src/ai/skeleton.ts'],
+    ],
+    '目录/文件要判对、重复路径要去重',
+  );
+
+  // ② 另建一个无 refs 的节点，再用 pm_progress 补 refs（"只补归属、不动数字"）
+  const bare = await tool('pm_add').execute({ name: '本来没有引用' }, exec);
+  const bareId = bare['nodeId'] as string;
+  assert.equal((await service.nodeView(bareId))?.refs, undefined, '前置：它本来没有 refs');
+  const patched = await tool('pm_progress').execute({ nodeId: bareId, refs: ['src/tools'] }, exec);
+  assert.equal(patched['status'], 'ok', JSON.stringify(patched));
+  assert.deepEqual(
+    (await service.nodeView(bareId))?.refs?.map((ref) => ref.target),
+    ['src/tools'],
+  );
+
+  // ③ 同身份要拒绝：把 bare 的 refs 改成与第一个节点**路径集合完全相同**
+  const clash = await tool('pm_progress').execute(
+    { nodeId: bareId, refs: ['src/ai', 'src/ai/skeleton.ts'] },
+    exec,
+  );
+  assert.equal(clash['status'], 'denied', JSON.stringify(clash));
+  assert.equal(clash['code'], 'E_IDENTITY_CLASH');
+  assert.deepEqual(
+    (await service.nodeView(bareId))?.refs?.map((ref) => ref.target),
+    ['src/tools'],
+    '被拒时不得改动已有 refs（不是"改了一半"）',
+  );
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});

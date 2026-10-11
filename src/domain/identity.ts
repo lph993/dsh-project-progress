@@ -44,6 +44,27 @@ export function normalizeRefPath(target: string): string {
 }
 
 /**
+ * 把一串工作区相对路径转成 `Ref[]`：归一化 → 去重 → 判类型。
+ *
+ * 判类型沿用 {@link identityKeyOf} 的口径（**含 `.` 视为文件，否则视为目录**）：
+ * 两处必须一致，否则会出现"身份键当它是目录、refs 说它是文件"的自相矛盾。
+ *
+ * 为什么单独成一个函数：`pm_add` / `pm_progress` 的 refs 通道与服务端写路径都要用它 ——
+ * 各写一份转换规则迟早漂。
+ */
+export function refsFromPaths(paths: readonly string[]): Ref[] {
+  const refs: Ref[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    const path = normalizeRefPath(raw);
+    if (path === '' || seen.has(path)) continue;
+    seen.add(path);
+    refs.push({ type: path.includes('.') ? 'code' : 'dir', target: path });
+  }
+  return refs;
+}
+
+/**
  * 一个节点的**身份键**（FR-158）——由 `refs` 路径派生。
  *
  * 优先级：① 目录引用（功能点最自然的身份）→ ② 文件引用 → ③ 名称兜底。
