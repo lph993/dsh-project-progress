@@ -107,16 +107,33 @@ function fakeBoard(): BoardSnapshot {
 
 const failures: string[] = [];
 
-function check(label: string, render: () => string, expectText?: string): void {
+/**
+ * 跑一条渲染用例。
+ *
+ * `expect` 支持两种写法，且**向后兼容**老的纯字符串调用：
+ * - `expect`：字符串（必须出现）/ `string[]`（都必须出现）/ `undefined`（只要求能渲染）；
+ * - `expectAbsent`：不该出现的文本。用于钉"条件不成立时不要多渲染一块"——
+ *   这类断言以前写不出来，于是"每张卡都挂一句提示"这种错会悄悄溜过去。
+ */
+function check(label: string, render: () => string, expect?: string | string[], expectAbsent?: string[]): void {
   try {
     const html = render();
     if (html.length < 50) {
       failures.push(`${label}：渲染结果过短（${html.length} 字节）`);
       return;
     }
-    if (expectText !== undefined && !html.includes(expectText)) {
-      failures.push(`${label}：渲染结果里没有「${expectText}」`);
-      return;
+    const wanted = expect === undefined ? [] : Array.isArray(expect) ? expect : [expect];
+    for (const text of wanted) {
+      if (!html.includes(text)) {
+        failures.push(`${label}：渲染结果里没有「${text}」`);
+        return;
+      }
+    }
+    for (const text of expectAbsent ?? []) {
+      if (html.includes(text)) {
+        failures.push(`${label}：不该出现「${text}」却出现了`);
+        return;
+      }
     }
     console.log(`✔ ${label}（${html.length} 字节）`);
   } catch (error) {
@@ -779,6 +796,36 @@ check(
   () =>
     renderToStaticMarkup(React.createElement(NodeInspector, { node: undefined })),
   '点一个节点',
+);
+/**
+ * 「黄底感叹号」必须在属性栏里被解释。
+ *
+ * 为什么值得钉死：画布只在 tooltip 里写了"已完成但有遗留待处理"，属性栏此前一个字都没提 ——
+ * 用户点开黄标节点只看到一个孤零零的 `!`，还可能误以为它等于"异常"（红色 ✕）。
+ * 这条用例保证那段说明真的渲染出来，将来谁把条件写错就会在这里红。
+ */
+check(
+  'NodeInspector（完成后有遗留 → 解释黄底感叹号是什么）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(NodeInspector, {
+        node: { ...(board.nodes.find((n) => n.id === 'a2') as (typeof board.nodes)[number]), hasFollowUp: true },
+        onAction: () => {},
+      }),
+    ),
+  '已完成，但还有尾巴',
+);
+check(
+  'NodeInspector（无遗留 → 不出现那条说明，免得每张卡都挂一句）',
+  () =>
+    renderToStaticMarkup(
+      React.createElement(NodeInspector, {
+        node: { ...(board.nodes.find((n) => n.id === 'a2') as (typeof board.nodes)[number]), hasFollowUp: false },
+        onAction: () => {},
+      }),
+    ),
+  undefined,
+  ['已完成，但还有尾巴'],
 );
 
 // ⑥ 回滚浮层（FR-51b/53b）：新加的下拉 + 单选 + 共享文件勾选，是最容易渲染崩的一支
