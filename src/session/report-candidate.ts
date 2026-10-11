@@ -97,6 +97,56 @@ export function pickReportCandidates(
 }
 
 /**
+ * **落在树盲区**的变动文件：改了、但没有任何节点声明负责它。
+ *
+ * 为什么这条值得单独算：它回答的是**另一个问题** —— 不是"某个节点该更新了"，
+ * 而是"**这段活树上根本没有节点**"。用户的原始质疑正是从这里来的：
+ * 「这些是你刚加的，为什么需要我提醒你才行，插件却没起作用」——
+ * 我做完一个功能、提交了、推送了，树上却没有它的落点，而这**本该被自动发现**。
+ *
+ * 判据完全靠事实：文件确实变了（宿主看得见）、它不在任何节点的 refs 里（树里读得到）。
+ * 不含任何推测，也不产生数字。
+ *
+ * @param changedPaths 本回合变动过的工作区相对路径
+ * @param nodes        该项目**全部**节点（不是某个会话订阅的那些）
+ */
+export function uncoveredPaths(
+  changedPaths: readonly string[],
+  nodes: readonly CandidateNode[],
+): string[] {
+  const changed = [...new Set(changedPaths.map(normalizeRefPath).filter((path) => path !== ''))];
+  if (changed.length === 0) return [];
+  const refs: string[] = [];
+  for (const node of nodes) {
+    if (node.done) continue;
+    for (const ref of node.refs ?? []) refs.push(ref.target);
+  }
+  return changed.filter((path) => !refs.some((ref) => refCoversPath(ref, path)));
+}
+
+/** 每个"盲区"提醒最多列几个文件。 */
+export const MAX_BLIND_SPOT_HITS = 6;
+
+/**
+ * 盲区提醒文本：改动落在树的覆盖范围之外 ⇒ 建议建节点。
+ *
+ * 口径与 `reportNudgeText` 一致（说清事实、给出工具、不许编数字），但**诉求不同**：
+ * 前者是"更新已有节点"，这条是"树上缺节点"。两者可以同时出现，互不替代。
+ */
+export function blindSpotText(paths: readonly string[], limit = MAX_BLIND_SPOT_HITS): string | undefined {
+  const clean = [...new Set(paths.map(normalizeRefPath).filter((path) => path !== ''))];
+  if (clean.length === 0) return undefined;
+  const shown = clean.slice(0, limit);
+  const rest = clean.length - shown.length;
+  const tail = rest > 0 ? ` 等 ${clean.length} 个文件` : '';
+  return (
+    `[pm] 本回合改动的这些文件**不属于任何已有节点**：${shown.join('、')}${tail}。` +
+    '说明这段活树上没有落点 —— 如果没有对应节点，请用 pm_add 建一个（放在合适的枝下，' +
+    '并把 refs 指向这些路径），别让进度靠人记得。'
+  );
+}
+
+/**
  * 候选清单的单行提醒文本（沿用 `boundaryReminderText` 的极简口径）。
  *
  * 说清四件事：**哪些节点**有变动、**变了哪些文件**（证据）、**用什么工具**、**数字谁给**。

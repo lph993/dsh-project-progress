@@ -14,9 +14,11 @@ import assert from 'node:assert/strict';
 
 import {
   MAX_HITS_PER_CANDIDATE,
+  blindSpotText,
   pickReportCandidates,
   refCoversPath,
   reportNudgeText,
+  uncoveredPaths,
   type CandidateNode,
 } from '../../src/session/report-candidate.ts';
 
@@ -152,4 +154,62 @@ test('提醒文本是确定性的：同样输入渲染出同样文本', () => {
   const a = reportNudgeText(pickReportCandidates(['src/a/x.ts', 'src/b/y.ts'], nodes));
   const b = reportNudgeText(pickReportCandidates(['src/b/y.ts', 'src/a/x.ts'], nodes));
   assert.equal(a, b, '输入顺序不同不该改变输出（否则 diff 与提示词缓存全是噪声）');
+});
+
+// ── 树盲区（本回合改了、但没有任何节点负责它）────────────────────
+//
+// 这一组是用户质疑的落点：「这些是你刚加的，为什么需要我提醒你才行」——
+// 做完一个功能、提交了、推送了，树上却没有它的落点，而这本该被自动发现。
+
+test('未覆盖路径：改动落在所有节点 refs 之外时被抓出来', () => {
+  const nodes = [node({ nodeId: 'n1', refs: [{ type: 'dir', target: '.codeartsdoer' }] })];
+  const uncovered = uncoveredPaths(['server/crates/entity/src/genetics.rs', '.codeartsdoer/mcp/x.json'], nodes);
+  assert.deepEqual(uncovered, ['server/crates/entity/src/genetics.rs'], '只有没人负责的那个才算盲区');
+});
+
+test('未覆盖路径：全部被覆盖时为空（不打扰）', () => {
+  const nodes = [node({ nodeId: 'n1', refs: [{ type: 'dir', target: 'src' }] })];
+  assert.deepEqual(uncoveredPaths(['src/a.ts', 'src/deep/b.ts'], nodes), []);
+});
+
+test('未覆盖路径：已完成节点的 refs 不算覆盖（它不再负责那片地了）', () => {
+  const nodes = [node({ nodeId: 'n1', refs: [{ type: 'dir', target: 'src' }], done: true })];
+  assert.deepEqual(uncoveredPaths(['src/a.ts'], nodes), ['src/a.ts']);
+});
+
+test('未覆盖路径：没有 refs 的抽象节点覆盖不了任何东西', () => {
+  assert.deepEqual(uncoveredPaths(['a/b.ts'], [node({ nodeId: 'n1' })]), ['a/b.ts']);
+});
+
+test('未覆盖路径：归一化 + 去重 + 空输入不产生结果', () => {
+  const nodes = [node({ nodeId: 'n1', refs: [{ type: 'dir', target: 'src' }] })];
+  assert.deepEqual(uncoveredPaths(['out\\a.ts', './out/a.ts', 'out/a.ts'], nodes), ['out/a.ts'], '三种写法同一文件');
+  assert.deepEqual(uncoveredPaths([], nodes), []);
+  assert.deepEqual(uncoveredPaths([''], nodes), []);
+});
+
+test('盲区提醒：说清文件、指出树上缺节点、并给出建节点工具与 refs 要求', () => {
+  const text = blindSpotText(['server/crates/entity/src/genetics.rs']);
+  assert.ok(text !== undefined);
+  assert.match(text, /server\/crates\/entity\/src\/genetics\.rs/, '要把盲区文件摆出来当证据');
+  assert.match(text, /不属于任何已有节点/, '说清这是盲区，不是"该更新某节点"');
+  assert.match(text, /pm_add/, '要给出可执行的工具');
+  assert.match(text, /refs/, '并告诉它把 refs 指向这些路径，下次才不再是盲区');
+  assert.match(text, /别让进度靠人记得/, '点明这条机制的目的');
+});
+
+test('盲区提醒：没有盲区就不产生文本；过多时截断但说清总数', () => {
+  assert.equal(blindSpotText([]), undefined);
+  assert.equal(blindSpotText(['']), undefined);
+  const many = Array.from({ length: 9 }, (_, i) => `out/f${i}.ts`);
+  const text = blindSpotText(many);
+  assert.ok(text !== undefined);
+  assert.match(text, /等 9 个文件/, '超出上限时要说清一共有多少');
+});
+
+test('盲区与候选互不替代：同一份改动可以两者都为真', () => {
+  const nodes = [node({ nodeId: 'n1', name: '已有节点', refs: [{ type: 'dir', target: 'src/a' }] })];
+  const touched = ['src/a/x.ts', 'server/b.rs'];
+  assert.equal(pickReportCandidates(touched, nodes).length, 1, '落在 src/a 的那份要提醒更新节点');
+  assert.deepEqual(uncoveredPaths(touched, nodes), ['server/b.rs'], '落在盲区的那份要提醒建节点 —— 两件事同时成立');
 });

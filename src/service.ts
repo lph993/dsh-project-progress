@@ -190,6 +190,8 @@ import {
 import {
   pickReportCandidates,
   reportNudgeText,
+  blindSpotText,
+  uncoveredPaths,
   type CandidateNode,
   type ReportCandidate,
 } from './session/report-candidate.ts';
@@ -710,6 +712,8 @@ export class ProjectService {
      */
     reportNudges: 0,
     lastNudgeActorId: '' as string,
+    /** 「树上缺节点」被提醒过的次数（blindSpotText 命中）。与 reportNudges 分开计数，才能分辨机制在干嘛。 */
+    blindSpotNudges: 0,
     lastKind: '' as string,
     lastActorId: '',
     lastAt: '',
@@ -2774,22 +2778,40 @@ export class ProjectService {
   }
 
   /**
-   * 本回合的**报告候选**：按"碰过的文件"×"该会话绑定的节点 refs"挑出来的节点。
+   * 本回合的**报告候选**与**盲区文件**。
    *
-   * 纯查询、不改任何状态；没有碰过文件或没有候选时返回空数组（调用方据此不打扰）。
-   * 数字**不在这里产生** —— 它只回答"这一回合哪些节点可能有进展"，数字由模型给。
+   * 两个关键口径（都是踩过之后才定下来的）：
+   * 1. 候选池是**整个项目的节点**，不是"该会话订阅过的节点"。早先取 `boundFacts`
+   *    （订阅过的），结果对**从没订阅过**的会话完全失效 —— 而实际干活的人从来不订阅，
+   *    于是提醒永远不触发（AIG 那个工作区就是这样冻了 8 小时）。
+   * 2. 同时算出**盲区**：改动了、但没有任何节点声明负责这些文件。那说明这段活树上
+   *    根本没有落点，该提醒的是"建节点"而不是"更新进度"。
+   *
+   * 纯查询、不改业务状态；但会**取走**本回合的触碰记录（见 `takeSessionTouched`）。
    */
-  reportCandidatesFor(actorId: string): { candidates: ReportCandidate[]; touched: string[] } {
+  reportCandidatesFor(
+    actorId: string,
+    graph: GraphSnapshot,
+    derived: DerivedGraph,
+  ): { candidates: ReportCandidate[]; touched: string[]; uncovered: string[] } {
     const touched = this.takeSessionTouched(actorId);
-    if (touched === undefined) return { candidates: [], touched: [] };
-    const bound = this.boundFacts.get(actorId) ?? [];
-    const nodes: CandidateNode[] = bound.map((node) => ({
-      nodeId: node.nodeId,
-      name: node.name,
-      ...(node.refs !== undefined ? { refs: node.refs } : {}),
-      done: node.derivedState === 'done' || node.derivedState === 'removed',
-    }));
-    return { candidates: pickReportCandidates(touched, nodes), touched };
+    if (touched === undefined) return { candidates: [], touched: [], uncovered: [] };
+    const nodes: CandidateNode[] = [];
+    for (const [nodeId, record] of Object.entries(graph.nodes)) {
+      const view = derived.nodes.get(nodeId);
+      if (view === undefined) continue;
+      nodes.push({
+        nodeId,
+        name: record.name,
+        ...(record.refs !== undefined ? { refs: record.refs } : {}),
+        done: view.derivedState === 'done' || view.derivedState === 'removed',
+      });
+    }
+    return {
+      candidates: pickReportCandidates(touched, nodes),
+      touched,
+      uncovered: uncoveredPaths(touched, nodes),
+    };
   }
 
   /**
@@ -2918,11 +2940,21 @@ export class ProjectService {
      * 汇报时 `noteSessionReported` 已经把触碰记录清掉了，所以这里不查也不会留下旧账。
      */
     const reported = this.consumeSessionReported(input.actorId);
-    const nudgeCandidates = reported ? [] : this.reportCandidatesFor(input.actorId).candidates;
-    const nudge = nudgeCandidates.length > 0 ? reportNudgeText(nudgeCandidates) : undefined;
+    const probe = reported
+      ? { candidates: [] as ReportCandidate[], touched: [] as string[], uncovered: [] as string[] }
+      : this.reportCandidatesFor(input.actorId, graph, derived);
+    const nudge = probe.candidates.length > 0 ? reportNudgeText(probe.candidates) : undefined;
+    /**
+     * **盲区提醒**：改了文件，但没有任何节点声明负责它 —— 说明这段活树上没有落点。
+     *
+     * 与上面的候选提醒是**两件事**：候选是"已有节点该更新了"，盲区是"树上缺节点"。
+     * 这条正是用户质疑的落点（"这些是你刚加的，为什么需要我提醒你才行"）：做完一个功能却
+     * 没人建节点，本来该由插件自己发现。
+     */
+    const blindSpot = blindSpotText(probe.uncovered);
     const stillRunningReminder = boundaryReminderText(plan);
-    const reminder =
-      nudge === undefined ? stillRunningReminder : stillRunningReminder === undefined ? nudge : `${nudge}\n${stillRunningReminder}`;
+    const parts = [nudge, blindSpot, stillRunningReminder].filter((text) => text !== undefined);
+    const reminder = parts.length > 0 ? parts.join('\n') : undefined;
     let reminded = false;
     if (
       reminder !== undefined &&
@@ -2939,6 +2971,10 @@ export class ProjectService {
     if (reminded) this.boundaryStats.reminders += 1;
     if (nudge !== undefined) {
       this.boundaryStats.reportNudges += 1;
+      this.boundaryStats.lastNudgeActorId = input.actorId;
+    }
+    if (blindSpot !== undefined) {
+      this.boundaryStats.blindSpotNudges += 1;
       this.boundaryStats.lastNudgeActorId = input.actorId;
     }
     this.boundaryStats.lastKind = input.kind;
@@ -2982,6 +3018,7 @@ export class ProjectService {
     reminders: number;
     injected: number;
     reportNudges: number;
+    blindSpotNudges: number;
     lastNudgeActorId: string;
     /**
      * 当前**处于武装状态**的会话数：已经碰过文件、但还没汇报的会话。
