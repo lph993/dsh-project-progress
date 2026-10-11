@@ -309,6 +309,14 @@ export function estimateAiBuild(input: {
   likelyTooLarge?: boolean;
   /** 上次实测（提供方真实用量）；只透传，不做任何加工。 */
   lastActual?: { at: string; inputTokens: number; outputTokens: number };
+  /**
+   * **确定会分批**时的片数（骨架没把仓库装下 ⇒ `aiBuildTree` 直接分批，见批次 77/78）。
+   *
+   * 传了它就意味着"上面那些条目数/输入 token 是**按 N 片合计**的口径、实际会发 N 次调用"，
+   * 描述里那几句"若被截断才分批重试"也必须换成"直接分批"—— 否则确认框会自相矛盾：
+   * 一边写着"预计 1 次调用"，一边真的发 6 次（真机实测过这个谎）。
+   */
+  plannedShards?: number;
 }): AiEstimate {
   const maxOutputTokens =
     input.maxOutputTokens !== undefined && Number.isFinite(input.maxOutputTokens) && input.maxOutputTokens > 0
@@ -354,7 +362,10 @@ export function estimateAiBuild(input: {
     entries,
     signatureBytes,
     promptBytes,
-    calls: 1,
+    calls:
+      input.plannedShards !== undefined && input.plannedShards > 1
+        ? Math.round(input.plannedShards)
+        : 1,
     inputTokens,
     ...(maxOutputTokens !== undefined ? { outputTokens: maxOutputTokens } : {}),
     ...(input.outputLimitSource !== undefined ? { outputLimitSource: input.outputLimitSource } : {}),
@@ -461,10 +472,14 @@ export function describeEstimate(estimate: AiEstimate): string {
     estimatedOutputText +
     actualText +
     (estimate.likelyTooLarge === true
-      ? '这个仓库的文件数超过单次请求的常规范围：**若这次输出被截断，会自动按顶层目录分批重试**（事前先说清楚，不等到失败才告诉你）。'
+      ? estimate.calls > 1
+        ? `这个仓库的骨架没装下（只覆盖一部分）：**这次会直接按顶层目录分批（${estimate.calls} 片）**，不等失败再重试；上面的条目数与输入 token 是**按 ${estimate.calls} 片合计**的口径。`
+        : '这个仓库的文件数超过单次请求的常规范围：**若这次输出被截断，会自动按顶层目录分批重试**（事前先说清楚，不等到失败才告诉你）。'
       : '') +
     '不发送整文件内容；建树、相对工作量与完成度初判在同一次调用里完成。' +
-    `若这次输出被截断，插件会自动按顶层目录**分批**重试（片数有上限），不会白花这一轮。` +
+    (estimate.calls > 1
+      ? `每片一次调用，共 ${estimate.calls} 次（片数有上限）。`
+      : `若这次输出被截断，插件会自动按顶层目录**分批**重试（片数有上限），不会白花这一轮。`) +
     (estimate.outputTokens === undefined
       ? ''
       : `最坏情况合计约 ${estimate.totalTokens} token（输入 + 输出上限，仅用于估算上限）。`)

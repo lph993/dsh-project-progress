@@ -5376,6 +5376,8 @@ export class ProjectService {
       maxNodes: maxNodesForEstimate,
       // 事前提示（不是判定）：文件数超过单次请求的常规范围时，确认框里直说"可能被截断"
       likelyTooLarge: shouldShard(collected.entries),
+      // 会直接分批时把片数交给预估：描述里的"N 次调用 / 直接分批"由它统一措辞
+      ...(shardedPlan !== undefined ? { plannedShards: shardedPlan.count } : {}),
       ...(lastActual !== undefined ? { lastActual } : {}),
     });
 
@@ -5395,13 +5397,8 @@ export class ProjectService {
     return {
       available: true,
       estimate,
-      description:
-        describeEstimate(estimate) +
-        (shardedPlan !== undefined
-          ? `\n\n> ⚠ **这次会直接分批**：骨架没把仓库装下（只覆盖一部分），建树会按顶层切成 ` +
-            `**${shardedPlan.count} 片**、每片各带一份骨架 —— 上面的条目数与输入 token 是` +
-            `**按 ${shardedPlan.count} 片合计**的口径，实际会发 ${shardedPlan.count} 次调用。`
-          : ''),
+      // 分批口径的措辞由 `describeEstimate` 统一给（受 `plannedShards` 驱动），这里不再叠一句
+      description: describeEstimate(estimate),
       route: `${route.route.provider} / ${route.route.model}（${route.route.source === 'config' ? '设置' : '跟随默认模型'}）`,
       cache: {
         state: reusable && cache.verdict.kind === 'hit'
