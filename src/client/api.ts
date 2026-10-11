@@ -110,13 +110,16 @@ export type BranchRemoveOutcome =
 /**
  * 删除一个项目（连同节点/审计/冲突/快照）。
  *
- * 两阶段：`confirm: false` 只拿影响范围（先给用户看）；服务端**不允许删当前绑定的项目**
- * （会把读路径静默带到别的项目）—— 那种情况回 400 + `code: 'E_PROJECT_BOUND'`。
+ * 两阶段：`confirm: false` 只拿影响范围（先给用户看），`confirm: true` 才真删。
+ *
+ * 删的若是**当前绑定**的项目，服务端会**自愈**：同一个工作区根立刻得到一个全新的空项目
+ * （返回 `reboundProjectId`）—— 所以"删了再建"是一步，且不会静默换到别的工作区。
+ * （旧版这里会直接拒删并回 `E_PROJECT_BOUND`，那让面板的删除按钮永远只能命中被拒的那个。）
  */
 export type DeleteProjectOutcome =
   | { status: 'needs-confirm'; preview: string; action: 'delete-project' }
   | { status: 'denied'; code: string; message: string; hint?: string }
-  | { status: 'ok'; projectId: string; removedNodes: number };
+  | { status: 'ok'; projectId: string; removedNodes: number; reboundProjectId?: string };
 
 export async function deleteProject(
   body: { projectId: string; confirm?: boolean },

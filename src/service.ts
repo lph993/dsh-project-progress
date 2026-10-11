@@ -1469,52 +1469,39 @@ export class ProjectService {
   }
 
   /**
-   * 这次调用所属会话**正在用的**项目 id（**判断用，不产生绑定副作用**）。
-   *
-   * 为什么不能直接用全局 `this.projectId`：那是"**任何**会话最后一次绑定"，
-   * 与"发起这次调用的会话在哪个项目上"是两回事。真机现场（面板要删 AIG 却被拒）：
-   * 全局指针被**另一个**会话按在了 AIG 上，而用户自己的会话在别的项目 ——
-   * 于是"当前项目"这个判断落在了错误的对象上。
-   *
-   * 判据顺序：
-   * ① 没有会话上下文（匿名面板轮询）→ 沿用全局绑定（保持原语义）；
-   * ② 全局绑定**就是这个会话**留下的（`boundRootSession`）→ 直接是它，无歧义；
-   * ③ 其余 → 按该会话自己的根反查项目；查不到说明它还没有项目（那就谁也拦不住）。
-   */
-  private async callerProjectId(sessionId?: string): Promise<string | undefined> {
-    if (sessionId === undefined || sessionId === '') return this.projectId;
-    if (this.boundRootSession === sessionId) return this.projectId;
-    const root = this.resolveRoot(sessionId).root;
-    if (root === undefined || root === '') return undefined;
-    const projects = await this.listProjects();
-    const match = projects.find(
-      (meta) => meta.workspaceRoot !== undefined && isSameRoot(meta.workspaceRoot, root),
-    );
-    return match?.projectId;
-  }
-
-  /**
    * **删除一个项目**（连同它的全部节点、进度、审计、冲突、快照记录）。
    *
    * 为什么需要：幽灵空项目与"试错留下的整棵树"没有别的清理入口 —— 只能在树里一枝一枝删，
    * 而用户真正想扔的是**整个项目**（真机现场：AIG 那棵按目录建的树、VideoFix 的空壳）。
    *
+   * ## 为什么**不再**拒绝"删当前项目"（旧硬规则已删，2026-10-11）
+   *
+   * 旧规则是「不允许删调用者自己所在的那个项目」，理由是"删掉后读路径会退到别的项目，
+   * 等于静默换了项目，比删不掉更糟"。但它与**面板**的交互是个死结：面板那个按钮删的就是
+   * **它正在显示**的项目（`board.projectId`），而"正在显示某项目"就等于"你站在它上面" ——
+   * 于是按钮永远只会命中被拒的那一个，功能等于不可用。真机现场：用户反复点、反复得到
+   * `E_PROJECT_BOUND`，而按 hint 去"换个项目再删"也做不到（换过去之后**显示的就是别人了**）。
+   *
+   * 现在改成**自愈**，用更直接的办法满足原来那条理由：
+   * 删掉之后**立刻清掉绑定**，让**同一个工作区根**重新落到"没有项目"的分支上 ——
+   * `bindProjectToRoot()` 会为它**新建一个空项目**。于是既不静默换工作区，
+   * 也不会留下一个指向已删除项目的死指针（后者才是旧规则真正要防的东西）。
+   *
    * 纪律：
-   * ① **不允许删「调用者自己所在」的那个项目**（`force` 也不行）—— 删掉它之后再读就会
-   *    退到**别的项目**，等于静默换了项目，比删不掉更糟。注意是"调用者自己的"，
-   *    不是"全局最后绑定的那个"（见 `callerProjectId`：后者会把判断落到错误对象上）。
-   * ② 两阶段：`confirm !== true` 时**只回影响范围**（节点数 / 枝数 / 名字样例），不落库。
-   * ③ 真删时走存储端口的 `deleteProject()`（它已经会清两张节点表 + meta + global 里的 id）。
+   * ① 两阶段：`confirm !== true` 时**只回影响范围**（节点数 / 枝数 / 名字样例），不落库。
+   * ② 真删时走存储端口的 `deleteProject()`（它已经会清两张节点表 + meta + global 里的 id）。
+   * ③ 删的是**当前绑定**项目时，紧接着必须把绑定重放到同一个工作区根上（见上）——
+   *    否则 `bindProjectToRoot` 会因为"根没变"而**早返回**，一直指着那个已经不存在的项目。
    */
   async deleteProject(input: {
     projectId: string;
     confirm?: boolean;
-    /** 发起这次删除的会话（面板会带上它，见下）。 */
+    /** 发起这次删除的会话：自愈重建时用它记账（"谁在用的根"）。 */
     sessionId?: string;
   }): Promise<
     | { status: 'denied'; code: string; message: string; hint?: string }
     | { status: 'needs-confirm'; preview: string; action: 'delete-project' }
-    | { status: 'ok'; projectId: string; removedNodes: number }
+    | { status: 'ok'; projectId: string; removedNodes: number; reboundProjectId?: string }
   > {
     const meta = await this.port.getMeta(input.projectId);
     if (meta === undefined) {
@@ -1524,30 +1511,9 @@ export class ProjectService {
         message: `项目 ${input.projectId} 不存在（可能已经被删过）`,
       };
     }
-    /**
-     * 「是不是当前项目」必须按**发起删除的会话**来算，不能用全局 `this.projectId`。
-     *
-     * 全局那个是"**任何**会话最后一次绑定"，可能根本不是发起者的项目 —— 真机现场：
-     * 用户在面板上要删 AIG，却因为**另一个**会话刚把 AIG 绑上而被拒；他看到的是
-     * "不能删除"，而它并不是他正在看的项目（他自己的项目是另一个）。
-     * 反过来也一样糟：全局指针恰好指向别处时，会**放行删除面板正在看的那个项目**。
-     *
-     * 面板的 `DELETE /pm/projects` 现在也带会话 id（与 `/pm/board` 一致）。
-     * 不带会话 id（匿名调用）时保持原语义，用全局绑定判断。
-     */
-    const callerProjectId = await this.callerProjectId(input.sessionId);
-    if (callerProjectId !== undefined && callerProjectId === input.projectId) {
-      return {
-        status: 'denied',
-        code: 'E_PROJECT_BOUND',
-        message:
-          `项目「${meta.projectName}」正是**你当前所在**的那个，不能在这里删 —— ` +
-          '删掉它之后读路径会退到别的项目（等于静默换了项目）。',
-        hint:
-          '要删它：先切到别的工作区/项目操作一步（绑定会跟着会话的工作区根走），' +
-          '或者直接清理该工作区的存储；也可以先删掉它的顶级枝（等于清空树），再重建。',
-      };
-    }
+    /** 删的是当前绑定项目吗？是的话删完要自愈（纪律③）。 */
+    const wasBound = input.projectId === this.projectId;
+    const boundRoot = this.boundRoot;
     const graph = await this.port.readGraph(input.projectId);
     const nodes = graph === undefined ? [] : Object.values(graph.nodes);
     const liveRoots = nodes.filter((node) => node.parentId === null);
@@ -1560,7 +1526,10 @@ export class ProjectService {
           `将**彻底删除项目**「${meta.projectName}」（${input.projectId}）：` +
           `${nodes.length} 个节点、${liveRoots.length} 个顶级枝、${meta.rootIds.length} 个根。` +
           (names !== '' ? `顶级枝：${names}${liveRoots.length > 8 ? ' …' : ''}。` : '') +
-          '连同审计 / 冲突 / 快照记录一起删，**不可撤销**。',
+          '连同审计 / 冲突 / 快照记录一起删，**不可撤销**。' +
+          (wasBound && boundRoot !== undefined
+            ? `删掉后工作区 ${boundRoot} 会得到一个**全新的空项目**（树从零开始；不会跑到别的工作区）。`
+            : ''),
       };
     }
     await this.port.deleteProject(input.projectId);
@@ -1568,7 +1537,31 @@ export class ProjectService {
       'project',
       `已删除项目 ${input.projectId}（name=${meta.projectName}，节点 ${nodes.length} 个）`,
     );
-    return { status: 'ok', projectId: input.projectId, removedNodes: nodes.length };
+    /**
+     * 纪律③ 自愈：删的若是**当前绑定**项目，绑定此刻指向一个已经不在的项目。
+     * 先清掉 `boundRoot`（否则 `bindProjectToRoot` 会因为"根没变"直接早返回、
+     * 继续用那个死 id），再让**同一个工作区根**重新解析 —— 没有项目匹配时它会新建一个空项目。
+     * 这样"删了再建"一步到位，而且不会跑到别的工作区去。
+     */
+    let reboundProjectId: string | undefined;
+    if (wasBound && boundRoot !== undefined) {
+      this.boundRoot = undefined;
+      this.snapshots = undefined;
+      this.snapshotDecision = undefined;
+      this.externalChange = undefined;
+      await this.bindProjectToRoot(boundRoot, input.sessionId ?? this.boundRootSession);
+      reboundProjectId = this.projectId;
+      debugBus.info(
+        'project',
+        `删除后为工作区根 ${boundRoot} 重建了空项目 ${reboundProjectId}（自愈，不换工作区）`,
+      );
+    }
+    return {
+      status: 'ok',
+      projectId: input.projectId,
+      removedNodes: nodes.length,
+      ...(reboundProjectId !== undefined ? { reboundProjectId } : {}),
+    };
   }
 
   private async readGraph(): Promise<GraphSnapshot> {

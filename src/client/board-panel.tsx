@@ -973,8 +973,9 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
    * 删除当前项目（两段式）。
    *
    * 第一下：拿影响范围（`confirm:false`，服务端只回预览、不落库）并显示出来；
-   * 第二下（同一项目）：真删。服务端**不允许删当前绑定的项目**，那时会回
-   * `E_PROJECT_BOUND`，这里如实把原因显示出来（不静默失败）。
+   * 第二下（同一项目）：真删。删的是**当前显示**的项目时服务端会**自愈** ——
+   * 同一个工作区根立刻得到一个全新的空项目（`reboundProjectId`），
+   * 所以"删了再建"一步到位，不会静默换到别的工作区。
    */
   const doDeleteProject = useCallback(() => {
     const projectId = board?.projectId;
@@ -1002,7 +1003,12 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         return;
       }
       setProjectDelete(undefined);
-      setRootNotice(`已删除项目（${value.removedNodes} 个节点一并清除）`);
+      setRootNotice(
+        `已删除项目（${value.removedNodes} 个节点一并清除）` +
+          (value.reboundProjectId !== undefined
+            ? '；本工作区已重建为一个空项目，可以直接重新建树'
+            : ''),
+      );
       refresh();
     });
   }, [board?.projectId, projectDelete, refresh, sessionId]);

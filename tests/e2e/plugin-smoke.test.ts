@@ -1195,11 +1195,16 @@ test('空项目清理：只删零节点空壳，绝不碰当前绑定与有内�
 /**
  * 删除项目（清理入口）：真机现场是"试错留下的整棵树 / 幽灵空项目没有别的清理方式"。
  *
- * 两条必须钉住的纪律：
+ * 三条必须钉住的纪律：
  * ① **两段式**：`confirm:false` 只回影响范围、**不落库**；`confirm:true` 才真删。
- * ② **不允许删当前绑定的项目**（否则删完再读会退到别的项目 = 静默换项目）。
+ * ② **删"当前项目"要自愈**（2026-10-11 改）：不再是拒删 —— 旧规则与面板是个死结
+ *    （面板那个按钮删的正是它**正在显示**的项目，于是永远只命中被拒的那一个）。
+ *    现在删完立刻把绑定重放到**同一个工作区根**上，`bindProjectToRoot()` 为它新建一个
+ *    **空项目**（返回 `reboundProjectId`）：既不留下指向已删项目的死指针，
+ *    也不会静默换到别的工作区。
+ * ③ 删过的 id 再删要如实说"不存在"，不抛错。
  */
-test('删除项目：两段式确认、不允许删当前绑定、删完从列表消失', async () => {
+test('删除项目：两段式确认、删当前项目自愈出空项目、删完从列表消失', async () => {
   const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-del-a-'));
   const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-del-b-'));
   const ctx = createFakeContext({ workspace: wsA });
@@ -1247,23 +1252,36 @@ test('删除项目：两段式确认、不允许删当前绑定、删完从列�
   assert.ok(!projects.some((p) => p.projectId === projectB), 'B 项目应从列表消失');
   assert.ok(projects.some((p) => p.projectId === projectA), 'A 项目必须还在');
 
-  // ③ 守卫：当前绑定的项目不许删（force 也不行 —— 这里没有 force 这个口子）
-  const bound = await service.deleteProject({ projectId: projectA, confirm: true });
-  assert.equal(bound['status'], 'denied', JSON.stringify(bound));
-  assert.equal(bound['code'], 'E_PROJECT_BOUND');
-  assert.ok(
-    (await service.listProjects()).some((p) => p.projectId === projectA),
-    '被拒后项目必须还在',
+  // ③ 删**当前绑定**的项目（A）：必须放行，并自愈出同一工作区的新空项目
+  //    （旧版这里回 E_PROJECT_BOUND —— 而那正是面板按钮的唯一目标，等于功能不可用）
+  const bound = await service.deleteProject({
+    projectId: projectA,
+    confirm: true,
+    sessionId: 'session-A',
+  });
+  assert.equal(bound['status'], 'ok', `删当前项目必须放行，实际：${JSON.stringify(bound)}`);
+  const rebound = bound['reboundProjectId'];
+  assert.ok(typeof rebound === 'string' && rebound !== '', '必须返回自愈出的新项目 id');
+  assert.notEqual(rebound, projectA, '新项目必须是另一个 id');
+
+  projects = await service.listProjects();
+  assert.ok(!projects.some((p) => p.projectId === projectA), '旧项目 A 必须已被删除');
+  assert.ok(projects.some((p) => p.projectId === rebound), '自愈出的新项目必须在列表里');
+  assert.equal(
+    projects.find((p) => p.projectId === rebound)?.workspaceRoot,
+    wsA,
+    '自愈必须落在**同一个工作区根**上（不许换工作区）',
   );
+
+  // 树从零开始：A 会话再读，拿到的就是那个空项目
+  const boardA = await service.board('session-A');
+  assert.equal(boardA.projectId, rebound, 'A 会话应已落到自愈出的新项目上');
+  assert.deepEqual(boardA.nodes, [], '自愈出来的必须是空项目（树从零开始）');
 
   // ④ 删过的 id 再删一次：如实说"不存在"，不抛错
   const again = await service.deleteProject({ projectId: projectB, confirm: true });
   assert.equal(again['status'], 'denied');
   assert.equal(again['code'], 'E_PROJECT_NOT_FOUND');
-
-  // A 的树完好
-  const boardA = await service.board('session-A');
-  assert.deepEqual(boardA.nodes.map((n) => n.name), ['A树']);
 
   ctx.disposeAll();
   rmSync(wsA, { recursive: true, force: true });
@@ -1271,24 +1289,20 @@ test('删除项目：两段式确认、不允许删当前绑定、删完从列�
 });
 
 /**
- * 删除项目的「是不是当前项目」必须按**发起删除的会话**判断，不能用全局绑定指针。
+ * 面板删除的**死结**（真机现场，2026-10-11）。
  *
- * ## 现场（真机，2026-10-11）
+ * 面板那个删除按钮删的就是它**正在显示**的项目（`board.projectId`），而"正在显示某项目"
+ * 就等于"你站在它上面"。旧规则据此一律拒删并回 `E_PROJECT_BOUND` —— 于是那个按钮
+ * **永远只能命中被拒的那一个**，功能等于不可用（用户反复点、反复被拒；按 hint 去
+ * "换个项目再删"也做不到，因为换过去之后**显示的就是别人了**）。
  *
- * 用户在面板上要删 AIG，得到的却是 `E_PROJECT_BOUND`「正是当前绑定的那个」——
- * 因为面板的 `DELETE /pm/projects` 当时**不带会话 id**，只能拿全局 `this.projectId`
- * 比；而那个指针被**另一个**会话（在 `Z:\Projects\AIG` 里干活的那个）按在了 AIG 上。
- * 用户自己并不在 AIG 上 —— 判断落在了错误的对象上。
- *
- * 反过来同样危险：全局指针恰好指向别处时，会**放行删除面板正在看的那个项目**。
- *
- * 判据：带 `sessionId` 时，只有"**该会话自己的工作区**对应的项目"才不可删；
- * 别的项目哪怕正被全局绑定，也应当可删。不带 `sessionId`（匿名）时保持原语义。
+ * 判据：删"调用者自己所在的那一个"必须**成功**，并自愈到**同一个工作区根**的新空项目上；
+ * 同时**不碰**别的项目。
  */
-test('删除项目：按发起会话判断「是不是当前项目」，不被全局绑定指针带偏', async () => {
-  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-del-a-'));
-  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-del-b-'));
-  const ctx = createFakeContext({ workspace: wsA });
+test('删除项目：删掉"正在显示的这个项目"（面板死结）→ 自愈到同一工作区的新空项目', async () => {
+  const wsMain = mkdtempSync(join(tmpdir(), 'pm-e2e-del-main-'));
+  const wsOther = mkdtempSync(join(tmpdir(), 'pm-e2e-del-other-'));
+  const ctx = createFakeContext({ workspace: wsMain });
   const module = (await import('../../lib/index.js')) as {
     apply(ctx: unknown, config: unknown): Promise<void>;
   };
@@ -1297,57 +1311,68 @@ test('删除项目：按发起会话判断「是不是当前项目」，不被�
     currentProjectId: string;
     noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
     addNode(input: Record<string, unknown>): Promise<{ status: string }>;
-    board(sessionId?: string): Promise<{ projectId: string }>;
-    listProjects(): Promise<Array<{ projectId: string }>>;
+    board(sessionId?: string): Promise<{ projectId: string; nodes: Array<{ name: string }> }>;
+    listProjects(): Promise<Array<{ projectId: string; workspaceRoot?: string }>>;
     deleteProject(input: Record<string, unknown>): Promise<Record<string, unknown>>;
   };
 
-  // A 会话在 wsA，B 会话在 wsB（两个项目）
-  service.noteWorkspaceRoot(wsA, 'session-A');
-  await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
-  const projectA = service.currentProjectId;
-  service.noteWorkspaceRoot(wsB, 'session-B');
-  await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
-  const projectB = service.currentProjectId;
-  assert.notEqual(projectA, projectB);
+  // 别人的项目先建好（必须毫发无伤）
+  service.noteWorkspaceRoot(wsOther, 'session-other');
+  await service.addNode({ parentId: null, name: '别人的树', sessionId: 'session-other' });
+  const projectOther = service.currentProjectId;
 
-  // 现场：**全局绑定停在 B**（别人刚操作过），而 A 会话要删的正是 B
-  await service.board('session-B');
-  assert.equal(service.currentProjectId, projectB, '前置条件：全局绑定停在 B');
+  // 本会话（面板"正在显示"的那个）建一棵要扔掉的树
+  service.noteWorkspaceRoot(wsMain, 'session-main');
+  await service.addNode({ parentId: null, name: '要扔的树', sessionId: 'session-main' });
+  const projectMain = service.currentProjectId;
+  assert.notEqual(projectMain, projectOther);
 
-  // ① A 会话（自己在 A）删 B → 必须放行（B 不是 A 会话的项目）
-  const preview = await service.deleteProject({ projectId: projectB, sessionId: 'session-A' });
-  assert.equal(
-    preview['status'],
-    'needs-confirm',
-    `A 会话删 B 不该被"当前项目"挡住（旧实现会回 E_PROJECT_BOUND），实际：${JSON.stringify(preview)}`,
+  // 现场：本会话就站在 projectMain 上 —— 旧规则在这里必然回 E_PROJECT_BOUND
+  const preview = await service.deleteProject({ projectId: projectMain, sessionId: 'session-main' });
+  assert.equal(preview['status'], 'needs-confirm', JSON.stringify(preview));
+  assert.match(
+    String(preview['preview']),
+    /全新的空项目/,
+    `预览必须说清删完会得到新空项目：${String(preview['preview'])}`,
   );
 
-  // ② 同一条件下，A 会话删**自己**的项目 → 必须拒（这条纪律本身不能松）
-  const own = await service.deleteProject({ projectId: projectA, sessionId: 'session-A' });
-  assert.equal(own['status'], 'denied', JSON.stringify(own));
-  assert.equal(own['code'], 'E_PROJECT_BOUND');
+  const done = await service.deleteProject({
+    projectId: projectMain,
+    confirm: true,
+    sessionId: 'session-main',
+  });
+  assert.equal(
+    done['status'],
+    'ok',
+    `删自己所在的项目必须放行（旧版这里是 E_PROJECT_BOUND 的死结），实际：${JSON.stringify(done)}`,
+  );
+  const rebound = done['reboundProjectId'];
+  assert.ok(typeof rebound === 'string' && rebound !== projectMain, '必须自愈出另一个项目');
 
-  // ③ B 会话删自己的项目 → 同样拒（判断跟着会话走，不是跟着全局指针走）
-  const ownB = await service.deleteProject({ projectId: projectB, sessionId: 'session-B' });
-  assert.equal(ownB['status'], 'denied', JSON.stringify(ownB));
-  assert.equal(ownB['code'], 'E_PROJECT_BOUND');
+  const projects = await service.listProjects();
+  assert.ok(!projects.some((p) => p.projectId === projectMain), '旧项目应已删除');
+  assert.equal(
+    projects.find((p) => p.projectId === rebound)?.workspaceRoot,
+    wsMain,
+    '自愈必须落在**同一个工作区根**上，不得跑到别的工作区',
+  );
+  assert.ok(
+    projects.some((p) => p.projectId === projectOther),
+    '别人的项目不得被牵动',
+  );
 
-  // ④ 匿名（不带会话 id）保持原语义：全局绑定是 B ⇒ 删 B 仍被拒
-  const anon = await service.deleteProject({ projectId: projectB });
-  assert.equal(anon['status'], 'denied', JSON.stringify(anon));
-  assert.equal(anon['code'], 'E_PROJECT_BOUND');
-
-  // ⑤ 真删走通，且只少一个项目
-  const done = await service.deleteProject({ projectId: projectB, confirm: true, sessionId: 'session-A' });
-  assert.equal(done['status'], 'ok', JSON.stringify(done));
-  const left = (await service.listProjects()).map((p) => p.projectId);
-  assert.ok(!left.includes(projectB), 'B 应已删除');
-  assert.ok(left.includes(projectA), 'A 必须还在');
+  // 本会话仍在本工作区，且拿到的是空项目 —— 这就是"删了再建"的直接前提
+  const board = await service.board('session-main');
+  assert.equal(board.projectId, rebound);
+  assert.deepEqual(board.nodes, [], '自愈出来的必须是空项目');
+  // 别人的树完好
+  const other = await service.board('session-other');
+  assert.equal(other.projectId, projectOther);
+  assert.deepEqual(other.nodes.map((n) => n.name), ['别人的树']);
 
   ctx.disposeAll();
-  rmSync(wsA, { recursive: true, force: true });
-  rmSync(wsB, { recursive: true, force: true });
+  rmSync(wsMain, { recursive: true, force: true });
+  rmSync(wsOther, { recursive: true, force: true });
 });
 
 test('老数据迁移：库里只有一个无根项目时被"认领"，而不是孤立它', async () => {
