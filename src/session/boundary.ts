@@ -22,7 +22,7 @@
  * 需要模型判断时走既有工具（`pm_progress`）或交接文档补写那条明确确认过的路径。
  */
 
-import type { DerivedState, Gate, SelfState } from '../shared/types.ts';
+import type { DerivedState, Gate, Ref, SelfState } from '../shared/types.ts';
 
 /** 边界来源（进审计，事后能看清是谁触发的修正）。 */
 export type BoundaryKind = 'turn-end' | 'agent-disposed';
@@ -48,6 +48,14 @@ export interface BoundNode {
    * 父节点，然后拿着 `denied` 结果报告"已推进" —— 那是**假汇报**。
    */
   leaf: boolean;
+  /**
+   * 该节点声明的引用路径（它负责的目录/文件）。
+   *
+   * **为什么边界层需要它**：回合收尾时要判断"本回合变动的文件属于哪些节点"，
+   * 判据只能是节点自己声明的 `refs`（见 `session/report-candidate.ts`）。
+   * 没有 refs 的抽象节点无从判断，**不猜**。
+   */
+  refs?: readonly Ref[] | undefined;
 }
 
 /** 边界修正的输入（都是可测的纯数据）。 */

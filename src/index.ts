@@ -519,6 +519,60 @@ async function applyInner(ctx: Context, config: Config): Promise<void> {
   }, 'project-manager: destructive-guard');
 
   /**
+   * **进度自动回写：证据采集**（①+② 的输入侧）。
+   *
+   * 用户的原始质疑（2026-10-11）：「为什么不能在运行中自动处理进度呢，别人用难道也要手动
+   * 告诉你需要刷新树了，不太合理吧」——实测现状证实了这个缺陷：树上的 32 个叶节点全卡在
+   * 0.50–0.70、完成数为 0，整体比例长期冻在 0.649，因为**没有任何机制推动收尾**。
+   *
+   * 这里只采两样东西，都不花 token、不拦流程（返回值原样透传）：
+   * | 采集 | 来源 | 用途 |
+   * |---|---|---|
+   * | 本回合碰过哪些文件 | 写工具的 `args`（复用 `touchedPathsOf`，跨项目审核门同款） | ② 挑候选节点的证据 |
+   * | 本回合有没有汇报过 | `pm_report` / `pm_finish` 被调用 | ① 决定边界要不要催 |
+   *
+   * **为什么不查 git**：git 只能说明"仓库现在有哪些差异"，分不出"哪次会话碰的"；
+   * 而写工具必须过这道门，天然带会话归属。
+   *
+   * **为什么记 `pm_progress` 不算"已汇报"**：单条进度更新正是"还没收尾"的表现；
+   * 要收尾得用 `pm_report`（批量）或 `pm_finish`（完成）。口径与提示词纪律一致。
+   *
+   * ## 注册顺序是**语义要求**，不是随便放的（真机 + 测试双重踩过）
+   *
+   * 本钩子必须注册在**跨子项目审核门之前**。原因在 e2e 的替身里看得最清楚
+   * （`plugin-smoke.test.ts` 的 `judge`）：它**逐个**调用监听器，每次都给一个**干净的**
+   * `{ kind: 'allow' }` 当 `next`，再取**最后一个**返回值当结论。于是任何注册在审核门之后、
+   * 且会返回自己那份 `decision` 的钩子，都会把审核门判好的 `ask` **覆盖成 allow** ——
+   * FR-161 因此变红（本次实测：监听器 #0 allow → #1 ask → #2 被覆盖成 allow）。
+   * 放在前面则不会碰到"后面还有判定"的情形，语义也更正确：**采集只读，不参与判定**。
+   */
+  ctx.effect(() => {
+    const WRITE_TOOLS = new Set(['write', 'edit', 'str_replace_editor']);
+    const REPORT_TOOLS = new Set(['pm_report', 'pm_finish']);
+    const off = ctx.on('tools/pre-execute', async (exec: unknown, next: () => Promise<unknown>) => {
+      const decision = (await next()) as { kind?: string } | undefined;
+      const view = execViewOf(exec);
+      if (view.toolName === undefined) return decision as never;
+      if (decision !== undefined && decision.kind === 'deny') return decision as never;
+      // 会话 id 直接用 ExecView 的（它内部已按 `agent.id` → 旧字段名 三级回退读好）
+      const sessionId = view.sessionId;
+      if (typeof sessionId !== 'string' || sessionId === '') return decision as never;
+      if (REPORT_TOOLS.has(view.toolName)) {
+        service.noteSessionReported(sessionId);
+        return decision as never;
+      }
+      if (WRITE_TOOLS.has(view.toolName)) {
+        service.noteSessionTouched(sessionId, touchedPathsOf(view.args));
+      }
+      return decision as never;
+    });
+    return () => {
+      off();
+      debugBus.debug('session', '进度回写证据采集已卸载');
+    };
+  }, 'project-manager: report-evidence');
+
+  /**
    * **跨子项目写入的审核门**（FR-161）。
    *
    * 判据在纯函数里（`domain/review-gate.ts`，13 条单测钉住），这里只做三件事：

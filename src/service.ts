@@ -187,6 +187,12 @@ import {
   type BoundNode,
   type BoundaryKind,
 } from './session/boundary.ts';
+import {
+  pickReportCandidates,
+  reportNudgeText,
+  type CandidateNode,
+  type ReportCandidate,
+} from './session/report-candidate.ts';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { clampTimeout } from '@deepseek-ai/dsh-timeout';
 
@@ -633,6 +639,26 @@ export class ProjectService {
    */
   private readonly boundFacts = new Map<string, BoundNode[]>();
   /**
+   * **本回合各会话碰过的工作区路径**（进度自动回写 ②的证据来源）。
+   *
+   * 为什么按会话收在这里而不是去查 git：
+   * - 便宜且准：写工具（`write` / `edit` / `str_replace_editor`）都必须过 `tools/pre-execute`，
+   *   那里已经有 `touchedPathsOf(view.args)`（跨项目审核门就在用同一份）；
+   * - git 只能告诉你"仓库现在有什么差异"，**分不出"哪次会话碰的"**，也看不见未提交之外的语义。
+   *
+   * 生命周期：`noteSessionTouched` 累加，回合边界消费后清空（`takeSessionTouched`）——
+   * 不清就会让下一回合永远带着上一回合的文件，提醒变成噪音。
+   */
+  private readonly sessionTouched = new Map<string, Set<string>>();
+  /**
+   * **本回合该会话是否已经汇报过进度**（`pm_report` / `pm_finish` 被调用过）。
+   *
+   * 这是 ① 的核心判据：有了它，边界才知道该不该催 —— 早先的边界逻辑**完全不知道**
+   * 这一回合有没有回写过，所以它永远只推 `pending → running`，推不到收尾（实测后果：
+   * 32 个叶节点全卡在 0.50–0.70、完成数 0，整体比例冻在 0.649）。
+   */
+  private readonly sessionReported = new Set<string>();
+  /**
    * 待确认的整枝删除登记表（FR-158 之外的"审核可见性"）。
    *
    * **由 AI/会话发起**的删除在这里登记：看板据此把这枝**标红**，用户在流程图上一眼看出"要删哪个"。
@@ -675,6 +701,15 @@ export class ProjectService {
     patches: 0,
     reminders: 0,
     injected: 0,
+    /**
+     * 「进度自动回写」里**催了模型汇报**的次数（batch 69）。
+     *
+     * 单独计数是刻意的：它与上面那个 `reminders` 不是一回事 —— 后者是"还有节点在进行中"的
+     * 泛泛提醒，前者是"本回合确实改了文件、但你没汇报，按 refs 该看这几个节点"的**有证据**提醒。
+     * 混在一起就分不清"机制在干活"和"机制在空转"。
+     */
+    reportNudges: 0,
+    lastNudgeActorId: '' as string,
     lastKind: '' as string,
     lastActorId: '',
     lastAt: '',
@@ -2673,6 +2708,8 @@ export class ProjectService {
         progress: record.progress,
         // C5：父节点不能写自身状态 → 边界修正必须知道谁是叶节点
         leaf: (derived.index.childrenOf.get(nodeId) ?? []).length === 0,
+        // 回合收尾挑候选要用：节点自己声明它负责哪些路径（没 refs 的抽象节点不参与判断）
+        ...(record.refs !== undefined ? { refs: record.refs } : {}),
       });
     }
     return bound;
@@ -2686,6 +2723,82 @@ export class ProjectService {
   boundFactsOf(actorId: string | undefined): BoundNode[] {
     if (actorId === undefined) return [];
     return this.boundFacts.get(actorId) ?? [];
+  }
+
+  /**
+   * 记下"本回合这个会话碰过哪些工作区路径"（进度自动回写 ②的证据来源）。
+   *
+   * 调用点在 `src/index.ts` 的第二个 `tools/pre-execute` 钩子上：写工具都必须过那道门，
+   * 那里已经有 `touchedPathsOf(view.args)`。用工具触碰而不是查 git，是因为 git 分不出
+   * "哪次会话碰的"，而这里天然按会话归属。
+   */
+  noteSessionTouched(actorId: string, paths: readonly string[]): void {
+    if (actorId === '' || paths.length === 0) return;
+    let set = this.sessionTouched.get(actorId);
+    if (set === undefined) {
+      set = new Set<string>();
+      this.sessionTouched.set(actorId, set);
+    }
+    for (const path of paths) if (path !== '') set.add(path);
+  }
+
+  /**
+   * 取出并清空某会话本回合碰过的路径。
+   *
+   * **必须取走就清**：不清的话下一回合会一直带着上一回合的文件，提醒退化成噪音。
+   * 返回 `undefined` 表示"本回合没碰过文件"（而不是空数组），调用方据此直接跳过。
+   */
+  takeSessionTouched(actorId: string): string[] | undefined {
+    const set = this.sessionTouched.get(actorId);
+    if (set === undefined) return undefined;
+    this.sessionTouched.delete(actorId);
+    return set.size === 0 ? undefined : [...set];
+  }
+
+  /**
+   * 标记"本回合该会话已经汇报过进度"（`pm_report` / `pm_finish` 被调用）。
+   *
+   * 边界据此**不催**：已经写过的回合再催一次就是打扰，也会让"提醒"这个信号贬值。
+   */
+  noteSessionReported(actorId: string): void {
+    if (actorId === '') return;
+    this.sessionReported.add(actorId);
+    /**
+     * 顺手清掉本回合的触碰记录。
+     *
+     * 语义上更准确：既然已经汇报过，这批改动就"结账"了，下一回合不该再拿它去催；
+     * 而且这样"有没有武装"与"碰过路径"是**同一件事**，不必再单独记一个计数器
+     * （少一个状态就少一处会漂移的地方）。
+     */
+    this.sessionTouched.delete(actorId);
+  }
+
+  /**
+   * 本回合的**报告候选**：按"碰过的文件"×"该会话绑定的节点 refs"挑出来的节点。
+   *
+   * 纯查询、不改任何状态；没有碰过文件或没有候选时返回空数组（调用方据此不打扰）。
+   * 数字**不在这里产生** —— 它只回答"这一回合哪些节点可能有进展"，数字由模型给。
+   */
+  reportCandidatesFor(actorId: string): { candidates: ReportCandidate[]; touched: string[] } {
+    const touched = this.takeSessionTouched(actorId);
+    if (touched === undefined) return { candidates: [], touched: [] };
+    const bound = this.boundFacts.get(actorId) ?? [];
+    const nodes: CandidateNode[] = bound.map((node) => ({
+      nodeId: node.nodeId,
+      name: node.name,
+      ...(node.refs !== undefined ? { refs: node.refs } : {}),
+      done: node.derivedState === 'done' || node.derivedState === 'removed',
+    }));
+    return { candidates: pickReportCandidates(touched, nodes), touched };
+  }
+
+  /**
+   * 本回合是否已汇报过（读一次即消费，语义是"这一回合的账结掉"）。
+   */
+  consumeSessionReported(actorId: string): boolean {
+    const had = this.sessionReported.has(actorId);
+    this.sessionReported.delete(actorId);
+    return had;
   }
 
   /** 用一次派生结果刷新同步快照（actorId → 绑定节点）。 */
@@ -2790,7 +2903,26 @@ export class ProjectService {
 
     // 提醒：走 `agent.inject`（**不唤醒** driver）—— 这是官方文档里 "添加模型可见上下文"
     // 的那条路：idle 的 agent 会把它挂到下一次 pre-step，因此**不会**在回合边界自动烧 token。
-    const reminder = boundaryReminderText(plan);
+    //
+    // 两种提醒，按"有没有证据"分：
+    // ① **候选提醒（本回合有文件变动但没回写）**：这是"进度自动回写"的 ①+② ——
+    //    证据来自写工具触碰的路径（`sessionTouched`）× 节点自己声明的 `refs`。
+    //    它比下面那条"还在进行中"的提醒**有信息量得多**：模型拿到的不是"记得汇报"，
+    //    而是"你改的这些文件属于这几个节点"。数字仍然只由模型给（本模块绝不猜数字）。
+    // ② **仍在进行提醒**：原有的"该会话订阅的节点还没收尾"。
+    /**
+     * **已汇报**的回合不催：写过的回合再催一次就是打扰，也会让"提醒"这个信号贬值。
+     *
+     * 注意顺序：`reportCandidatesFor` 会**取走并清空**本回合触碰记录（有副作用），
+     * 所以已汇报时**不要调用它** —— 否则会白白吃掉证据。
+     * 汇报时 `noteSessionReported` 已经把触碰记录清掉了，所以这里不查也不会留下旧账。
+     */
+    const reported = this.consumeSessionReported(input.actorId);
+    const nudgeCandidates = reported ? [] : this.reportCandidatesFor(input.actorId).candidates;
+    const nudge = nudgeCandidates.length > 0 ? reportNudgeText(nudgeCandidates) : undefined;
+    const stillRunningReminder = boundaryReminderText(plan);
+    const reminder =
+      nudge === undefined ? stillRunningReminder : stillRunningReminder === undefined ? nudge : `${nudge}\n${stillRunningReminder}`;
     let reminded = false;
     if (
       reminder !== undefined &&
@@ -2805,6 +2937,10 @@ export class ProjectService {
     this.boundaryStats.runs += 1;
     this.boundaryStats.patches += applied.length;
     if (reminded) this.boundaryStats.reminders += 1;
+    if (nudge !== undefined) {
+      this.boundaryStats.reportNudges += 1;
+      this.boundaryStats.lastNudgeActorId = input.actorId;
+    }
     this.boundaryStats.lastKind = input.kind;
     this.boundaryStats.lastActorId = input.actorId;
     this.boundaryStats.lastAt = this.deps.clock.now();
@@ -2845,6 +2981,15 @@ export class ProjectService {
     patches: number;
     reminders: number;
     injected: number;
+    reportNudges: number;
+    lastNudgeActorId: string;
+    /**
+     * 当前**处于武装状态**的会话数：已经碰过文件、但还没汇报的会话。
+     *
+     * 为什么这个数值得暴露：它是"机制活着"的**实时证据**。数值 > 0 说明有会话改了文件却
+     * 还没回写 —— 下一个回合边界就会催；长期恒为 0 则说明采集没生效（而不是"大家都汇报得很好"）。
+     */
+    nudgeArmed: number;
     lastKind: string;
     lastActorId: string;
     lastAt: string;
@@ -2855,6 +3000,7 @@ export class ProjectService {
   } {
     return {
       ...this.boundaryStats,
+      nudgeArmed: this.sessionTouched.size,
       enabled: this.deps.config.sessionBoundaryWriteback !== false,
       prompt: this.deps.config.sessionBoundaryPrompt !== false,
       promptState: this.promptRegistration,
