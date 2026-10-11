@@ -86,6 +86,37 @@ describe('AI 输出解析', () => {
     assert.deepEqual(outcome.value.nodes[0]?.refs, [{ type: 'dir', target: 'src' }]);
   });
 
+  /**
+   * refs 也要过校验（2026-10-11 补）。真机现场：重建的树上出现了指向 `.venv`、
+   * `.mypy_cache` 的 refs —— 模型给的路径此前被直接采信。**只**排非代码产物，
+   * `tests` / `examples` 是合法引用（"补单元测试"的节点本来就该 refs 到 tests/）。
+   */
+  it('refs 指向非代码产物（虚拟环境/缓存/构建输出）→ 丢弃该引用并记说明', () => {
+    const outcome = parseTreeResponse(
+      '{"nodes":[{"name":"根","refs":[' +
+        '{"type":"dir","target":".venv"},' +
+        '{"type":"code","target":"server/.venv/lib/x.py"},' +
+        '{"type":"code","target":".mypy_cache/3.11/os.json"},' +
+        '{"type":"code","target":"server/crates/entity/src/genetics.rs"},' +
+        '{"type":"dir","target":"tests"}' +
+        ']}]}',
+    );
+    assert.equal(outcome.ok, true);
+    if (!outcome.ok) return;
+    assert.deepEqual(
+      outcome.value.nodes[0]?.refs,
+      [
+        { type: 'code', target: 'server/crates/entity/src/genetics.rs' },
+        { type: 'dir', target: 'tests' },
+      ],
+      '只该丢掉非代码产物；真代码与 tests 必须保留',
+    );
+    assert.ok(
+      outcome.notes.some((note) => note.includes('非代码产物')),
+      `丢弃要留痕，实际 notes：${JSON.stringify(outcome.notes)}`,
+    );
+  });
+
   it('实测回归：`type:"file"` 这类别名要归一，而不是把整棵树判失败', () => {
     // 这是真实跑出来过的输出片段：模型把引用类型写成 "file"，早先版本直接整树被拒
     const outcome = parseTreeResponse(

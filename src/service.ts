@@ -62,6 +62,7 @@ import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import { nextTaskOf, type TaskCandidate } from './domain/next-task.ts';
 import {
   DEFAULT_SCAN_OPTIONS,
+  NON_CODE_ARTIFACT_EXCLUDE,
 } from './domain/scanner.ts';
 
 /**
@@ -72,6 +73,9 @@ import {
  * `client.js`、`.map` 全建成了"任务点"，用户一眼就看出不对）。
  */
 export const DEFAULT_SCAN_EXCLUDE: readonly string[] = [
+  // 非代码产物（虚拟环境 / 缓存 / 构建输出 / 日志）：与建树表**同一份定义**，
+  // 否则就会重演"只排了 JS 生态"那一幕（见 NON_CODE_ARTIFACT_EXCLUDE 的注释）。
+  ...NON_CODE_ARTIFACT_EXCLUDE,
   'node_modules',
   '.git',
   '.pm',

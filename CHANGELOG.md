@@ -37,11 +37,15 @@
 
 ### 修复
 
-- **扫描排除表补上 Python 生态**：节点 `refs` 曾指向 `.venv/Lib/site-packages/aiohttp`、
-  `.mypy_cache`、`__pycache__` 这类第三方依赖与缓存 —— 原排除表只排 JS 生态
-  （`node_modules`/`dist`/`.next`…），Python 生态一个都没排。查 glob 语义时发现原先的
-  假设是错的，实测钉住两条：一条 `**/x` **同时覆盖根层与任意嵌套层**，所以补排除项写这
-  一种就够；且**不跨目录名**（`a/xnode_modules` 不算 `a/*/node_modules`）。
+- **钉住扫描排除表的 glob 语义（**更正**：这一条原先写的是"补上 Python 生态"，那是错的）**：
+  节点 `refs` 曾指向 `.venv/Lib/site-packages/aiohttp`、`.mypy_cache`、`__pycache__` 这类
+  第三方依赖与缓存 —— 原排除表只排 JS 生态（`node_modules`/`dist`/`.next`…），Python 生态
+  一个都没排。**但这一版实际只落了测试，排除项本身并没有补**（提交 `0fd8e63` 只改了
+  `tests/domain/scanner.test.ts`）：实测钉住了两条 glob 语义 —— 一条 `**/x` **同时覆盖根层
+  与任意嵌套层**，所以补排除项写这一种就够；且**不跨目录名**（`a/xnode_modules` 不算
+  `a/*/node_modules`）。**后果在 2026-10-11 的 AIG 重建树上复现了**：`.venv`（该工作区有
+  67233 个文件）与 `.mypy_cache` 仍然成了节点的 `refs`。补排除项与"AI 提议的 refs 也要过
+  一遍排除表"见后续版本。
 
 ### 说明
 

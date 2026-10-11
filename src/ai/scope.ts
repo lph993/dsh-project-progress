@@ -26,7 +26,7 @@
  * `DEFAULT_SCAN_EXCLUDE + AI_BUILD_EXCLUDE + 用户自己的 scanExclude`。
  */
 
-import { matchesGlob } from '../domain/scanner.ts';
+import { matchesGlob, NON_CODE_ARTIFACT_EXCLUDE } from '../domain/scanner.ts';
 
 /**
  * 建树时额外排除的 glob（在 `DEFAULT_SCAN_EXCLUDE` 之上叠加）。
@@ -35,6 +35,10 @@ import { matchesGlob } from '../domain/scanner.ts';
  * 像 `scripts`、`**.config.*` 这种**代码**一律不放进来（见文件头的界线表）。
  */
 export const AI_BUILD_EXCLUDE: readonly string[] = [
+  // ── 非代码产物：虚拟环境 / 缓存 / 构建输出（与扫描表**同一份定义**）──
+  // 为什么必须在这里也带上：建树骨架 = DEFAULT_SCAN_EXCLUDE + 本表 + 用户配置，
+  // 少一边就等于 Python/Rust 生态没排（真机后果见 NON_CODE_ARTIFACT_EXCLUDE 的注释）。
+  ...NON_CODE_ARTIFACT_EXCLUDE,
   // ── 测试（含测试资产）────────────────────────────────────
   'tests',
   'test',
@@ -96,4 +100,22 @@ export const AI_BUILD_EXCLUDE: readonly string[] = [
 export function isOutsideMainCode(relativePath: string): boolean {
   const path = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
   return AI_BUILD_EXCLUDE.some((glob) => matchesGlob(path, glob));
+}
+
+/**
+ * 这条路径是不是**非代码产物**（虚拟环境 / 缓存 / 构建输出 / 日志）。
+ *
+ * ## 与 `isOutsideMainCode` 的区别（别混用）
+ *
+ * `isOutsideMainCode` 是**骨架**的口径（"只给主要代码"，连 `tests` / `examples`
+ * 都不给模型看）；而节点的 `refs` 允许指向测试、示例这类**真实文件**——
+ * 一个"补单元测试"的节点当然该 refs 到 `tests/`。所以校验 refs 时**只**排非代码产物，
+ * 不能拿整张建树排除表去卡（那会把合法的测试引用一起丢掉）。
+ *
+ * 真机现场（2026-10-11）：模型的 refs 直接落库、不过任何校验，于是 `.venv`、
+ * `.mypy_cache` 成了节点的 refs —— 正是批次 70 记录过的那类垃圾引用。
+ */
+export function isNonCodeArtifact(relativePath: string): boolean {
+  const path = relativePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  return NON_CODE_ARTIFACT_EXCLUDE.some((glob) => matchesGlob(path, glob));
 }

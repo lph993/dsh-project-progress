@@ -16,6 +16,7 @@
  */
 
 import type { NodeKind } from '../shared/types.ts';
+import { isNonCodeArtifact } from './scope.ts';
 
 /** 归一后的引用类型（与 `Ref` 的类型子集一致）。 */
 export type AiRefType = 'dir' | 'md' | 'code';
@@ -382,6 +383,19 @@ export function parseTreeResponse(text: string): ParseOutcome {
     const refs = (Array.isArray(record['refs']) ? record['refs'] : [])
       .map((ref) => normalizeRef(ref, name, notes))
       .filter((ref): ref is { type: AiRefType; target: string } => ref !== undefined)
+      /**
+       * **refs 也要过一遍校验**（此前直接采信模型给的路径）。
+       *
+       * 真机现场（2026-10-11）：重建的树上出现了指向 `.venv`、`.mypy_cache` 的 refs ——
+       * 正是批次 70 记录过的那类"第三方依赖/缓存当功能点引用"的垃圾。
+       * 这里**只**排非代码产物（`isNonCodeArtifact`），不排 `tests` / `examples`：
+       * 一个"补单元测试"的节点本来就应该 refs 到 `tests/`（见那个函数的注释）。
+       */
+      .filter((ref) => {
+        if (!isNonCodeArtifact(ref.target)) return true;
+        notes.push(`「${name}」的 refs 里 ${ref.target} 是非代码产物（虚拟环境/缓存/构建输出），已丢弃`);
+        return false;
+      })
       .slice(0, 12);
 
     const kindDecision = normalizeKind(record['kind'], 'task');
