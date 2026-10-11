@@ -5126,3 +5126,134 @@ test('refs 写入通道：pm_add 能带 refs、pm_progress 能补 refs、同身�
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+
+/**
+ * **骨架没装下时直接分批**，以及**分批不许把整棵树标成"疑似遗留"**（批次 77 + 78）。
+ *
+ * ## 现场（AIG，2026-10-11）
+ *
+ * 那个工作区遍历 **15,398** 条、骨架只有 **800** 条（**只看到 5.2%**）。原来的分工是
+ * "单次**失败**才分批"，可它单次一次**成功**、没有任何失败信号 —— 于是深层内容整片没进模型，
+ * 「模型验证与数值比对」那一支静默消失，看板上连提示都没有。
+ *
+ * 改成"截断就直接分批"之后又暴露第二个问题：6 片各自跑一遍 `applyAiTree`，每片都把
+ * **其余片刚建的节点**判成"本轮没再提到" ⇒ 真机上 **52 个节点里 48 个被标 `stale`**。
+ *
+ * ## 判据（这个测试同时钉住两件事）
+ *
+ * ① **不先发整仓请求**：整个流程里没有任何一次提示词**同时**包含三个顶层目录
+ *    （整仓那份会包含全部），并且调用次数 == notes 里说的片数（有一次失败重试就会多 1）；
+ * ② **`stale` 一个都不许有**：每片的节点都带 `progress`（于是"被推进过"、够格被标遗留），
+ *    若哪一片的 apply 做了全局判断，就会把别片的节点标上。
+ */
+test('骨架被截断：直接分批（不先发整仓），且分批不许把别片建的节点标成 stale', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-trunc-'));
+  /**
+   * 造 **> 400 个文件**（`DEFAULT_MAX_SKELETON_ENTRIES` 是 400 ⇒ 骨架必然被截断），
+   * 分成 3 个顶层目录。文件直接放在顶层下（没有第二级目录），所以分片切不出更细的片。
+   */
+  const tops = ['alpha', 'beta', 'gamma'];
+  for (const top of tops) {
+    mkdirSync(join(workspace, top), { recursive: true });
+    for (let index = 0; index < 200; index += 1) {
+      writeFileSync(
+        join(workspace, top, `f${String(index).padStart(3, '0')}.ts`),
+        `export const v${index} = ${index};\n`,
+      );
+    }
+  }
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      throw new Error('本测试必须走注入的假流，不该碰真 llm');
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ nodes: Array<{ name: string; progress: number; stale?: boolean }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  let modelCalls = 0;
+  /** 每次调用看到的顶层目录 —— 用来证明"没有发过整仓请求"。 */
+  const topsSeenPerCall: string[][] = [];
+  const streamOf = (text: string) =>
+    (async function* () {
+      yield { type: 'block-start', index: 0, blockType: 'text' };
+      yield { type: 'text-delta', index: 0, text };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+      yield { type: 'finish', reason: 'stop' };
+    })();
+  const fakeStream = {
+    stream: (options: { messages?: unknown[] }) => {
+      modelCalls += 1;
+      const promptText = JSON.stringify(options.messages ?? []);
+      const seen = tops.filter((name) => promptText.includes(`${name}/`));
+      topsSeenPerCall.push(seen);
+      const top = seen[0] ?? `unknown${modelCalls}`;
+      return streamOf(
+        JSON.stringify({
+          projectName: '截断演示',
+          nodes: [
+            {
+              name: `模块 ${top}`,
+              kind: 'feature',
+              parent: null,
+              weight: 4,
+              priority: 5,
+              // 带 progress ⇒ 这个节点"被推进过"，够格被后来的片标成遗留（正是要防的）
+              progress: 0.5,
+            },
+          ],
+        }),
+      );
+    },
+  };
+
+  const result = await service.aiBuildTree({ confirm: true, stream: fakeStream });
+  assert.equal(result['status'], 'ok', JSON.stringify(result));
+
+  // ① 不先发整仓请求：没有任何一次的提示词同时含三个顶层
+  assert.ok(modelCalls >= 2, `骨架被截断就必须分批，实际调用 ${modelCalls} 次`);
+  for (const [index, seen] of topsSeenPerCall.entries()) {
+    assert.ok(
+      seen.length <= 2,
+      `第 ${index + 1} 次调用的提示词里出现了 ${seen.length} 个顶层（${seen.join('、')}）—— ` +
+        '看起来发出了整仓请求；骨架被截断时应当**直接**分批，不先赌一次单次',
+    );
+  }
+  const notes = (result['notes'] as string[]).join('\n');
+  const shardsInNotes = Number(/共 (\d+) 片/.exec(notes)?.[1] ?? '0');
+  assert.ok(shardsInNotes >= 2, `notes 要说清片数：${notes}`);
+  assert.equal(
+    modelCalls,
+    shardsInNotes,
+    `调用次数必须等于片数（多一次就说明先发了一次整仓请求）：实际 ${modelCalls} 次 / ${shardsInNotes} 片`,
+  );
+
+  // ② stale 一个都不许有（分片是局部视图，没资格做"整棵树没再提到"的判断）
+  const board = await service.board();
+  assert.deepEqual(
+    board.nodes.filter((node) => node.stale === true).map((node) => node.name),
+    [],
+    '分批时不许把别的片刚建的节点标成疑似遗留（真机曾 48/52 全被标）',
+  );
+  // 前置自检：节点确实带上了 progress（否则"够格被标"这个前提不成立、测试会空转）
+  assert.ok(
+    board.nodes.some((node) => node.progress > 0),
+    `前置条件：分片建的节点要带 progress，实际 ${JSON.stringify(board.nodes.map((n) => n.progress))}`,
+  );
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});

@@ -320,8 +320,19 @@
  * 改法：`AiEstimate` 新增 `plannedShards`，`estimateAiBuild` 用它把 `calls` 设成真实片数，
  * `describeEstimate` 据此换措辞（"**这次会直接按顶层目录分批（N 片）**，不等失败再重试；
  * 上面的条目数与输入 token 是按 N 片合计"）。措辞只留一处，service 里那句叠加上去的说明删掉。
+ *
+ * ## 批次 80 的用途
+ *
+ * **0.3.1 发布**：把批次 72–79 的这一串修复发出去（读路径按会话、面板删除自愈、建树排除表、
+ * 骨架广度、骨架深度、refs 写入通道、成功但浅、stale 满屏、预估口径）。
+ *
+ * 本批**不再引入任何行为变更** —— 批次号 +1 的理由与批次 68 / 71 相同：**版本号被内联进宿主
+ * 产物**（`src/index.ts` 的 `__PM_VERSION__`），所以发布产物与批次 79 的开发产物不是同一份字节，
+ * 诊断页要靠这个数自证"跑的是哪一份代码"。
+ *
+ * 对照 0.3.0：那一版只带批次 69/70 两个功能批；0.3.1 带的是 **9 个修复**（其中 4 个是真 bug）。
  */
-export const HOST_BATCH = 79;
+export const HOST_BATCH = 80;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {
