@@ -5494,6 +5494,49 @@ export class ProjectService {
         `窗口余量不足：把输出上限从 ${outputLimit.limit} 压到 ${maxTokens}（窗口 ${windowTokens} − 输入粗估 ${requiredByInput}）`,
       );
     }
+    /**
+     * **骨架没把仓库装下 ⇒ 直接分批，不等失败**（2026-10-11，真机现场驱动）。
+     *
+     * 原来的分工是"单次**失败**（空返回/输出不合法/被截断）才分批"。但大仓库可以
+     * **"成功但浅"**：AIG 那次遍历 **15,398** 条、骨架只有 **800** 条（**只看到 5.2%**），
+     * 单次一次成功、**没有任何失败信号**，于是静默漏掉整片内容 —— `aitest` 深层的
+     * `verify_*` 一支从此不存在，而看板上连一条提示都没有（`droppedTops` 是空的，
+     * 因为每个顶层都进了 ≥1 条）。
+     *
+     * 骨架被截断**本身就是"没看全"的直接证据**，有证据就不该再赌单次能覆盖。
+     * 装不出 ≥2 片时（小仓库被误判）由 `aiBuildTreeSharded` 自己判失败，照旧走单次。
+     */
+    if (collected.truncated) {
+      const direct = await this.aiBuildTreeSharded({
+        skeleton: collected.skeleton,
+        entries: collected.entries,
+        root,
+        projectName: collected.projectName,
+        maxNodes: input.maxNodes ?? 60,
+        describeOnly,
+        replaceAutoDraft: input.replaceAutoDraft !== false,
+        estimate: preflight.estimate,
+        route: route.route,
+        ...(outputLimit.source === 'plugin' && maxTokens !== undefined ? { maxTokens } : {}),
+        ...(maxTokens !== undefined ? { displayLimit: maxTokens } : {}),
+        ...(input.agent !== undefined ? { agent: input.agent } : {}),
+        ...(input.callId !== undefined ? { callId: input.callId } : {}),
+        ...(input.stream !== undefined ? { stream: input.stream } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      });
+      if (direct.status === 'ok') {
+        debugBus.info(
+          'ai',
+          `骨架被截断（仓库没装下）⇒ 直接分批建树：${direct.shards} 片，` +
+            `新建 ${direct.result.created}、更新 ${direct.result.updated}`,
+        );
+        return direct.result;
+      }
+      debugBus.info(
+        'ai',
+        `骨架被截断但切不出 ≥2 片（${direct.message}）→ 退回单次建树`,
+      );
+    }
     const cache = await this.inspectAiCache(prompt, route.route, maxTokens, collected.skeleton);
     // 强制重算：把命中/续跑一律降级为"未命中"（仍然照常写回新缓存）
     const verdict: CacheVerdict =
@@ -6151,18 +6194,25 @@ export class ProjectService {
       debugBus.warn('ai', `有 ${collected.unreadable.length} 个关键文件读不到签名（已如实跳过）`);
     }
     /**
-     * **如实报告骨架截断**（FR-174 的警示通道 → 看板 alerts 与 `/pm/debug` 同一个数）。
+     * **如实报告骨架覆盖不足**（FR-174 通道 → 看板 alerts 与 `/pm/debug` 同一个数）。
      *
-     * 为什么必须报：骨架被截断时，没进模型的顶层目录对模型**根本不存在**，
-     * 建出来的树上当然不会有它们。不报的话，用户看到"树里没有 server/"只能猜是模型判断错了
-     * （真机现场就是这么误判的 —— 实际上是 `aitest` + `nrfunc` 吃掉了 92% 的预算）。
+     * 为什么必须报：没进模型的区域对模型**根本不存在**，建出来的树上当然不会有它们。
+     * 而"每个顶层都进了 ≥1 条"**并不等于看全了** —— AIG 那次遍历 15,398 条、骨架只有
+     * 800 条（只看到 **5.2%**），`aitest` 深层的 `verify_*` 整片没进，而 `droppedTops`
+     * 是空的。所以这里必须报**覆盖率**，不能只报"哪些顶层一条没进"。
      */
-    if (collected.droppedTops.length > 0) {
+    if (collected.truncated) {
+      const totalEntries = collected.coverage.reduce((sum, row) => sum + row.total, 0);
+      const keptEntries = collected.coverage.reduce((sum, row) => sum + row.kept, 0);
+      const percent =
+        totalEntries === 0 ? 0 : Math.round((keptEntries / totalEntries) * 1000) / 10;
       debugBus.warn(
         'ai',
-        `骨架被截断：${collected.droppedTops.length} 个顶层目录一条都没进模型` +
-          `（${collected.droppedTops.join('、')}）—— 建出来的树不会有它们。` +
-          '可用设置页的 scanExclude 收窄范围，或把不重要的子树排掉后重跑。',
+        `骨架没把仓库装下：遍历 ${totalEntries} 条，只有 ${keptEntries} 条进了模型（**${percent}%**）` +
+          (collected.droppedTops.length > 0
+            ? `；其中 ${collected.droppedTops.length} 个顶层目录一条都没进（${collected.droppedTops.join('、')}）`
+            : '；每个顶层都进了至少一条，但**内部被截断**') +
+          '。建树会直接分批（每片各一份预算）；要更准就先用设置页的 scanExclude 收窄范围。',
       );
     }
     const projectName = walked.packageName ?? walked.rootDirName;
@@ -6228,6 +6278,31 @@ export class ProjectService {
     let updated = 0;
     let removed = 0;
     let workingGraph = graph;
+    /**
+     * **「完成度初判」给了几条？一条都没给时要如实说出来。**
+     *
+     * 真机现场（AIG 重建，2026-10-11）：33 个节点**一个都没带 `progress`**，而新节点在存储里的
+     * 默认值就是 `progress: 0` —— 于是看板显示 `整体 0.0%`，读起来像"这个项目什么都没做"，
+     * 而仓库里明显有大量已完成代码。根因是提示词里"看不见就省略（不要猜 0）"这句，
+     * 与"省略会被显示成 0%"是**互相矛盾**的：存储层根本表达不了"未评估"。
+     *
+     * 两头一起收紧：提示词改成**必须给**（看不到就给带依据的 0），这里再兜一层 ——
+     * 真的一条都没给时，明确告诉用户"0% 是未评估，不是没做"。
+     */
+    const estimatedCount = tree.nodes.filter((node) => node.progress !== undefined).length;
+    const progressNotes: string[] =
+      estimatedCount === 0 && tree.nodes.length > 0
+        ? [
+            `⚠ 本轮**没有任何完成度初判**（${tree.nodes.length} 个节点都没给 progress）：` +
+              '看板上的 0% 表示**未评估**，不是"没做"。',
+          ]
+        : [`完成度初判：${estimatedCount} / ${tree.nodes.length} 个节点给了 progress。`];
+    if (estimatedCount === 0 && tree.nodes.length > 0) {
+      debugBus.warn(
+        'ai',
+        '本轮建树没有任何完成度初判：看板上的 0% 表示"未评估"，不是"没做"（提示词已要求必须给，这轮模型没照做）',
+      );
+    }
 
     // ① 先清掉"没人动过的**阶段 A** 草稿"（阶段 B 改写阶段 A 的骨架，§6.4b）
     //
@@ -6996,6 +7071,7 @@ export class ProjectService {
       staleCleared,
       // 单一根规范化与"同名复用"的说明放在最前面：它们改的是**结构**，比"新建了几个节点"更该先看到
       notes: [
+        ...progressNotes,
         ...rootNotes,
         ...(reused > 0
           ? [
