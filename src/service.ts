@@ -5231,6 +5231,61 @@ export class ProjectService {
   }
 
   /**
+   * 分批时**真实的**预估口径：把每一片要发出去的提示词都拼出来，再求和。
+   *
+   * ## 为什么必须这么算
+   *
+   * `aiBuildTree` 在骨架被截断时**直接分批**（批次 77），而分批是 **N 次调用、每片各带
+   * 一份骨架**。若沿用单次那份 800 条骨架的预估，确认框里会写着
+   * 「规模小，成本很低……**预计 1 次调用**、输入约 3536 token」，而**实际发了 6 次、
+   * 输入 15,830 token**（真机实测，2026-10-11）—— 本仓库对这件事的口径是硬的：
+   * **预估与实际不一致就是在骗人**（T6）。
+   *
+   * 与执行路径共用同一套分片与上限口径（`shardSkeleton` + `DEFAULT_MAX_SKELETON_ENTRIES`
+   * + 按文件占比分摊节点数），所以这里算出来的就是真会发出去的那些字。
+   */
+  private async planShardPrompts(input: {
+    root: string;
+    projectName: string;
+    entries: ReadonlyArray<{
+      path: string;
+      kind: 'file' | 'dir';
+      sizeBytes?: number;
+      mtimeMs?: number;
+    }>;
+    maxNodes: number;
+  }): Promise<{ count: number; promptBytes: number; entries: number } | undefined> {
+    const shards = shardSkeleton(input.entries);
+    // 装不出 ≥2 片：与执行路径一样退回单次，所以**没有**分批口径可报
+    if (shards.length <= 1) return undefined;
+    const totalFiles = Math.max(1, input.entries.filter((entry) => entry.kind === 'file').length);
+    let promptBytes = 0;
+    let entries = 0;
+    for (const shard of shards) {
+      const per = await collectSkeleton({
+        root: input.root,
+        entries: shard.entries,
+        maxEntries: DEFAULT_MAX_SKELETON_ENTRIES,
+        countSource: input.entries,
+      });
+      const shardFiles = shard.entries.filter((entry) => entry.kind === 'file').length;
+      const shardMaxNodes = Math.min(
+        input.maxNodes,
+        Math.max(4, Math.round((input.maxNodes * shardFiles) / totalFiles)),
+      );
+      const prompt = buildTreePrompt({
+        projectName: input.projectName,
+        skeleton: per.skeleton,
+        maxNodes: shardMaxNodes,
+        ...(per.truncated ? { truncated: true } : {}),
+      });
+      promptBytes += Buffer.byteLength(prompt, 'utf8');
+      entries += per.skeleton.length;
+    }
+    return { count: shards.length, promptBytes, entries };
+  }
+
+  /**
    * AI 建树的成本预估（**不调用模型**）。
    *
    * 只用手上已有的元数据：遍历到的目录/文件数、关键文件签名字节。
@@ -5295,10 +5350,23 @@ export class ProjectService {
     }
     const outputLimit = await this.effectiveOutputLimit(route.route);
     const maxTokens = outputLimit.limit;
+    /**
+     * **骨架被截断 ⇒ 会直接分批**（批次 77）。所以预估值必须按**分批口径**给：
+     * N 片、每片各带一份骨架。否则确认框会写着"1 次调用 / 输入约 3536 token"，
+     * 而实际发 6 次、输入 15,830 token（真机实测）—— 那就是预估在骗人（T6）。
+     */
+    const shardedPlan = collected.truncated
+      ? await this.planShardPrompts({
+          root,
+          projectName: collected.projectName,
+          entries: collected.entries,
+          maxNodes: maxNodesForEstimate,
+        })
+      : undefined;
     const estimate = estimateAiBuild({
-      entries: collected.skeleton.length,
+      entries: shardedPlan?.entries ?? collected.skeleton.length,
       signatureBytes: collected.signatureBytes,
-      promptBytes: collected.promptBytes,
+      promptBytes: shardedPlan?.promptBytes ?? collected.promptBytes,
       ...(maxTokens !== undefined ? { maxOutputTokens: maxTokens } : {}),
       outputLimitSource: outputLimit.source,
       ...(outputLimit.contextWindow !== undefined ? { contextWindow: outputLimit.contextWindow } : {}),
@@ -5327,7 +5395,13 @@ export class ProjectService {
     return {
       available: true,
       estimate,
-      description: describeEstimate(estimate),
+      description:
+        describeEstimate(estimate) +
+        (shardedPlan !== undefined
+          ? `\n\n> ⚠ **这次会直接分批**：骨架没把仓库装下（只覆盖一部分），建树会按顶层切成 ` +
+            `**${shardedPlan.count} 片**、每片各带一份骨架 —— 上面的条目数与输入 token 是` +
+            `**按 ${shardedPlan.count} 片合计**的口径，实际会发 ${shardedPlan.count} 次调用。`
+          : ''),
       route: `${route.route.provider} / ${route.route.model}（${route.route.source === 'config' ? '设置' : '跟随默认模型'}）`,
       cache: {
         state: reusable && cache.verdict.kind === 'hit'
@@ -6048,6 +6122,9 @@ export class ProjectService {
       const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
         // ① 只有第一片清理阶段 A 草稿（见方法头注释）
         replaceAutoDraft: input.replaceAutoDraft && index === 0,
+        // ② 每片都是**局部**视图 ⇒ 不许做"本轮没再提到"这类全局判断（否则片 N 会
+        //    把其余片刚建的节点全标成 stale —— 真机 52 个节点里 48 个被标）
+        partialView: true,
         ...(input.agent !== undefined ? { agent: input.agent } : {}),
         ...(input.callId !== undefined ? { callId: input.callId } : {}),
       });
@@ -6253,7 +6330,22 @@ export class ProjectService {
   private async applyAiTree(
     tree: AiTree,
     _notes: string[],
-    options?: { replaceAutoDraft?: boolean; agent?: unknown; callId?: string },
+    options?: {
+      replaceAutoDraft?: boolean;
+      agent?: unknown;
+      callId?: string;
+      /**
+       * **分批路径必须传 true**：这是一棵**局部**树（只覆盖一个分片），
+       * 因此不许做"本轮没再提到"这类**全局**判断。
+       *
+       * 真机现场（AIG 第四次重建，2026-10-11）：6 片各自跑一遍 `applyAiTree`，
+       * 每片都把**其余 5 片刚建的节点**判成"本轮没再提到" ⇒ 52 个节点里 **48 个**
+       * 被标成 `stale`（疑似遗留）。这个标记本该是"一眼看出该清理哪些"，
+       * 全树 92% 都被标上之后它彻底失去意义。
+       * "回来了就撤销 stale"那半段仍然保留 —— 它只看本片用到的 id，是安全的。
+       */
+      partialView?: boolean;
+    },
   ): Promise<{
     projectName: string;
     created: number;
@@ -6976,7 +7068,8 @@ export class ProjectService {
      * 另外：按**身份键**与**名称**双重判断"本轮是否真的没再提到"，两者有一个命中就不标。
      */
     for (const candidate of liveNodesForStale) {
-      // ③ 被再次认领/复用 ⇒ 它又出现了，撤销 stale（"回来了就不算遗留"）
+      // ③ 被再次认领/复用 ⇒ 它又出现了，撤销 stale（"回来了就不算遗留"）。
+      //    这半段对分批也安全：它只看**本片**用到的 id，不会冤枉别人。
       if (usedIds.has(candidate.id)) {
         if (candidate.stale !== true) continue;
         const cleared = await this.patchNode({
@@ -6989,6 +7082,11 @@ export class ProjectService {
         continue;
       }
       // ② 本轮没被认领才算"遗留"
+      //
+      // 但**分批（局部分片）不许做这个判断**：一片只看到自己那块，让它判"没再提到"，
+      // 结果是每片都把其余片刚建的节点标成遗留（真机 48/52 全被标）。
+      // `stale` 的语义是"**整棵树**本轮没再提到"——只有整树建树才有资格下这个结论。
+      if (options?.partialView === true) continue;
       if (candidate.autoCreated !== true) continue;
       const state = derived.nodes.get(candidate.id);
       // ③ 没被推进过的自动节点归"草稿清理"管（上面已删），这里只处理"有人动过、删不掉"的那批
