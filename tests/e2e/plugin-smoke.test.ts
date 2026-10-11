@@ -1270,6 +1270,86 @@ test('删除项目：两段式确认、不允许删当前绑定、删完从列�
   rmSync(wsB, { recursive: true, force: true });
 });
 
+/**
+ * 删除项目的「是不是当前项目」必须按**发起删除的会话**判断，不能用全局绑定指针。
+ *
+ * ## 现场（真机，2026-10-11）
+ *
+ * 用户在面板上要删 AIG，得到的却是 `E_PROJECT_BOUND`「正是当前绑定的那个」——
+ * 因为面板的 `DELETE /pm/projects` 当时**不带会话 id**，只能拿全局 `this.projectId`
+ * 比；而那个指针被**另一个**会话（在 `Z:\Projects\AIG` 里干活的那个）按在了 AIG 上。
+ * 用户自己并不在 AIG 上 —— 判断落在了错误的对象上。
+ *
+ * 反过来同样危险：全局指针恰好指向别处时，会**放行删除面板正在看的那个项目**。
+ *
+ * 判据：带 `sessionId` 时，只有"**该会话自己的工作区**对应的项目"才不可删；
+ * 别的项目哪怕正被全局绑定，也应当可删。不带 `sessionId`（匿名）时保持原语义。
+ */
+test('删除项目：按发起会话判断「是不是当前项目」，不被全局绑定指针带偏', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-del-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-del-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    currentProjectId: string;
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(sessionId?: string): Promise<{ projectId: string }>;
+    listProjects(): Promise<Array<{ projectId: string }>>;
+    deleteProject(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  };
+
+  // A 会话在 wsA，B 会话在 wsB（两个项目）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
+  const projectA = service.currentProjectId;
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  const projectB = service.currentProjectId;
+  assert.notEqual(projectA, projectB);
+
+  // 现场：**全局绑定停在 B**（别人刚操作过），而 A 会话要删的正是 B
+  await service.board('session-B');
+  assert.equal(service.currentProjectId, projectB, '前置条件：全局绑定停在 B');
+
+  // ① A 会话（自己在 A）删 B → 必须放行（B 不是 A 会话的项目）
+  const preview = await service.deleteProject({ projectId: projectB, sessionId: 'session-A' });
+  assert.equal(
+    preview['status'],
+    'needs-confirm',
+    `A 会话删 B 不该被"当前项目"挡住（旧实现会回 E_PROJECT_BOUND），实际：${JSON.stringify(preview)}`,
+  );
+
+  // ② 同一条件下，A 会话删**自己**的项目 → 必须拒（这条纪律本身不能松）
+  const own = await service.deleteProject({ projectId: projectA, sessionId: 'session-A' });
+  assert.equal(own['status'], 'denied', JSON.stringify(own));
+  assert.equal(own['code'], 'E_PROJECT_BOUND');
+
+  // ③ B 会话删自己的项目 → 同样拒（判断跟着会话走，不是跟着全局指针走）
+  const ownB = await service.deleteProject({ projectId: projectB, sessionId: 'session-B' });
+  assert.equal(ownB['status'], 'denied', JSON.stringify(ownB));
+  assert.equal(ownB['code'], 'E_PROJECT_BOUND');
+
+  // ④ 匿名（不带会话 id）保持原语义：全局绑定是 B ⇒ 删 B 仍被拒
+  const anon = await service.deleteProject({ projectId: projectB });
+  assert.equal(anon['status'], 'denied', JSON.stringify(anon));
+  assert.equal(anon['code'], 'E_PROJECT_BOUND');
+
+  // ⑤ 真删走通，且只少一个项目
+  const done = await service.deleteProject({ projectId: projectB, confirm: true, sessionId: 'session-A' });
+  assert.equal(done['status'], 'ok', JSON.stringify(done));
+  const left = (await service.listProjects()).map((p) => p.projectId);
+  assert.ok(!left.includes(projectB), 'B 应已删除');
+  assert.ok(left.includes(projectA), 'A 必须还在');
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
 test('老数据迁移：库里只有一个无根项目时被"认领"，而不是孤立它', async () => {
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-'));
   const otherRoot = mkdtempSync(join(tmpdir(), 'pm-e2e-adopt-other-'));

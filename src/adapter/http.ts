@@ -240,9 +240,16 @@ export function registerRoutes(
               sendJson(res, 400, { ok: false, error: 'projectId-required' });
               return;
             }
+            /**
+             * 面板会带上会话 id（与 `/pm/board` 一致）。不带的话，"是不是当前项目"只能拿
+             * **全局最后绑定**判断，而那个指针可能压根不是发起者所在的项目（实测踩过：
+             * 面板要删 AIG，却因为**另一个**会话刚把 AIG 绑上而被拒）。
+             */
+            const sessionId = readSessionId(body, params);
             const outcome = await service.deleteProject({
               projectId,
               ...(parsedBody.confirm === true ? { confirm: true } : {}),
+              ...(sessionId !== undefined ? { sessionId } : {}),
             });
             sendJson(res, outcome.status === 'denied' ? 400 : 200, outcome);
             return;

@@ -982,6 +982,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     const pending = projectDelete?.projectId === projectId ? projectDelete : undefined;
     void deleteProject(
       pending !== undefined ? { projectId, confirm: true } : { projectId },
+      undefined,
+      sessionId,
     ).then((outcome) => {
       const value = outcome.value;
       if (value === undefined) {
@@ -1003,7 +1005,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       setRootNotice(`已删除项目（${value.removedNodes} 个节点一并清除）`);
       refresh();
     });
-  }, [board?.projectId, projectDelete, refresh]);
+  }, [board?.projectId, projectDelete, refresh, sessionId]);
 
   /**
    * 回滚浮层（FR-51b/53b）：**选回滚点 + 选范围**，所以不能复用"是/否"确认框。

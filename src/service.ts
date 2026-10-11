@@ -1469,20 +1469,48 @@ export class ProjectService {
   }
 
   /**
+   * 这次调用所属会话**正在用的**项目 id（**判断用，不产生绑定副作用**）。
+   *
+   * 为什么不能直接用全局 `this.projectId`：那是"**任何**会话最后一次绑定"，
+   * 与"发起这次调用的会话在哪个项目上"是两回事。真机现场（面板要删 AIG 却被拒）：
+   * 全局指针被**另一个**会话按在了 AIG 上，而用户自己的会话在别的项目 ——
+   * 于是"当前项目"这个判断落在了错误的对象上。
+   *
+   * 判据顺序：
+   * ① 没有会话上下文（匿名面板轮询）→ 沿用全局绑定（保持原语义）；
+   * ② 全局绑定**就是这个会话**留下的（`boundRootSession`）→ 直接是它，无歧义；
+   * ③ 其余 → 按该会话自己的根反查项目；查不到说明它还没有项目（那就谁也拦不住）。
+   */
+  private async callerProjectId(sessionId?: string): Promise<string | undefined> {
+    if (sessionId === undefined || sessionId === '') return this.projectId;
+    if (this.boundRootSession === sessionId) return this.projectId;
+    const root = this.resolveRoot(sessionId).root;
+    if (root === undefined || root === '') return undefined;
+    const projects = await this.listProjects();
+    const match = projects.find(
+      (meta) => meta.workspaceRoot !== undefined && isSameRoot(meta.workspaceRoot, root),
+    );
+    return match?.projectId;
+  }
+
+  /**
    * **删除一个项目**（连同它的全部节点、进度、审计、冲突、快照记录）。
    *
    * 为什么需要：幽灵空项目与"试错留下的整棵树"没有别的清理入口 —— 只能在树里一枝一枝删，
    * 而用户真正想扔的是**整个项目**（真机现场：AIG 那棵按目录建的树、VideoFix 的空壳）。
    *
    * 纪律：
-   * ① **不允许删当前绑定的项目**（`force` 也不行）—— 删掉它之后再读就会退到**别的项目**，
-   *    等于静默换了项目，比删不掉更糟。要删就先去那个工作区（绑定会跟着根走）。
+   * ① **不允许删「调用者自己所在」的那个项目**（`force` 也不行）—— 删掉它之后再读就会
+   *    退到**别的项目**，等于静默换了项目，比删不掉更糟。注意是"调用者自己的"，
+   *    不是"全局最后绑定的那个"（见 `callerProjectId`：后者会把判断落到错误对象上）。
    * ② 两阶段：`confirm !== true` 时**只回影响范围**（节点数 / 枝数 / 名字样例），不落库。
    * ③ 真删时走存储端口的 `deleteProject()`（它已经会清两张节点表 + meta + global 里的 id）。
    */
   async deleteProject(input: {
     projectId: string;
     confirm?: boolean;
+    /** 发起这次删除的会话（面板会带上它，见下）。 */
+    sessionId?: string;
   }): Promise<
     | { status: 'denied'; code: string; message: string; hint?: string }
     | { status: 'needs-confirm'; preview: string; action: 'delete-project' }
@@ -1496,14 +1524,28 @@ export class ProjectService {
         message: `项目 ${input.projectId} 不存在（可能已经被删过）`,
       };
     }
-    if (input.projectId === this.projectId) {
+    /**
+     * 「是不是当前项目」必须按**发起删除的会话**来算，不能用全局 `this.projectId`。
+     *
+     * 全局那个是"**任何**会话最后一次绑定"，可能根本不是发起者的项目 —— 真机现场：
+     * 用户在面板上要删 AIG，却因为**另一个**会话刚把 AIG 绑上而被拒；他看到的是
+     * "不能删除"，而它并不是他正在看的项目（他自己的项目是另一个）。
+     * 反过来也一样糟：全局指针恰好指向别处时，会**放行删除面板正在看的那个项目**。
+     *
+     * 面板的 `DELETE /pm/projects` 现在也带会话 id（与 `/pm/board` 一致）。
+     * 不带会话 id（匿名调用）时保持原语义，用全局绑定判断。
+     */
+    const callerProjectId = await this.callerProjectId(input.sessionId);
+    if (callerProjectId !== undefined && callerProjectId === input.projectId) {
       return {
         status: 'denied',
         code: 'E_PROJECT_BOUND',
         message:
-          `项目「${meta.projectName}」正是**当前绑定**的那个，不能在这里删 —— ` +
+          `项目「${meta.projectName}」正是**你当前所在**的那个，不能在这里删 —— ` +
           '删掉它之后读路径会退到别的项目（等于静默换了项目）。',
-        hint: '要删它：先在别的项目里操作（绑定会跟着工作区根走），或者直接清理该工作区的存储。',
+        hint:
+          '要删它：先切到别的工作区/项目操作一步（绑定会跟着会话的工作区根走），' +
+          '或者直接清理该工作区的存储；也可以先删掉它的顶级枝（等于清空树），再重建。',
       };
     }
     const graph = await this.port.readGraph(input.projectId);

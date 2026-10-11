@@ -121,13 +121,18 @@ export type DeleteProjectOutcome =
 export async function deleteProject(
   body: { projectId: string; confirm?: boolean },
   signal?: AbortSignal,
+  sessionId?: string,
 ): Promise<FetchOutcome<DeleteProjectOutcome>> {
   try {
     const url = new URL(`./${ROUTE_PREFIX}/projects`.replace(/\/+/g, '/'), document.baseURI);
     const response = await fetch(url.toString(), {
       method: 'DELETE',
       headers: { accept: 'application/json', 'content-type': 'application/json' },
-      body: JSON.stringify(body),
+      // 会话 id 走 body（服务端 `readSessionId` 会先看 query 再看 body）：
+      // 带上它服务端才能按"**你这个会话所在的项目**"判断该不该拒，而不是拿全局指针。
+      body: JSON.stringify(
+        sessionId !== undefined && sessionId !== '' ? { ...body, sessionId } : body,
+      ),
       ...(signal ? { signal } : {}),
     });
     const value = (await response.json()) as DeleteProjectOutcome;
