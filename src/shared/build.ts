@@ -64,7 +64,20 @@
  * 另：0.2.0 是**破坏性**版本（工具 33 → 32、路由与设置项删除，见批次 66），
  * 首个公开版本，无历史用户，故不提供兼容垫片。
  */
-export const HOST_BATCH = 67;
+/**
+ * ## 批次 68 的用途
+ *
+ * **0.2.1：修正已发布版本指向的仓库地址**。
+ *
+ * GitHub 仓库后来改名为 `lph993/dsh-project-progress`，而 0.2.0 发布时
+ * `repository` / `homepage` / `bugs` 仍写着旧名 `lph993/dsh-project-manager`。
+ * 链接靠 GitHub 重定向仍可用，但 npm 页面上显示的是个已改名的旧名字；
+ * npm **不允许**改已发布版本的元数据，所以只能发新版本修正。
+ *
+ * **本批无任何行为变更**：只为把版本号（内联进产物）与元数据一起刷新。
+ * 批次号 +1 是因为宿主产物确实变了（版本号内联其中）——诊断页靠它自证"跑的是哪一份代码"。
+ */
+export const HOST_BATCH = 68;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

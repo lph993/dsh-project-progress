@@ -5,13 +5,27 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.2.1] — 仓库改名后的元数据修正
+
+### 修复
+
+- **`repository` / `homepage` / `bugs` 指向已改名的仓库**：GitHub 仓库已改名为
+  `dsh-project-progress`，0.2.0 发布时这三个字段仍写着旧名 `dsh-project-manager`。
+  链接本身靠 GitHub 重定向仍可用，但 npm 页面上显示的是个已改名的旧名字。
+  npm **不允许**修改已发布版本的元数据，因此只能靠新版本修正。
+
+### 说明
+
+- **代码无任何变更**：本版本与 0.2.0 的产物逐字节相同（`lib/index.js`、`lib/client.js`
+  及 `HOST_BATCH` 均未改动），只为修正 `package.json` 里的链接字段而发。
+  若你已装 0.2.0，**没有升级的必要**。
+
 ## [0.2.0] — 首个公开版本
 
 ### 变更
 
 - **包名改为 `dsh-project-progress`**（原 `dsh-project-manager`）。
   原因：`dsh-project-manager` 在 npm 上已被他人占用（`hoyyang/dsh-project-manager` 0.4.0，与本项目无关）。
-  GitHub 仓库名保持不变，仍是 `lph993/dsh-project-manager`。
 - 版本号 `0.1.0` → `0.2.0`。
 
 > ⚠ **包名同时是本插件的运行时身份。** 若你此前装过旧名字的版本，必须先把 profile 里的挂载改掉
@@ -59,6 +73,7 @@
 
 - 基准宿主 `@deepseek-ai/dsh` **0.1.5-rc.2**（本版本只在该版本上实测过）。
 - 安装：`dsh plugin --profile web add dsh-project-progress`，随后重启 `dsh web`。
-- 代码仓库：<https://github.com/lph993/dsh-project-manager>
+- 代码仓库：<https://github.com/lph993/dsh-project-progress>
 
-[0.2.0]: https://github.com/lph993/dsh-project-manager/releases/tag/v0.2.0
+[0.2.1]: https://github.com/lph993/dsh-project-progress/releases/tag/v0.2.1
+[0.2.0]: https://github.com/lph993/dsh-project-progress/releases/tag/v0.2.0
