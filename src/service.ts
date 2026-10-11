@@ -1694,7 +1694,7 @@ export class ProjectService {
    * ① 只取**可执行的任务点**（叶节点）—— 功能点不是"能动手做"的单元；
    * ② 算好"是否在**关注链路**内"（关注枝的子树 + 它的祖先链，与其它"关注"口径同源）。
    */
-  async nextTask(): Promise<{
+  async nextTask(sessionId?: string): Promise<{
     status: 'ok' | 'empty';
     nodeId?: string;
     name?: string;
@@ -1704,7 +1704,7 @@ export class ProjectService {
     /** 一句话说明"为什么是它"，让人/模型能核对排序是否合理。 */
     reason?: string;
   }> {
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(sessionId);
     const focusRoots = focusedRoots(derived.index);
     /** 关注链路 = 关注枝本身 / 它的子孙 / 它的祖先（人已表态"我盯这条"）。 */
     const inFocusChain = (id: string): boolean => {
@@ -2507,6 +2507,7 @@ export class ProjectService {
       kind: input.gate === 'paused' ? 'pause' : 'hold',
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
       ...(input.supplements !== undefined ? { supplements: input.supplements } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     });
 
     return {
@@ -3115,10 +3116,13 @@ export class ProjectService {
     supplements?: HandoffSupplements;
     maxBytes?: number;
     excludePaths?: readonly string[];
+    /** 发起这次写文档的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<HandoffDocument | undefined> {
-    const root = this.workspaceRoot();
+    await this.bindForCall(input.sessionId);
+    const root = this.resolveRoot(input.sessionId).root;
     if (!root) return undefined;
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(input.sessionId);
     const index = buildIndex(graph);
     const covered = [input.nodeId, ...subtreeIds(index, input.nodeId)];
 
@@ -3191,7 +3195,11 @@ export class ProjectService {
     /** 发起这次放行的会话（据此把项目绑到**该会话**的工作区）。 */
     sessionId?: string;
   }): Promise<ApplyResult & { handoff?: HandoffDocument; resumed?: boolean }> {
-    const root = this.workspaceRoot();
+    // 交接文档在**工作区根**下：先按调用会话绑对项目，再用该会话的根去找文档。
+    // 此前这里用的是 `workspaceRoot()`（匿名/全局口径），别的会话刚绑过就会找错工作区，
+    // 于是"放行了但读不到交接文档"（真机现场）。
+    await this.bindForCall(input.sessionId);
+    const root = this.resolveRoot(input.sessionId).root;
     const doc = root ? await this.readLatestHandoff(root, input.nodeId, input.kind) : undefined;
 
     const result = await this.setGate({
@@ -3264,6 +3272,8 @@ export class ProjectService {
     kind?: HandoffKind;
     offset?: number;
     limitBytes?: number;
+    /** 发起这次读的会话：交接文档在**工作区根**下，必须按该会话的根去找。 */
+    sessionId?: string;
   }): Promise<{
     found: boolean;
     fileName?: string;
@@ -3273,7 +3283,8 @@ export class ProjectService {
     supplementsSkipped?: boolean;
     reason?: string;
   }> {
-    const root = this.workspaceRoot();
+    await this.bindForCall(input.sessionId);
+    const root = input.sessionId !== undefined ? this.resolveRoot(input.sessionId).root : this.workspaceRoot();
     if (!root) return { found: false, reason: '无法确定工作区根目录' };
     const doc = await this.readLatestHandoff(root, input.nodeId, input.kind);
     if (!doc) return { found: false, reason: '该节点没有交接文档' };
@@ -3320,12 +3331,17 @@ export class ProjectService {
     touchedPaths?: string[];
     notify?: 'key' | 'full' | 'none';
     expiresAt?: string;
+    /** 发起这次订阅的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<
     ApplyResult & {
       subscriptionId?: string;
       lock?: { kind: 'granted' | 'queued' | 'rejected'; blockedBy: string[]; reason?: string };
     }
   > {
+    // 订阅是挂在**某个项目的节点**上的：先绑对项目，否则会在别人的项目里挂订阅
+    // （`readGraph()` 读的是"当前项目"，而当前项目可能是别的会话刚绑上的那个）。
+    await this.bindForCall(input.sessionId);
     const graph = await this.readGraph();
     const subscriptionId = this.deps.random.uuid();
     const touchedPaths = input.touchedPaths ?? [];
@@ -3394,7 +3410,10 @@ export class ProjectService {
     subscriptionId: string;
     by?: 'session' | 'subagent' | 'job' | 'user';
     actorId?: string;
+    /** 发起这次释放的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult & { releasedTo?: string[] }> {
+    await this.bindForCall(input.sessionId);
     const graph = await this.readGraph();
     const result = mutateUnsubscribe(
       graph,
@@ -3428,6 +3447,8 @@ export class ProjectService {
     conflict: unknown;
     by: 'session' | 'subagent' | 'job' | 'user';
     actorId?: string;
+    /** 发起这次裁决请求的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<{
     status: 'needs-human' | 'accepted';
     nodeId: string;
@@ -3435,6 +3456,8 @@ export class ProjectService {
     preview: string;
     hint?: string;
   }> {
+    // 审计是按项目记的，先绑对再写（否则"谁请求的裁决"会记到别人项目里）。
+    await this.bindForCall(input.sessionId);
     const preview = `${input.reason}\n当前锁冲突：${JSON.stringify(input.conflict)}`;
     await this.port.appendAudit({
       attemptId: this.deps.random.uuid(),
@@ -3465,7 +3488,7 @@ export class ProjectService {
   }
 
   /** 某节点的订阅列表 + 锁状态（`pm_watchers`）。 */
-  async watchers(nodeId: string): Promise<{
+  async watchers(nodeId: string, sessionId?: string): Promise<{
     nodeId: string;
     subscriptions: Array<{
       subscriptionId: string;
@@ -3481,7 +3504,7 @@ export class ProjectService {
     }>;
     conflicts: ReturnType<FileLockManager['snapshot']>['conflicts'];
   }> {
-    const { graph } = await this.derive();
+    const { graph } = await this.derive(sessionId);
     const node = graph.nodes[nodeId];
     const snapshot = this.locks.snapshot();
     const conflicts = snapshot.conflicts.filter((entry) =>
@@ -3911,6 +3934,9 @@ export class ProjectService {
     /** 发起这次建点的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
     sessionId?: string;
   }): Promise<CaptureResult & { nodeId: string }> {
+    // 先按调用会话把项目绑对，再取快照管理器：`snapshotManager()` 是按**当前工作区根**
+    // 建/取的，绑错就会把回滚点建到别的工作区去（真机现场：解析到的根是别的会话刚绑上的那个）。
+    await this.bindForCall(input.sessionId);
     const manager = this.snapshotManager();
     if (!manager) {
       return {
@@ -4049,7 +4075,11 @@ export class ProjectService {
     toolName?: string;
     agent?: unknown;
     callId?: string;
+    /** 发起这次回滚的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
+    // 同 `captureSnapshot`：管理器与快照索引都按工作区根走，绑错会回滚别人的工作区。
+    await this.bindForCall(input.sessionId);
     const manager = this.snapshotManager();
     if (!manager) {
       return {
@@ -4430,7 +4460,10 @@ export class ProjectService {
     toolName?: string;
     agent?: unknown;
     callId?: string;
+    /** 发起这次撤销的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
   }): Promise<ApplyResult> {
+    await this.bindForCall(input.sessionId);
     const manager = this.snapshotManager();
     if (!manager) {
       return {
@@ -4478,12 +4511,14 @@ export class ProjectService {
   }
 
   /** 快照可达性自检（FR-89b）。 */
-  async checkSnapshotReachability(): Promise<{
+  async checkSnapshotReachability(sessionId?: string): Promise<{
     available: boolean;
     total?: number;
     orphaned?: Array<{ snapshotId: string; ref: string; reason: string }>;
     reason?: string;
   }> {
+    // 索引是按工作区根找的：先按调用会话绑对，再去查（否则自检的是别人的工作区）。
+    await this.bindForCall(sessionId);
     const manager = this.snapshotManager();
     if (!manager) return { available: false, reason: '无法确定工作区根目录' };
     const result = await manager.checkReachability();
@@ -4620,9 +4655,15 @@ export class ProjectService {
     };
   }
 
-  /** 单节点视图。 */
-  async nodeView(nodeId: string): Promise<NodeView | undefined> {
-    const { derived } = await this.derive();
+  /**
+   * 单节点视图。
+   *
+   * @param sessionId 发起这次读的会话。**读路径也必须带上它** —— 不带就走"匿名/已绑定"
+   *   语义，于是别的会话（另一个工作区）刚绑过项目时，这里会去**别人的项目**里找节点，
+   *   返回 `not-found`（真机现场：本会话能写进自己的项目，却读不到刚写的那个节点）。
+   */
+  async nodeView(nodeId: string, sessionId?: string): Promise<NodeView | undefined> {
+    const { derived } = await this.derive(sessionId);
     return this.toView(derived, nodeId);
   }
 
@@ -4677,14 +4718,19 @@ export class ProjectService {
     return view;
   }
 
-  /** 树形返回（`pm_tree`）：按父子关系嵌套，返回极简字段（FR-74）。 */
+  /**
+   * 树形返回（`pm_tree`）：按父子关系嵌套，返回极简字段（FR-74）。
+   *
+   * @param options.sessionId 发起这次读的会话（理由同 {@link nodeView}：读路径也要按会话解析）。
+   */
   async tree(options: {
     rootId?: string;
     depth?: number;
     detail?: boolean;
     limit?: number;
+    sessionId?: string;
   }): Promise<{ nodes: unknown[]; truncated: boolean; totalNodes: number }> {
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(options.sessionId);
     const index = derived.index;
     const roots = options.rootId ? [options.rootId] : graph.rootIds;
     const maxDepth = options.depth ?? Number.POSITIVE_INFINITY;
@@ -4768,10 +4814,13 @@ export class ProjectService {
   /** 文档合法性检查（FR-02/04）。 */
   async checkDocumentFile(
     graph?: GraphSnapshot,
+    sessionId?: string,
   ): Promise<{ exists: boolean; check?: DocCheckResult; markdown?: string }> {
+    // 文档路径按工作区根解析，而图来自"当前项目" —— 两者都必须先按**调用会话**绑对。
+    if (graph === undefined) await this.bindForCall(sessionId);
     const snapshot = graph ?? (await this.readGraph());
     try {
-      const root = this.workspaceRoot();
+      const root = sessionId !== undefined ? this.resolveRoot(sessionId).root : this.workspaceRoot();
       const fs = this.fileSystem();
       const target = await fs.resolve(this.deps.config.documentPath, {
         ...(root !== undefined ? { cwd: root } : {}),
@@ -4800,11 +4849,13 @@ export class ProjectService {
    *
    * 结构未变（指纹一致）时**短路不写**，避免无意义写盘与文件监听抖动。
    */
-  async projectDocumentToDisk(): Promise<{
+  async projectDocumentToDisk(sessionId?: string): Promise<{
     written: boolean;
     reason: string;
     path: string;
   }> {
+    // 写盘是"写"：先按调用会话把项目绑对，再读图/解析根（否则会把投影写进别人的工作区）。
+    await this.bindForCall(sessionId);
     const rendered = await this.renderDocument();
     if (rendered.overflow) {
       return {
@@ -4919,7 +4970,10 @@ export class ProjectService {
   }
 
   /** 审计读取（状态条展示）。 */
-  async recentAudit(limit = 50): Promise<AuditRecord[]> {
+  async recentAudit(limit = 50, sessionId?: string): Promise<AuditRecord[]> {
+    // 审计是按**项目**存的（`listAudit(this.projectId, …)`），所以必须先按调用会话把项目
+    // 绑对，否则读的是"当前全局绑定的那个项目"的审计 —— 别的会话刚绑过就会串项目。
+    await this.bindForCall(sessionId);
     return this.port.listAudit(this.projectId, limit);
   }
 
@@ -6966,12 +7020,18 @@ export class ProjectService {
    *
    * 面板右键（`clear-review`）与会话工具（`pm_review pass`）**共用这一份**实现。
    */
-  async clearReviewFlags(input: { nodeId: string; by?: 'user' | 'session' }): Promise<{
+  async clearReviewFlags(input: {
+    nodeId: string;
+    by?: 'user' | 'session';
+    /** 发起这次审查通过的会话（据此把项目绑到**该会话**的工作区，见 `bindForCall`）。 */
+    sessionId?: string;
+  }): Promise<{
     cleared: number;
     failed: string[];
     subtree: number;
   }> {
-    const { graph, derived } = await this.derive();
+    await this.bindForCall(input.sessionId);
+    const { graph, derived } = await this.derive(input.sessionId);
     const subtree = subtreeIds(derived.index, input.nodeId);
     let cleared = 0;
     const failed: string[] = [];
@@ -6998,10 +7058,10 @@ export class ProjectService {
    * 按 `nextTask` 的口径排序（待审 > 关注 > 优先级 > 进度），但**不筛掉有子节点的枝** ——
    * 审查常常是针对一整块的（用户可以标一个功能点，让它整枝进入待审视野）。
    */
-  async reviewQueue(): Promise<
+  async reviewQueue(sessionId?: string): Promise<
     Array<{ id: string; name: string; derivedState: string; progress: number; refs: Array<{ type: string; target: string }> }>
   > {
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(sessionId);
     const out: Array<{
       id: string;
       name: string;
@@ -7084,6 +7144,8 @@ export class ProjectService {
     text?: string;
     reason?: string;
     by?: 'user' | 'session';
+    /** 发起这次面板动作的会话（会话侧 `pm_review` 会传；浏览器面板轮询不传）。 */
+    sessionId?: string;
   }): Promise<{
     status: 'ok' | 'needs-confirm' | 'denied';
     action: string;
@@ -7094,7 +7156,7 @@ export class ProjectService {
     /** 让面板把结果说得更具体（如新节点 id、交接文档名）。 */
     detail?: Record<string, unknown>;
   }> {
-    const { graph, derived } = await this.derive();
+    const { graph, derived } = await this.derive(input.sessionId);
     const node = graph.nodes[input.nodeId];
     if (!node) {
       return { status: 'denied', action: input.action, code: 'E_NOT_FOUND', message: '节点不存在' };
@@ -7206,6 +7268,7 @@ export class ProjectService {
           patch: { needsReview: true },
           by,
           reason: '面板标记待审查（FR-164）',
+          ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
         });
         return this.panelResult('mark-review', marked, { needsReview: true });
       }
@@ -7216,7 +7279,11 @@ export class ProjectService {
          * 用户口径："审查可遗传，就是父节点审查了，通审整枝。审查标记在审查完成后消失"。
          * 级联实现在 `clearReviewFlags`（与会话工具 `pm_review` **共用同一份**，不写两遍）。
          */
-        const outcome = await this.clearReviewFlags({ nodeId: input.nodeId, by });
+        const outcome = await this.clearReviewFlags({
+          nodeId: input.nodeId,
+          by,
+          ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+        });
         return {
           status: 'ok',
           action: 'clear-review',

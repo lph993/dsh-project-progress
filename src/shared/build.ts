@@ -129,7 +129,30 @@
  * 对照 0.2.1：那一版代码与 0.2.0 **逐字节相同**（只改了 `package.json` 里的链接字段），
  * 因此 npm 用户拿不到任何新东西；本次不同，**确实带去了批次 69 / 70 的功能**。
  */
-export const HOST_BATCH = 71;
+/**
+ * ## 批次 72 的用途
+ *
+ * **读工具按会话解析工作区**（修"读到别人的项目"）。
+ *
+ * 真机现场：本会话**写**得进自己的项目（写路径早就按会话绑定），却**读不到自己刚写的节点**
+ * —— `pm_node` 返回 `not-found`，`pm_board` / `pm_tree` / `pm_next` 显示的是**另一个**
+ * 工作区的树。
+ *
+ * 根因：19 个读工具都调了 `withRoot(exec)`，却把它的返回值（**会话 id**）丢掉当语句用；
+ * 而写工具一律是 `const sessionId = withRoot(exec)` 再往下传。于是读路径退化成
+ * "匿名 / 已绑定"语义 —— 而"已绑定"是**全局单值**：别的会话刚绑过哪个工作区，
+ * 读就看到哪个项目。
+ *
+ * 影响宿主侧行为的部分：读路径全部改为按调用会话解析（与写路径同口径），
+ * 并把 `tree` / `nodeView` / `nextTask` / `recentAudit` / `checkDocumentFile` /
+ * `projectDocumentToDisk` / `watchers` / `subscribe` / `unsubscribe` /
+ * `requestArbitration` / `undoRollback` / `readHandoffPage` / `checkSnapshotReachability` /
+ * `reviewQueue` / `clearReviewFlags` / `panelNodeAction` / `writeHandoff` 都补上 `sessionId`；
+ * 快照类改为**先绑定再取管理器**（管理器按工作区根建）；`releaseGate` 改用它本来就有的
+ * `sessionId` 解析交接文档所在的根。仅 `pm_watch_conflicts` / `pm_watch_wait` 不取会话 id
+ * （锁表是全局的，与项目无关），已在工具处注明。
+ */
+export const HOST_BATCH = 72;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

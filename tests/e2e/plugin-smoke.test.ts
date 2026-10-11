@@ -833,6 +833,100 @@ test('多工作区：写入必须跟着「调用会话自己的工作区」，�
 });
 
 /**
+ * 多工作区：**读**工具必须跟着「调用会话自己的工作区」。
+ *
+ * ## 现场（真机，2026-10-11）
+ *
+ * A 工作区的会话**写**得进自己的项目（写路径早就按会话绑定，见上一个用例），
+ * 却**读不到自己刚写的节点**：`pm_node` 返回 `not-found`，而 `pm_board` / `pm_tree` /
+ * `pm_next` 显示的是**另一个**工作区（B）的树。
+ *
+ * 根因不是根解析逻辑，而是**19 个读工具把 `withRoot(exec)` 的返回值丢掉了**：
+ * 只有写工具写 `const sessionId = withRoot(exec)` 并往下传，读工具一律只调 `withRoot(exec)`
+ * 当语句用。于是读路径退化成"匿名 / 已绑定"语义 —— 而"已绑定"是**全局单值**：
+ * 别的会话刚绑过哪个工作区，读就看到哪个项目（本会话自己的树反而看不见）。
+ *
+ * 判据：同一个会话调读工具，必须读到自己工作区的项目，与别的会话刚绑过什么无关。
+ */
+test('多工作区：读工具必须跟着「调用会话自己的工作区」，不能被别人的绑定带偏', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-read-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-read-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as { currentProjectId: string };
+
+  type Tool = {
+    execute(args: Record<string, unknown>, exec: unknown): Promise<Record<string, unknown>>;
+  };
+  const toolDefs = ctx.toolDefs as Map<string, Tool>;
+  const tool = (name: string): Tool => {
+    const found = toolDefs.get(name);
+    assert.ok(found, `${name} 应已注册`);
+    return found;
+  };
+  /**
+   * 工具调用的执行上下文。宿主的契约是 `exec.agent.session.header.cwd` = 该会话的工作区、
+   * `exec.agent.id` = 会话 id —— 插件就是按这两个字段按会话解析工作区的。
+   */
+  const callAs = (sessionId: string, cwd: string) => ({
+    agent: { id: sessionId, session: { header: { cwd } } },
+    callId: 'e2e',
+  });
+  const execA = callAs('session-read-A', wsA);
+  const execB = callAs('session-read-B', wsB);
+
+  // A 会话建树（写工具：早就按会话绑定）
+  const addedA = await tool('pm_add').execute({ name: 'A树' }, execA);
+  assert.equal(addedA['status'], 'ok');
+  const nodeA = addedA['nodeId'] as string;
+  const projectA = service.currentProjectId;
+
+  // B 会话在**另一个工作区**建树 —— 它会把"当前已绑定的项目"改成 B（这正是现场条件）
+  const addedB = await tool('pm_add').execute({ name: 'B树' }, execB);
+  assert.equal(addedB['status'], 'ok');
+  const projectB = service.currentProjectId;
+  assert.notEqual(projectA, projectB, '两个工作区必须是两个项目');
+
+  // ① pm_board：A 会话读自己的看板 —— 不得读到 B 的项目
+  const boardA = await tool('pm_board').execute({}, execA);
+  assert.equal(
+    boardA['projectId'],
+    projectA,
+    `A 会话的 pm_board 必须读 A 的项目（读到别人的项目就是被带偏），实际：${String(boardA['projectId'])}`,
+  );
+
+  // ② pm_tree：树也必须只有自己的节点
+  const treeA = await tool('pm_tree').execute({}, execA);
+  assert.deepEqual(
+    (treeA['nodes'] as Array<{ name: string }>).map((n) => n.name),
+    ['A树'],
+    `A 会话的 pm_tree 不得显示别人的树，实际：${JSON.stringify(treeA['nodes'])}`,
+  );
+
+  // ③ pm_node：真机上这里返回 not-found（A 能写进自己的项目，却在自己的项目里找不到它）
+  const nodeViewA = await tool('pm_node').execute({ nodeId: nodeA }, execA);
+  assert.equal(nodeViewA['error'], undefined, 'A 会话读自己的节点不得是 not-found');
+  assert.equal(nodeViewA['name'], 'A树');
+
+  // ④ pm_next：取任务必须取自 A 的项目
+  const nextA = await tool('pm_next').execute({}, execA);
+  assert.equal(nextA['name'], 'A树', `pm_next 必须在 A 的项目里取任务，实际：${JSON.stringify(nextA)}`);
+
+  // ⑤ 反向同理：B 会话读自己的，也不能被 A 带偏
+  const boardB = await tool('pm_board').execute({}, execB);
+  assert.equal(boardB['projectId'], projectB, 'B 会话的 pm_board 必须读 B 的项目');
+  const treeB = await tool('pm_tree').execute({}, execB);
+  assert.deepEqual((treeB['nodes'] as Array<{ name: string }>).map((n) => n.name), ['B树']);
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
+/**
  * 匿名读（浏览器面板轮询）不得跟着**别的会话**的 `pendingRoot` 走。
  *
  * ## 现场

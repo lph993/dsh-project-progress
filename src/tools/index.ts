@@ -114,12 +114,13 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const tree = await service.tree({
             ...(args.rootId !== undefined ? { rootId: args.rootId } : {}),
             ...(args.depth !== undefined ? { depth: args.depth } : {}),
             ...(args.limit !== undefined ? { limit: args.limit } : {}),
             ...(args.detail !== undefined ? { detail: args.detail } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return tree as unknown as JsonValue;
         },
@@ -146,8 +147,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
-          const view = await service.nodeView(args.nodeId);
+          const sessionId = withRoot(exec);
+          const view = await service.nodeView(args.nodeId, sessionId);
           return (view ?? { error: 'not-found', nodeId: args.nodeId }) as unknown as JsonValue;
         },
       }),
@@ -349,12 +350,12 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const action = args.action === 'mark' || args.action === 'pass' ? args.action : 'list';
           const nodeIds = Array.isArray(args.nodeIds) ? (args.nodeIds as string[]) : [];
           if (action === 'list') {
-            const queue = await service.reviewQueue();
+            const queue = await service.reviewQueue(sessionId);
             return {
               status: 'ok',
               action: 'review-list',
@@ -379,6 +380,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
                 action: 'mark-review',
                 nodeId,
                 by: caller.by === 'user' ? 'user' : 'session',
+                ...(sessionId !== undefined ? { sessionId } : {}),
               });
             }
             return {
@@ -393,6 +395,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             const outcome = await service.clearReviewFlags({
               nodeId,
               by: caller.by === 'user' ? 'user' : 'session',
+              ...(sessionId !== undefined ? { sessionId } : {}),
             });
             results.push({ nodeId, cleared: outcome.cleared, failed: outcome.failed.length });
           }
@@ -715,7 +718,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const actor = caller.by === 'user' ? 'session' : caller.by;
           const result = await service.subscribe({
@@ -728,6 +731,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
               ? { notify: args.notify as 'key' | 'full' | 'none' }
               : {}),
             ...(args.expiresAt !== undefined ? { expiresAt: args.expiresAt } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -753,13 +757,14 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const result = await service.unsubscribe({
             nodeId: args.nodeId,
             subscriptionId: args.subscriptionId,
             by: caller.by === 'user' ? 'user' : caller.by,
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -782,8 +787,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
-          return (await service.watchers(args.nodeId)) as unknown as JsonValue;
+          const sessionId = withRoot(exec);
+          return (await service.watchers(args.nodeId, sessionId)) as unknown as JsonValue;
         },
       }),
     ),
@@ -800,6 +805,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(_args, exec) {
+          // 只调 `withRoot` 上报根，**不**取会话 id：锁表是全局的（按 subscriptionId/nodeId 索引），
+          // 与"哪个项目"无关，所以这条读不需要按会话绑项目。其余读工具都要取会话 id。
           withRoot(exec);
           return service.watchConflicts() as unknown as JsonValue;
         },
@@ -823,6 +830,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
         },
         async execute(args, exec) {
+          // 同上：等待的是全局锁表里的某条订阅，不涉及项目解析。
           withRoot(exec);
           const result = await service.watchWait({
             subscriptionId: args.subscriptionId,
@@ -850,7 +858,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           const conflicts = service.watchConflicts();
           const result = await service.requestArbitration({
@@ -859,6 +867,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             conflict: conflicts.conflicts,
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
             by: caller.by,
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -937,8 +946,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
-          const board = await service.board();
+          const sessionId = withRoot(exec);
+          const board = await service.board(sessionId);
           // 工具返回精简：去掉逐节点明细（那走 pm_tree）
           const { nodes: _nodes, unfinished, scanBand, ...rest } = board;
           /**
@@ -995,8 +1004,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(_args, exec) {
-          withRoot(exec);
-          const picked = await service.nextTask();
+          const sessionId = withRoot(exec);
+          const picked = await service.nextTask(sessionId);
           return picked as unknown as JsonValue;
         },
       }),
@@ -1018,10 +1027,10 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
-          const check = await service.checkDocumentFile();
+          const sessionId = withRoot(exec);
+          const check = await service.checkDocumentFile(undefined, sessionId);
           const projection = args.write === true
-            ? await service.projectDocumentToDisk()
+            ? await service.projectDocumentToDisk(sessionId)
             : undefined;
           return {
             exists: check.exists,
@@ -1051,8 +1060,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
-          const rows = await service.recentAudit(args.limit ?? 20);
+          const sessionId = withRoot(exec);
+          const rows = await service.recentAudit(args.limit ?? 20, sessionId);
           return { rows } as unknown as JsonValue;
         },
       }),
@@ -1080,13 +1089,14 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const result = await service.captureSnapshot({
             nodeId: args.nodeId,
             ...(args.reason !== undefined
               ? { reason: args.reason as 'manual' | 'pause' | 'hold' | 'pre-rollback' }
               : {}),
             force: true,
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -1107,8 +1117,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
-          const rows = await service.listSnapshots(args.nodeId);
+          const sessionId = withRoot(exec);
+          const rows = await service.listSnapshots(args.nodeId, sessionId);
           const status = service.snapshotStatus();
           return { nodeId: args.nodeId, mode: status.mode, modeReason: status.reason, rows } as unknown as JsonValue;
         },
@@ -1143,7 +1153,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const result = await service.rollback({
             nodeId: args.nodeId,
             scope: (args.scope as 'code' | 'state' | 'both' | undefined) ?? 'both',
@@ -1153,6 +1163,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             toolName: 'pm_rollback',
             agent: exec.agent,
             ...(exec.callId !== undefined ? { callId: String(exec.callId) } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -1174,13 +1185,14 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: renderResult(value as ApplyResult) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const result = await service.undoRollback({
             nodeId: args.nodeId,
             ...(args.confirmToken !== undefined ? { confirmToken: args.confirmToken } : {}),
             toolName: 'pm_rollback_undo',
             agent: exec.agent,
             ...(exec.callId !== undefined ? { callId: String(exec.callId) } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
         },
@@ -1201,9 +1213,11 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(_args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
+          // 顺序要紧：`checkSnapshotReachability` 会先按会话把项目绑对，
+          // 所以 `snapshotStatus()` 必须在它**之后**读 —— 否则读的是绑之前的那个工作区的档位。
+          const health = await service.checkSnapshotReachability(sessionId);
           const status = service.snapshotStatus();
-          const health = await service.checkSnapshotReachability();
           return { mode: status.mode, modeReason: status.reason, ...health } as unknown as JsonValue;
         },
       }),
@@ -1421,12 +1435,13 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
         },
         async execute(args, exec) {
-          withRoot(exec);
+          const sessionId = withRoot(exec);
           const page = await service.readHandoffPage({
             nodeId: args.nodeId,
             ...(args.kind !== undefined ? { kind: args.kind as 'pause' | 'hold' } : {}),
             ...(args.offset !== undefined ? { offset: args.offset } : {}),
             ...(args.limitBytes !== undefined ? { limitBytes: args.limitBytes } : {}),
+            ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return page as unknown as JsonValue;
         },
