@@ -215,7 +215,30 @@
  *    `debugBus.warn` 如实报告"哪些顶层没进模型"（走 FR-174 的警示通道 →
  *    看板 alerts 与 `/pm/debug` 报同一个数）。
  */
-export const HOST_BATCH = 74;
+/**
+ * ## 批次 75 的用途
+ *
+ * **分批建树改为"每片各一份骨架预算"**（承接批次 74 的广度修复，补上深度）。
+ *
+ * 批次 74 让每个顶层都进得去骨架了，但真机上出现**广度/深度二选一**：
+ * `aitest` 从 493 条降到 162 条后，它**深层**的 `verify_*` / `*_golden` 全看不见，
+ * 于是「模型验证与数值比对」那一整支（逐层输出比对、注意力与 RoPE、Softmax、MoE、
+ * 视觉分支、ResNet golden）消失 —— 而上一版恰恰有它。
+ *
+ * 根因是**顺序**：`collectAiSkeleton` 先做**全局**截断，再把这份残骸交给
+ * `shardSkeleton` 切片。分片给了每片独立的**节点**预算，可**条目**早被全局砍完了，
+ * 所以"大区域拿不到深度"这件事，分片救不了。
+ *
+ * 改法：分批路径切**未截断**的遍历结果（`collectAiSkeleton` 新增返回 `entries`），
+ * 并在每片内部各调一次 `collectSkeleton`（上限 `DEFAULT_MAX_SKELETON_ENTRIES`，
+ * 与单次路径同一个常量）。目录的"N 个文件"仍按**完整**遍历统计（`countSource`），
+ * 免得每片各算一份把数说小。单次路径与成本预估**不变**（仍用全局截断后的骨架），
+ * 所以"事前告诉你大概多少钱"这件事没有被放松。
+ *
+ * 代价说清楚：分批时输入 token 会增加（每片最多各带一份预算，而不是共享一份）——
+ * 节点预算（`maxNodes`）仍按文件占比分摊，输出量不变。
+ */
+export const HOST_BATCH = 75;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

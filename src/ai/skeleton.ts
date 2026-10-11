@@ -29,6 +29,13 @@ export interface SkeletonInput {
     mtimeMs?: number;
   }>;
   maxEntries?: number;
+  /**
+   * 只用于统计"目录的直接子文件数"的完整遍历结果。
+   *
+   * 分批路径必须传它：每片只拿到自己那部分条目，若按片统计，提示词里
+   * `目录 (N 个文件)` 会变成"这一片里的文件数"，比真实值小、会误导模型。
+   */
+  countSource?: ReadonlyArray<{ path: string; kind: 'file' | 'dir' }>;
 }
 
 export interface SkeletonResult {
@@ -126,15 +133,18 @@ export function allocateFairly<T extends { path: string }>(
   return { picked, coverage };
 }
 
+/** 单次骨架的条目上限（目录、文件各自一份预算）。分批路径**每片各用一份**。 */
+export const DEFAULT_MAX_SKELETON_ENTRIES = 400;
+
 /** 采集骨架：目录 + 关键文件（含签名）。 */
 export async function collectSkeleton(input: SkeletonInput): Promise<SkeletonResult> {
-  const maxEntries = input.maxEntries ?? 400;
+  const maxEntries = input.maxEntries ?? DEFAULT_MAX_SKELETON_ENTRIES;
   const dirs = input.entries.filter((entry) => entry.kind === 'dir');
   const files = input.entries.filter((entry) => entry.kind === 'file');
 
-  // 目录的直接子文件数（只数元数据，不读内容）
+  // 目录的直接子文件数（只数元数据，不读内容）；分批路径按**完整**遍历结果统计
   const fileCountByDir = new Map<string, number>();
-  for (const file of files) {
+  for (const file of (input.countSource ?? input.entries).filter((entry) => entry.kind === 'file')) {
     const parent = file.path.includes('/') ? file.path.slice(0, file.path.lastIndexOf('/')) : '';
     fileCountByDir.set(parent, (fileCountByDir.get(parent) ?? 0) + 1);
   }

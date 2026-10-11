@@ -70,3 +70,22 @@ test('collectSkeleton：预算不够分时，如实报出哪些顶层一条都�
   assert.equal(result.droppedTops.length, 15, JSON.stringify(result.coverage));
   assert.deepEqual(result.droppedTops.slice(0, 3), ['t05', 't06', 't07'], '从后往前缺，顺序稳定');
 });
+
+test('collectSkeleton：分批时目录的"N 个文件"按完整遍历统计（不按片各算一份）', async () => {
+  const full = [
+    { path: 'aitest/models', kind: 'dir' as const },
+    { path: 'aitest/models/a.bin', kind: 'file' as const },
+    { path: 'aitest/models/b.bin', kind: 'file' as const },
+    { path: 'aitest/models/c.bin', kind: 'file' as const },
+    { path: 'aitest/py/x.py', kind: 'file' as const },
+  ];
+  // 这一片只拿到"目录 + py 里那个文件"，但目录计数要看**完整**结果，
+  // 否则提示词里会写成"aitest/models (0 个文件)"，把数说小、误导模型。
+  const shard = await collectSkeleton({
+    root: '.',
+    entries: [full[0]!, full[4]!],
+    countSource: full,
+  });
+  const dir = shard.skeleton.find((entry) => entry.kind === 'dir' && entry.path === 'aitest/models');
+  assert.equal(dir?.fileCount, 3, `目录计数要按完整结果：${JSON.stringify(dir)}`);
+});

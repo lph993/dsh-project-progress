@@ -135,7 +135,7 @@ import type {
 } from './shared/types.ts';
 import type { ConflictPolicy, PatchFields } from './domain/validate.ts';
 import type { HeuristicCoefficients } from './weight/heuristic.ts';
-import { collectSkeleton } from './ai/skeleton.ts';
+import { collectSkeleton, DEFAULT_MAX_SKELETON_ENTRIES } from './ai/skeleton.ts';
 import { AI_BUILD_EXCLUDE } from './ai/scope.ts';
 import {
   AI_TREE_SYSTEM_PROMPT,
@@ -5210,7 +5210,7 @@ export class ProjectService {
         promptBytes: collected.promptBytes,
         outputLimitSource: 'unknown',
         maxNodes: maxNodesForEstimate,
-        likelyTooLarge: shouldShard(collected.skeleton),
+        likelyTooLarge: shouldShard(collected.entries),
         ...(lastActual !== undefined ? { lastActual } : {}),
       });
       return { available: false, reason: route.reason, hint: route.hint, estimate };
@@ -5229,7 +5229,7 @@ export class ProjectService {
         : {}),
       maxNodes: maxNodesForEstimate,
       // 事前提示（不是判定）：文件数超过单次请求的常规范围时，确认框里直说"可能被截断"
-      likelyTooLarge: shouldShard(collected.skeleton),
+      likelyTooLarge: shouldShard(collected.entries),
       ...(lastActual !== undefined ? { lastActual } : {}),
     });
 
@@ -5542,6 +5542,8 @@ export class ProjectService {
       if (SHARD_RETRY_REASONS.has(call.reason)) {
         const retry = await this.aiBuildTreeSharded({
           skeleton: collected.skeleton,
+          entries: collected.entries,
+          root,
           projectName: collected.projectName,
           maxNodes: input.maxNodes ?? 60,
           describeOnly,
@@ -5782,6 +5784,13 @@ export class ProjectService {
    */
   private async aiBuildTreeSharded(input: {
     skeleton: ReadonlyArray<SkeletonEntry>;
+    /**
+     * **未截断**的遍历结果（已过排除表）。分批按它切片、并按片各自设上限 ——
+     * 用被全局砍过的 `skeleton` 切片会让大区域永远拿不到深度（见 `collectAiSkeleton` 的说明）。
+     */
+    entries?: Awaited<ReturnType<typeof scanWorkspaceEntries>>['entries'];
+    /** 工作区根：按片采集骨架时要读关键文件签名。 */
+    root?: string;
     projectName: string;
     maxNodes: number;
     describeOnly?: readonly string[] | undefined;
@@ -5800,7 +5809,8 @@ export class ProjectService {
     | { status: 'ok'; shards: number; result: AiBuildTreeOk }
     | { status: 'fail'; shards: number; message: string }
   > {
-    const shards = shardSkeleton(input.skeleton);
+    const source = (input.entries ?? []).length > 0 ? (input.entries as typeof input.skeleton) : input.skeleton;
+    const shards = shardSkeleton(source);
     if (shards.length <= 1) {
       return {
         status: 'fail',
@@ -5808,7 +5818,7 @@ export class ProjectService {
         message: '按顶层目录只切得出 1 片，分批没有意义（不重复烧一遍同样的请求）。',
       };
     }
-    const totalEntries = Math.max(1, input.skeleton.length);
+    const totalEntries = Math.max(1, source.length);
     /**
      * **整轮的节点预算是 `maxNodes`，不是"每片各给一份"**。
      *
@@ -5819,7 +5829,7 @@ export class ProjectService {
      */
     const totalFiles = Math.max(
       1,
-      input.skeleton.filter((entry) => entry.kind === 'file').length,
+      source.filter((entry) => entry.kind === 'file').length,
     );
     let created = 0;
     let updated = 0;
@@ -5853,10 +5863,25 @@ export class ProjectService {
         input.maxNodes,
         Math.max(4, Math.round((input.maxNodes * shardFiles) / totalFiles)),
       );
+      /**
+       * **每一片各自采集骨架、各自用一份条目预算**。
+       *
+       * 原来是拿**全局砍过**的骨架切片 —— 分片给了每片独立的**节点**预算，可**条目**早没了，
+       * 于是大区域永远拿不到深度：真机上 `aitest` 深层的 `verify_*` / `*_golden` 全看不见，
+       * `模型验证与数值比对` 那一支整支消失（而广度分配修好之后每个顶层都进得去）。
+       * 目录的"N 个文件"仍按**完整**遍历结果统计，免得每片各算一份、把数说小。
+       */
+      const shardSkeletonResult = await collectSkeleton({
+        root: input.root ?? '',
+        entries: shard.entries,
+        maxEntries: DEFAULT_MAX_SKELETON_ENTRIES,
+        countSource: source,
+      });
       const prompt = buildTreePrompt({
         projectName: input.projectName,
-        skeleton: shard.entries,
+        skeleton: shardSkeletonResult.skeleton,
         maxNodes: shardMaxNodes,
+        ...(shardSkeletonResult.truncated ? { truncated: true } : {}),
         ...(input.describeOnly !== undefined ? { describeOnly: input.describeOnly } : {}),
       });
       const call = await this.callTreeBuilderWithProgress(
@@ -6019,6 +6044,16 @@ export class ProjectService {
     projectName: string;
     /** 有内容却一条都没进骨架的顶层目录（截断时如实带给上层）。 */
     droppedTops: string[];
+    /**
+     * **未截断**的遍历结果（已过排除表）。
+     *
+     * 为什么要带出来：分批路径（`aiBuildTreeSharded`）此前拿的是**已经被全局砍过**的
+     * `skeleton` —— 分片给每片独立的节点预算，可条目早没了，于是"大区域拿不到深度"
+     * 分片也救不了（真机现场：公平分配后每个顶层都进得去，但 `aitest` 深层的
+     * `verify_*` / `*_golden` 全看不见，`模型验证与数值比对` 那一支整支消失）。
+     * 分批应当**按片采集、按片设上限**，而不是切一份全局残骸。
+     */
+    entries: Awaited<ReturnType<typeof scanWorkspaceEntries>>['entries'];
   }> {
     const walked = await scanWorkspaceEntries({
       root,
@@ -6075,6 +6110,7 @@ export class ProjectService {
       skipped: walked.skipped,
       projectName,
       droppedTops: collected.droppedTops,
+      entries: walked.entries,
     };
   }
 
