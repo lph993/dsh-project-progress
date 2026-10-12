@@ -9,7 +9,8 @@
  * 用户决定 D：只留左侧入口）。
  *
  * **它是同一份投影的第二个视图**，不引入第二套数据通路：同样打 `/pm/board`
- * （§12.4：事实源在宿主，客户端只做呈现），同样按会话 id 解析工作区根。
+ * （§12.4：事实源在宿主，客户端只做呈现），**同样按工作区路径声明作用域**（0.3.2 修复：
+ * 以前两边都读了一个不存在的 `state.current`，等于谁都没声明作用域 —— 详见 `workspace-select.ts`）。
  *
  * **这里不该做的事**（用户决定的入口归并，见 FR-160）：
  * ① 不放"关注"按钮（未完成列表行尾的 `◆` 已删）——关注只留**右键菜单**与**右栏属性面板**两处；
@@ -25,13 +26,25 @@ import {
   formatCounts,
   nodeRowLabel,
 } from './api.ts';
-import { useBoardData, useAbsentSessions, type SessionsSelectorHook } from './board-panel.tsx';
+import {
+  useAbsentWorkspaces,
+  useBoardData,
+  type SessionsSelectorHook,
+  type WorkspacesSelectorHook,
+} from './board-panel.tsx';
+import {
+  activeSessionFromList,
+  pickWorkspace,
+  toWorkspaceOptions,
+  type SessionRowLike,
+  type WorkspaceOptionLike,
+} from './workspace-select.ts';
 import { isLiveNode } from './liveness.ts';
 import { nodePercentOf } from './labels.ts';
 import { orderUnfinished } from './unfinished-order.ts';
 import type { BoardSnapshot, NodeView } from './contract.ts';
 
-const { useState } = React;
+const { useMemo, useState } = React;
 
 /** 右栏只列这么多条未完成项：再多就该去主面板看了。 */
 const MAX_ROWS = 8;
@@ -39,15 +52,50 @@ const MAX_ROWS = 8;
 export interface RightProgressTabProps {
   /** 轮询间隔（毫秒）。右栏是"瞄一眼"的场景，默认比主面板慢一档。 */
   intervalMs?: number;
-  /** 全局标准源（缺失时退回"宿主自己解析工作区"，仍然不会瞎猜）。 */
+  /**
+   * 全局标准源（缺失时退回"宿主自己解析工作区"，仍然不会瞎猜）。
+   *
+   * ⚠️ **0.3.1 这里读错过字段**：`useSessions(state => state.current)` —— 该标准源的快照
+   * （`SessionListState`）里**没有 `current`**，于是恒为 `undefined`，请求里什么都不带，
+   * 宿主退回"最后绑过的那个工作区" ⇒ 右栏显示的进度可能完全不是当前工作区的。
+   * 现在与主面板同源：用 `useWorkspaces` 的工作区列表 + `useSessions` 的会话行（`cwd` / `updatedAt`）
+   * 算出作用域路径（见 `workspace-select.ts`）。**不要引入键控 Hook**（0.3.3 的 React #311）。
+   */
   useSessions?: SessionsSelectorHook;
+  /** 工作区列表选择器钩子（全局标准源；缺失时退回"宿主自己解析"）。 */
+  useWorkspaces?: WorkspacesSelectorHook;
 }
 
 /** 外壳：只取数据，渲染交给 {@link RightProgressView}（自检可以直接喂假数据）。 */
 export function RightProgressTab(props: RightProgressTabProps): React.ReactElement {
   const useSessions = props.useSessions ?? useAbsentSessions;
-  const sessionId = useSessions((state: { current?: string }) => state.current);
-  const { board, error, refresh } = useBoardData(props.intervalMs ?? 2000, sessionId);
+  const useWorkspaces = props.useWorkspaces ?? useAbsentWorkspaces;
+  const items = useWorkspaces((state) => state.items) as readonly WorkspaceOptionLike[] | undefined;
+  const options = useMemo(() => toWorkspaceOptions(items), [items]);
+  const sessionIds = useSessions((state) => state.ids) as readonly string[] | undefined;
+  const rowsById = useSessions((state) => state.byId) as
+    | Readonly<Record<string, SessionRowLike | undefined>>
+    | undefined;
+  const sessionLookup = useMemo(
+    () =>
+      sessionIds === undefined
+        ? undefined
+        : { ids: sessionIds, summaryOf: (sessionId: string) => rowsById?.[sessionId] },
+    [sessionIds, rowsById],
+  );
+  const activeSessionId = useMemo(
+    () => activeSessionFromList(options, sessionLookup),
+    [options, sessionLookup],
+  );
+  const pick = useMemo(
+    () => pickWorkspace({ options, ...(activeSessionId !== undefined ? { currentSessionId: activeSessionId } : {}) }),
+    [options, activeSessionId],
+  );
+  const { board, error, refresh } = useBoardData(
+    props.intervalMs ?? 2000,
+    activeSessionId,
+    pick?.option.path,
+  );
   return React.createElement(RightProgressView, { board, error, refresh });
 }
 

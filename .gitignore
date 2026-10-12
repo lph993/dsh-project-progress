@@ -7,6 +7,15 @@ lib/
 # `pnpm run render-check` 的中间产物（自检脚本编译出来的 .mjs）
 .render-check/
 
+# `npm pack` 出来的发布包：**本地安装源**，不是源码。
+#
+# 为什么必须忽略（实测踩到）：profile 的依赖是
+# `"dsh-project-progress": "file:E:/…/dsh-project-progress-0.3.10.tgz"` ——
+# 它是"这台机器上装什么"的记录，指向工作区里的一个二进制包；
+# 提交进仓库既让人误以为它是发布产物（真正的发布走 npm），也会随每次打包反复变动。
+# 它删不得（装了它的 profile 依赖这个路径），所以只能是"留着但不入库"。
+*.tgz
+
 # ── TypeScript 增量缓存 ─────────────────────────────────────────
 *.tsbuildinfo
 

@@ -74,6 +74,16 @@ export interface NodeView {
    */
   hasFollowUp?: boolean;
   /**
+   * **未完成时"还差什么"**（0.3.2 新增）。
+   *
+   * 与 `description`（任务简述）的分工见 `pm_progress` 的 `note` 参数：
+   * 看板上最有价值的是**没做完的那些**，而"缺什么"原先只能挤进任务简述，
+   * 或被 `pm_finish` 的 `followUp` 顶掉（那条路会把进度置为 1，对未完成节点是错的）。
+   */
+  note?: string;
+  /** `note` 最后一次被写入的时间（ISO），用来判断这条缺口说明还新不新鲜。 */
+  noteUpdatedAt?: string;
+  /**
    * 最后一次改动这个节点的会话 id（人手动改不覆盖）。
    *
    * 用途：属性栏给出「跳转到该会话」——"这个节点是谁在动"从**记录**里读，

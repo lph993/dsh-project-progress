@@ -52,6 +52,14 @@ export interface WorkspaceRootResolution {
     | 'workspace-registry'
     | 'bound'
     | 'env'
+    /**
+     * **面板显式声明的工作区**（0.3.2）。
+     *
+     * 单列一档而不是复用 `tool-call`：两者可信度相当（都是"调用方直接说的"），
+     * 但**来源不同**，而"根从哪来"正是排查看板看错工作区时第一个要看的东西 ——
+     * 写成一个含混的值等于把这个判据弄丢。工具读到的 `source` 会如实显示它。
+     */
+    | 'panel-scope'
     | 'none';
   /** 诊断说明（人可读）。 */
   detail: string;
@@ -89,23 +97,11 @@ export function pickWorkspaceFromRegistry(
 /**
  * 归一化工作区根，用于**比较**（不是用于落盘/展示）。
  *
- * 为什么需要：同一条路径在手写配置、DSH 注册表、`process.cwd()` 里可能出现
- * `Z:\a\b` / `Z:/a/b` / `z:\a\b\` / `\\?\Z:\a\b` 等写法，直接字符串比较会
- * 把"同一个工作区"认成两个，于是每个写法都新建一个项目。
+ * **实现已搬到 `shared/path.ts`**（纯函数，浏览器侧也要用），这里只做再导出 ——
+ * 原先它住在本文件，而本文件头顶 `import { existsSync } from 'node:fs'`：
+ * 客户端只要想比一条工作区路径就会把 `node:fs` 拖进 bundle。宿主侧的既有引用不受影响。
  */
-export function normalizeRootPath(input: string): string {
-  let path = input.trim();
-  // Windows 的长路径前缀（`\\?\C:\x` / `\\?\UNC\srv\share`）
-  if (path.startsWith('\\\\?\\UNC\\')) path = `\\\\${path.slice(8)}`;
-  else if (path.startsWith('\\\\?\\')) path = path.slice(4);
-  path = path.replace(/\\/g, '/');
-  // 去掉结尾斜杠（但要保留根 `/` 与 `C:/`）
-  path = path.replace(/\/+$/, '');
-  if (/^[a-zA-Z]:$/.test(path)) path = `${path}/`;
-  // Windows 盘符大小写不敏感；POSIX 敏感，所以只在小写盘符形态上统一
-  if (/^[a-zA-Z]:\//.test(path)) path = path[0]!.toLowerCase() + path.slice(1);
-  return path;
-}
+export { normalizeRootPath } from '../shared/path.ts';
 
 /** 解析工作区根（不外抛）。 */
 export function resolveWorkspaceRoot(input: {

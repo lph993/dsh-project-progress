@@ -179,6 +179,28 @@ export interface ClientSelfReport {
    * 宿主侧**什么都收不到**。有了这个字段，"空白"就有了可查的原因。
    */
   error?: { kind: string; message: string; stack?: string; at: string };
+  /**
+   * **面板作用域的自报**（0.3.2 新增，可选）。
+   *
+   * 为什么必须让客户端报这个：面板"看哪个工作区"的判据全在浏览器侧
+   * （`client/workspace-select.ts`：显式选择 > 会话所属 > 最近变更 > 首个），
+   * 而宿主只能看到"请求里带没带 `root`"。一旦某个标准源在真机上不可用
+   * （例如 `useWorkspaces` 没被提供），表现为**看板看错工作区**，
+   * 而宿主侧看到的只是一个"没带参数的请求" —— 与"旧客户端"完全无法区分。
+   * 把这个判据链报上来，"为什么选中了它 / 为什么一个都没选到"就不再需要猜。
+   */
+  scope?: {
+    /** 可选工作区个数（0 = 拿不到工作区列表）。 */
+    workspaceCount: number;
+    /** 选中的工作区路径（未选中时省略）。 */
+    pickedPath?: string;
+    /** 选中的判据（`manual` / `session` / `recent` / `first`）。 */
+    source?: string;
+    /** 标准源到位情况：`useWorkspaces` / `useSessions` 是否拿到。 */
+    hooks: { workspaces: boolean; sessionRetainInfo: boolean; sessions: boolean };
+    /** 当前显示的会话 id（拿不到时省略）。 */
+    activeSessionId?: string;
+  };
 }
 
 /** 生成一次性实例 id（浏览器安全 UUID，§5.2）。 */

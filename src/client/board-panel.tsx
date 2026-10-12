@@ -32,16 +32,39 @@ import {
   nodeRowLabel,
   nodeRowTitle,
   debugUrl,
-} from './api.ts';
-import type { BoardSnapshot, NodeView } from './contract.ts';
+} from './api.ts';import type { BoardSnapshot, NodeView } from './contract.ts';
 import { alertChipOf } from './alerts.ts';
 import { nodeCountLabel } from './labels.ts';
 import { dismissibleByBackdrop } from './modal-dismiss.ts';
 import { legendSections } from './legend.ts';
 import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
 import { NodeInspector } from './node-inspector.tsx';
+import {
+  activeSessionFromList,
+  pickWorkspace,
+  toWorkspaceOptions,
+  type SessionRowLike,
+  type WorkspaceOption,
+  type WorkspaceOptionLike,
+  type WorkspacePick,
+} from './workspace-select.ts';
+import { WorkspaceSwitcher } from './workspace-switcher.tsx';
+import {
+  browserScopeStore,
+  readRememberedScope,
+  writeRememberedScope,
+} from './workspace-memory.ts';
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
+
+/**
+ * 作用域自报用的 panelId。
+ *
+ * 与主面板的上报（`panelId: 'project-manager'`）**刻意不同**：后者带 `registeredSlots`，
+ * 是"槽位注册成功"的记录；这一条只讲"面板看哪个工作区、凭什么"。
+ * 分开写的好处是**后到的上报不会把槽位清单覆盖成空数组**（`state.client` 是单槽位记录）。
+ */
+const PANEL_ID_REPORT_SCOPE = 'project-manager-scope';
 
 /** 构建期注入的版本号（见 tsdown 的 `define`）。 */
 declare const __PM_VERSION__: string | undefined;
@@ -49,29 +72,47 @@ declare const __PM_VERSION__: string | undefined;
 /**
  * `useSessions` 标准钩子的结构类型（`SnapshotSelectorHook<SessionListState>` 的最小面）。
  *
- * 只声明我们真正用到的字段：`current`（当前会话 id）。
+ * ⚠️ **这个快照里没有 `current`**（只有 `ids` / `byId` / `phase` / `projectionsBySession`，
+ * 见 `dsh-api-session-controller` 的 `SessionListState`）。0.3.1 读的就是不存在的 `state.current`，
+ * 于是恒为 `undefined` ⇒ 面板从不声明作用域 ⇒ "看板看错工作区"。
+ * 现在只用**确实存在**的两列：`ids` 与 `byId[*].cwd` / `updatedAt`。
  */
-export type SessionsSelectorHook = <T>(selector: (state: { current?: string }) => T) => T;
+export type SessionsSelectorHook = <T>(
+  selector: (state: {
+    ids?: readonly string[];
+    byId?: Readonly<Record<string, SessionRowLike | undefined>>;
+  }) => T,
+) => T;
+
+/**
+ * `useWorkspaces` 标准钩子的结构类型（`SnapshotSelectorHook<WorkspaceSnapshot>` 的最小面）。
+ *
+ * 它给出 DSH 自己的**工作区列表**（`items` 里每行带 `workspaceId` / `path` / `title` /
+ * `updatedAt` / `sessionIds`）。面板据此声明"我要哪个工作区" —— 见 `workspace-select.ts`。
+ */
+export type WorkspacesSelectorHook = <T>(selector: (state: { items?: readonly unknown[] }) => T) => T;
 
 /**
  * 面板组件 props（`PropsRuntime<'main'>` + 注入面）。
  *
- * `useSessions` **不需要**我们注入：它是 DSH 的**全局标准源**（`GlobalStandardProps`），
- * 由渲染器把 `{...kit}` 摊进每个 slot 条目的 props
- * （`standardHookPropName('sessions') === 'useSessions'`，见 dsh-client-ui-renderer）。
+ * `useSessions` / `useWorkspaces` **都不需要**我们注入：它们是 DSH 的**全局标准源**
+ * （`GlobalStandardProps`），由渲染器把 `{...kit}` 摊进每个 slot 条目的 props
+ * （`standardHookPropName('workspaces') === 'useWorkspaces'`，见
+ * `dsh-client-ui-renderer`；二者的 `provideRoot` 分别在 `dsh-client-ui-session:469` 与
+ * `dsh-client-ui-workspace:4142`）。
  *
- * 我们用它读**当前会话 id**，再交给宿主的 `/pm/board?sessionId=…`：
- * 宿主据此把工作区根**精确**解析到"你正在看的那个工作区"，
- * 而不是退化成"最近使用过的那个工作区"。
- *
- * 未拿到该钩子时（宿主没有会话层 / 单测直接渲染）保持 undefined，
- * 此时宿主按"最近使用的工作区"解析——仍然不会瞎猜。
+ * ⚠️ **0.3.1 在这里读错过字段**：当时用 `useSessions(state => state.current)` 取"当前会话"，
+ * 而该标准源的快照是 `SessionListState`，**没有 `current`** ⇒ 恒为 `undefined` ⇒ 面板从来没把
+ * 自己的作用域告诉宿主，宿主只好用"最后绑过的那个工作区" ⇒ 用户看到的就是"时灵时不灵"。
+ * 现在作用域改由**工作区路径**表达（面板本来就拿得到），会话 id 只作补充。
  */
 export interface BoardPanelProps {
   /** 刷新间隔（毫秒），由宿主设置同步。 */
   intervalMs?: number;
   /** 会话列表选择器钩子（全局标准源；缺失时为 undefined）。 */
   useSessions?: SessionsSelectorHook;
+  /** 工作区列表选择器钩子（全局标准源；缺失时退回"宿主自己解析"）。 */
+  useWorkspaces?: WorkspacesSelectorHook;
 }
 
 /**
@@ -117,11 +158,6 @@ class CanvasBoundary extends React.Component<
   }
 }
 
-/** 选择当前会话 id。 */
-function selectCurrentSession(state: { current?: string }): string | undefined {
-  return state.current;
-}
-
 /**
  * 标准源缺失时的替身：不订阅、恒返回 undefined。
  *
@@ -130,6 +166,12 @@ function selectCurrentSession(state: { current?: string }): string | undefined {
  * 正常不会变，但保持次数稳定能避免潜在的 Hook 顺序问题。
  */
 export function useAbsentSessions<T>(_selector: (state: { current?: string }) => T): T | undefined {
+  useState(undefined);
+  return undefined;
+}
+
+/** `useWorkspaces` 缺失时的替身（同上：保持 Hook 次数稳定）。 */
+export function useAbsentWorkspaces<T>(_selector: (state: { items?: readonly unknown[] }) => T): T | undefined {
   useState(undefined);
   return undefined;
 }
@@ -372,11 +414,15 @@ const styles = {
  * 轮询看板数据。面板是"只读投影"，因此轮询足够，无需长连接。
  *
  * @param intervalMs - 轮询间隔（毫秒，下限 500）。
- * @param sessionId - 当前会话 id；带上它宿主才能把工作区根精确解析到该会话的工作区。
+ * @param sessionId - 当前会话 id（可选，交给宿主做会话记账与旧逻辑兜底）。
+ * @param rootPath - **要看哪个工作区**（0.3.2 新增）。不给就退回旧行为：
+ *   宿主按"当前已绑定的工作区根"解析，也就是**最后一个动过树的那个** ——
+ *   那正是"时灵时不灵"的来源，所以面板正常路径上总是给。
  */
 export function useBoardData(
   intervalMs: number,
   sessionId?: string,
+  rootPath?: string,
 ): {
   board: BoardSnapshot | undefined;
   error: string | undefined;
@@ -386,15 +432,15 @@ export function useBoardData(
   const [error, setError] = useState<string | undefined>(undefined);
   const inFlight = useRef(false);
 
-  // 会话切换：立刻丢掉上一棵项目树的投影，避免短暂显示"别人的看板"。
+  // 作用域切换：立刻丢掉上一棵项目树的投影，避免短暂显示"别人的看板"。
   useEffect(() => {
     setBoard(undefined);
-  }, [sessionId]);
+  }, [sessionId, rootPath]);
 
   const refresh = useCallback(() => {
     if (inFlight.current) return;
     inFlight.current = true;
-    void fetchBoard(undefined, sessionId)
+    void fetchBoard(undefined, sessionId, rootPath)
       .then((outcome) => {
         if (outcome.ok && outcome.value) {
           setBoard(outcome.value);
@@ -406,7 +452,7 @@ export function useBoardData(
       .finally(() => {
         inFlight.current = false;
       });
-  }, [sessionId]);
+  }, [sessionId, rootPath]);
 
   useEffect(() => {
     refresh();
@@ -426,12 +472,144 @@ export function useBoardData(
  * 于是"拿到数据就崩"这类问题在 `pnpm run verify` 就会被挡住。
  */
 export function BoardPanel(props: BoardPanelProps): React.ReactElement {
-  // 全局标准源 `useSessions`（渲染器摊进 kit）→ 当前会话 id。
-  // 无条件调用同一组 Hook：标准源缺失时用替身，保证 Hook 次数稳定。
+  /**
+   * **作用域判据链**（0.3.2 修复"时灵时不灵"的核心）：
+   *
+   * 1. 读 DSH 自己的工作区列表（`useWorkspaces`）；
+   * 2. 从**非键控**的会话列表（`useSessions`）里按 `cwd` 找出"我正在那个工作区里待着的会话"；
+   * 3. 归结成"显式选择 > 会话所属 > 最近变更 > 列表首个"（`pickWorkspace`），
+   *    并把判据名字显示在界面上。
+   *
+   * ⚠️ **不要在这里引入任何"键控 Hook"**（`useSessionRetainInfo` 那类）：0.3.3 用过它，
+   * 并按会话数可变次数调用 ⇒ React #311 ⇒ `main` 槽位崩溃、看板打不开。详见下面那段注释。
+   *
+   * 手动选择（`pickedPath`）要能一直压着自动判据，所以放在 state 里而不是每次重算；
+   * 但**用户在选择器里换工作区后会失效**（`activeSessionId` 变了就丢掉它）——
+   * 否则面板会永远钉在用户很久以前手选的那个工作区上。
+   */
   const useSessions = props.useSessions ?? useAbsentSessions;
-  const sessionId = useSessions(selectCurrentSession);
-  const { board, error, refresh } = useBoardData(props.intervalMs ?? 1000, sessionId);
-  return React.createElement(BoardView, { board, error, refresh, sessionId });
+  const useWorkspaces = props.useWorkspaces ?? useAbsentWorkspaces;
+
+  const items = useWorkspaces((state) => state.items) as readonly WorkspaceOptionLike[] | undefined;
+  const options = useMemo(() => toWorkspaceOptions(items), [items]);
+  /**
+   * **当前会话 id —— 只走非键控的全局标准源 `useSessions`**（0.3.4 修的 React #311）。
+   *
+   * 0.3.3 曾经改用**键控**钩子 `useSessionRetainInfo` 来判"哪个会话正被主区域显示"，
+   * 并在 `useMemo` 里按会话数**可变次数**地调用它 —— React 的 Hook 次数必须每次渲染一致，
+   * 于是它抛 `Minified React error #311`（"Rendered more hooks than during the previous render"），
+   * `main` 槽位整条崩掉、**看板打不开**。
+   *
+   * 现在改用会话列表快照里的 `cwd` + `updatedAt`（`activeSessionFromList`）：
+   * 一次订阅、无键控 Hook、纯函数可单测。
+   */
+  const sessionIds = useSessions((state) => state.ids) as readonly string[] | undefined;
+  const rowsById = useSessions((state) => state.byId) as
+    | Readonly<Record<string, SessionRowLike | undefined>>
+    | undefined;
+  const sessionLookup = useMemo(
+    () =>
+      sessionIds === undefined
+        ? undefined
+        : {
+            ids: sessionIds,
+            summaryOf: (sessionId: string) => rowsById?.[sessionId],
+          },
+    [sessionIds, rowsById],
+  );
+  const activeSessionId = useMemo(
+    () => activeSessionFromList(options, sessionLookup),
+    [options, sessionLookup],
+  );
+  /**
+   * 会话变了（用户切了工作区/会话）⇒ 丢掉手动选择。
+   *
+   * 用 **state 而非 ref** 记录"上一个是哪个会话"，这样丢弃动作发生在渲染期、
+   * 与手动选择同一次提交里，不会有"先按旧选择发一轮请求"的窗口。
+   *
+   * **初值从 `localStorage` 读回**（0.3.7）：以前只存在内存里，面板一卸载
+   * （切到别的视图再点回来）就没了 —— 用户原话："切换工作区不能记忆，每次点进去都要重新选"。
+   * 记忆按**会话**存（`dsh.pm.scope.<sessionId>`），于是"跨挂载记住、跨会话自动失效"
+   * 与既有的 `stale` 语义完全一致。
+   */
+  const [picked, setPicked] = useState<{ path: string; forSession: string | undefined } | undefined>(
+    () => {
+      const remembered = readRememberedScope(browserScopeStore(), activeSessionId);
+      return remembered === undefined
+        ? undefined
+        : { path: remembered, forSession: activeSessionId };
+    },
+  );
+  const stale = picked !== undefined && picked.forSession !== activeSessionId;
+  const manualPath = stale ? undefined : picked?.path;
+
+  const pick = useMemo(
+    () =>
+      pickWorkspace({
+        options,
+        ...(activeSessionId !== undefined ? { currentSessionId: activeSessionId } : {}),
+        ...(manualPath !== undefined ? { manualPath } : {}),
+      }),
+    [options, activeSessionId, manualPath],
+  );
+
+  /**
+   * `useSessions` 只用来取"当前会话 id"的**补充**信息：这个钩子真正给的是会话列表
+   * （`ids` / `byId` / `phase`），并不带当前选中项。真选中的那个由保留计数决定
+   * （`activeSessionId`），拿不到时就交给 `sessionId` 兜底。
+   */
+  const sessionId = useSessions((state: { current?: string }) => state.current);
+  const scopeSessionId = activeSessionId ?? sessionId;
+  /**
+   * **把"作用域是怎么定的"报给宿主**（0.3.2）。
+   *
+   * 为什么值得单独上报：这一整条判据链（哪些标准源到位、选中哪个工作区、凭什么）
+   * 全在浏览器里，而它出问题时的表现是"看板看错工作区" —— 宿主只看到一个**没带参数**的请求，
+   * 与"旧客户端"无法区分。0.3.2 的真机排查就卡在这一步：日志里全是 `GET /pm/board`（无参数），
+   * 只能靠猜"是不是某个标准源没到位"。有了这条，`/pm/debug` 直接给出答案。
+   *
+   * 只在判据真正变化时上报（依赖是一个把判据压平的字符串），不让诊断变成轮询噪声。
+   */
+  const scopeKey = `${options.length}|${pick?.option.path ?? ''}|${pick?.source ?? ''}|${
+    activeSessionId ?? ''
+  }`;
+  useEffect(() => {
+    reportClient({
+      panelId: PANEL_ID_REPORT_SCOPE,
+      bundleId: 'dsh-project-progress',
+      registeredSlots: [],
+      scope: {
+        workspaceCount: options.length,
+        ...(pick !== undefined ? { pickedPath: pick.option.path, source: pick.source } : {}),
+        hooks: {
+          workspaces: props.useWorkspaces !== undefined,
+          sessions: props.useSessions !== undefined,
+        },
+        ...(activeSessionId !== undefined ? { activeSessionId } : {}),
+      },
+    });
+  }, [scopeKey]);
+  const { board, error, refresh } = useBoardData(
+    props.intervalMs ?? 1000,
+    scopeSessionId,
+    pick?.option.path,
+  );
+  return React.createElement(BoardView, {
+    board,
+    error,
+    refresh,
+    sessionId: scopeSessionId,
+    workspacePick: pick,
+    workspaceOptions: options,
+    onSelectWorkspace: (option: WorkspaceOption) => {
+      /**
+       * **选完立刻写回记忆**（0.3.7），而不是等卸载时再存：
+       * 面板可能被直接关掉/刷新，那时没有"卸载回调"的机会。
+       */
+      writeRememberedScope(browserScopeStore(), activeSessionId, option.path);
+      setPicked({ path: option.path, forSession: activeSessionId });
+    },
+  });
 }
 
 /**
@@ -466,6 +644,12 @@ export interface BoardViewProps {
   error: string | undefined;
   refresh: () => void;
   sessionId: string | undefined;
+  /** 本次看板作用域落在哪个工作区、为什么（0.3.2）。 */
+  workspacePick?: WorkspacePick | undefined;
+  /** 可选工作区（下拉内容）。 */
+  workspaceOptions?: readonly WorkspaceOption[] | undefined;
+  /** 用户把面板切到另一个工作区。 */
+  onSelectWorkspace?: ((option: WorkspaceOption) => void) | undefined;
   /**
    * **跳到某个会话**（用户诉求："点击能跳转到对应会话"）。
    *
@@ -1449,13 +1633,32 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       rootNotice !== undefined
         ? React.createElement('div', { style: { ...styles.note, marginTop: 2 } }, rootNotice)
         : null,
-      // "根从哪来"必须可见（FR-71 口径同源）：用户最容易被"面板锁错工作区"迷惑
+      /**
+       * "根从哪来"必须可见（FR-71 口径同源）：用户最容易被"面板锁错工作区"迷惑。
+       *
+       * 0.3.2 起这一行从**纯文本变成控件**：面板自己声明作用域（`root` 查询参数），
+       * 所以用户既能看出"现在是哪个工作区、为什么是它"，也能**就在这里切** ——
+       * 不必离开看板去左侧栏点一遍、回来还得指望面板认对。
+       *
+       * **只有一个动作**：下拉里选 = 只切这个看板的作用域（看进度不必跳转）。
+       * 「在侧边栏打开」已在 0.3.8 去掉 —— 它的语义其实是"连接该工作区并打开
+       * 复用或新建的空白会话"，点下去常常只是**新建一个空会话**，与按钮字面承诺不符
+       * （用户原话："点一下只是新建会话，价值不大"）。
+       */
+      React.createElement(WorkspaceSwitcher, {
+        pick: props.workspacePick,
+        options: props.workspaceOptions ?? [],
+        boardRoot: board?.workspaceRoot.value ?? null,
+        onScope: (option: WorkspaceOption) => props.onSelectWorkspace?.(option),
+      }),
+      // 宿主回报的解析来源：与上面那个控件互补 —— 控件说"我要哪个"，
+      // 这一行说"宿主最后给了哪个、按什么判据"（两者不一致时就是排查线索）
       React.createElement(
         'div',
         { style: { ...styles.note, marginTop: 2 }, title: sessionId ? `会话 ${sessionId}` : '未拿到当前会话' },
         board?.workspaceRoot.value
-          ? `工作区：${board.workspaceRoot.value}（来源：${board.workspaceRoot.source}）`
-          : '工作区：未解析到（面板不会读任何目录）',
+          ? `宿主解析：${board.workspaceRoot.value}（来源：${board.workspaceRoot.source}）`
+          : '宿主未解析到工作区（面板不会读任何目录）',
       ),
       // 版本与规模自检：面板"空白"时，这一行能不能看到就是最快的分诊信息
       // （能看到 → 面板在渲染，问题在中间画布；看不到 → 主槽位压根没渲染我们的组件）

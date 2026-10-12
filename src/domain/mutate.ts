@@ -174,6 +174,7 @@ export function blockOf(patch: PatchFields): WriteBlock {
   if (patch.focus !== undefined) return 'focus';
   if (patch.name !== undefined) return 'name';
   if (patch.description !== undefined) return 'desc';
+  if (patch.note !== undefined) return 'desc';
   if (patch.refs !== undefined) return 'refs';
   return 'structure';
 }
@@ -271,6 +272,12 @@ export function mutatePatch(
     ...(decision.patch.description !== undefined
       ? { descriptionUpdatedAt: input.ts ?? ctx.clock.now() }
       : {}),
+    /**
+     * **`note` 写入时同样自动打时间戳**（`noteUpdatedAt`）—— 理由与 `description` 完全一样：
+     * "未完成时还差什么"这条信息**会过期**（缺口补上了、或换了做法），而判断它新不新鲜
+     * 必须知道它是什么时候写的。让调用方自己记得传是不可靠的，所以在合并处统一打。
+     */
+    ...(decision.patch.note !== undefined ? { noteUpdatedAt: input.ts ?? ctx.clock.now() } : {}),
     /**
      * **记录"最后是哪个会话改的它"**（供节点 →「跳转到会话」用）。
      *

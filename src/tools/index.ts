@@ -466,9 +466,9 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
       defineTool({
         name: 'pm_progress',
         description:
-          '推进节点进度或自身状态；也可以用它**补/改节点的 refs**。注意：父节点不可写自身状态' +
-          '（会被拒绝），请改门控或子节点；已完成节点回退需要 force 且来源为 user。携带 rev 做 CAS，' +
-          '陈旧会返回最新 rev。',
+          '推进节点进度或自身状态；也可以用它**补/改/清空节点的 refs**，或用 `note` 写"还差什么"。' +
+          '注意：父节点不可写自身状态（会被拒绝），请改门控或子节点；已完成节点回退需要 force 且来源为 user。' +
+          '携带 rev 做 CAS，陈旧会返回最新 rev。',
         parameters: {
           nodeId: { type: 'string', required: true, description: '节点 id' },
           progress: { type: 'number', description: '自身完成度 0–1' },
@@ -481,8 +481,25 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             type: 'array',
             description:
               '替换该节点的 refs（工作区相对路径，含点视为文件）。用于给**已有的**无 refs 节点补上归属；' +
-              '改完会重算身份键，若与别的活节点同身份会**拒绝**（避免造重复节点）。',
+              '**传空数组 `[]` = 显式清空**（与"不传这个参数"区分开 —— 写错路径后要能撤掉）。' +
+              '改完会重算身份键，若与别的活节点同身份会**拒绝**（避免造重复节点）；' +
+              '路径**存在性不拦写入**，但会如实回告 `warnings`。',
             items: { type: 'string' },
+          },
+          note: {
+            type: 'string',
+            description:
+              '**未完成时"还差什么"**（结构化字段，0.3.2 新增）。语义与 `description`（任务简述）分开：' +
+              '看板最有价值的就是没做完的那些，而"缺什么"既不该塞进任务简述，' +
+              '也不该靠 `pm_finish` 的 `followUp` 表达（那条路会把 progress 置为 1）。',
+          },
+          priority: {
+            type: 'number',
+            description:
+              '**优先级 1..10（1 最高）**（0.3.9 新增）。`pm_next` 的排序里有"优先级"这一档，' +
+              '而在此之前它**只能**由 AI 建树初判或面板里逐个手改 —— 某些整枝完全没优先级时' +
+              '（真机现场 `COP 系统` 59 个叶全空）那一档就等于不存在。' +
+              '**写它就等于表态**：来源标为 `user`，后续 AI 建树不会静默覆盖（只登记"想覆盖"并来问人）。',
           },
           rev: { type: 'number', description: 'CAS 版本号（从上次读取获得）' },
           force: { type: 'boolean', description: '回退/重开时需要（仅 user 来源有效）' },
@@ -498,26 +515,38 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           /**
            * refs 先写：它走的是**带查重**的专用路径（`updateRefs`），不是裸 patch。
            * 只给 refs 不给进度时，这就等于"只补归属、不动数字"。
+           *
+           * `'refs' in args` 而不是 `Array.isArray(args.refs) && args.refs.length > 0`：
+           * 后者会把"显式传空数组想清空"与"根本没传"混为一谈 —— 那正是真机上
+           * "写错路径后撤销不了"的原因（见 `updateRefs` 的 `explicitClear`）。
            */
           let refsResult: ApplyResult | undefined;
-          if (Array.isArray(args.refs) && args.refs.length > 0) {
+          if ('refs' in args) {
             refsResult = await service.updateRefs({
               nodeId: args.nodeId,
-              paths: args.refs as string[],
+              paths: Array.isArray(args.refs) ? (args.refs as string[]) : [],
+              explicitClear: true,
               by: caller.by,
               ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
               ...(sessionId !== undefined ? { sessionId } : {}),
             });
             if (refsResult.status !== 'ok') return refsResult as unknown as JsonValue;
           }
-          if (args.progress === undefined && args.selfState === undefined) {
+          if (
+            args.progress === undefined &&
+            args.selfState === undefined &&
+            args.note === undefined &&
+            args.priority === undefined
+          ) {
             // 只改 refs：把那次写入的结果原样返回
-            return (refsResult ?? { status: 'denied', reason: 'validation', code: 'E_NOTHING_TO_DO', message: '既没有 progress/selfState，也没有 refs' }) as unknown as JsonValue;
+            return (refsResult ?? { status: 'denied', reason: 'validation', code: 'E_NOTHING_TO_DO', message: '既没有 progress/selfState/note/priority，也没有 refs' }) as unknown as JsonValue;
           }
           const result = await service.progress({
             nodeId: args.nodeId,
             ...(args.progress !== undefined ? { progress: args.progress } : {}),
             ...(args.selfState !== undefined ? { selfState: args.selfState as SelfState } : {}),
+            ...(args.note !== undefined ? { note: args.note } : {}),
+            ...(args.priority !== undefined ? { priority: args.priority } : {}),
             ...(args.rev !== undefined ? { rev: args.rev } : {}),
             ...(args.force !== undefined ? { force: args.force } : {}),
             ...(args.reason !== undefined ? { reason: args.reason } : {}),
@@ -525,6 +554,17 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
             ...(sessionId !== undefined ? { sessionId } : {}),
           });
+          /**
+           * 只给了 `note` / `priority`（既没进度也没状态）时，上面那次 `progress` 一次写入就够 ——
+           * 它会把 `patch` 里的字段照旧带上（缺省就是不写）。refs 那次写入的结果
+           * 里有 `warnings`，合起来回给调用方，免得"补了 refs 的告警被后一步吞掉"。
+           */
+          if (args.progress === undefined && args.selfState === undefined) {
+            const warnings = refsResult?.status === 'ok' ? refsResult.warnings : undefined;
+            return (warnings !== undefined && result.status === 'ok'
+              ? { ...result, warnings }
+              : result) as unknown as JsonValue;
+          }
           return result as unknown as JsonValue;
         },
       }),
@@ -603,6 +643,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         description:
           '一次性汇报多个节点的进度/状态（**收尾时用**：回合、子任务或会话结束前把这段动过的节点一起报掉）。' +
           '每一项等价于一次 pm_progress，finish=true 则等价于 pm_finish（done 且 progress=1）；' +
+          '**每一项也可以带 `refs`（批量补归属）与 `note`（还差什么）**——' +
+          '建树时忘了带 refs 就靠它补，不必再逐节点调 pm_progress；' +
           '逐项独立判定，某一项失败不影响其它项，结果逐项返回。最多 50 项。',
         parameters: {
           updates: {
@@ -621,6 +663,23 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
                   description: '自身状态（finish=true 时忽略）',
                 },
                 finish: { type: 'boolean', description: '置为完成（等价 pm_finish）' },
+                refs: {
+                  type: 'array',
+                  description:
+                    '替换该节点的 refs（工作区相对路径）。**传空数组 `[]` = 显式清空**；' +
+                    '省略 = 不动 refs。与 `pm_progress` 同一套语义与同一段实现。',
+                  items: { type: 'string' },
+                },
+                note: {
+                  type: 'string',
+                  description: '**未完成时"还差什么"**（结构化字段）；与 `pm_progress.note` 同语义。',
+                },
+                priority: {
+                  type: 'number',
+                  description:
+                    '**优先级 1..10（1 最高）**；与 `pm_progress.priority` 同语义。' +
+                    '**这是唯一能"批量补优先级"的入口** —— 某些整枝完全没优先级时用它一次补齐。',
+                },
                 rev: { type: 'number', description: 'CAS 版本号' },
                 evidence: { type: 'string', description: '依据（进审计）' },
               },

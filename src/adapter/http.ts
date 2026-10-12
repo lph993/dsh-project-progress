@@ -42,6 +42,25 @@ import { HOST_BATCH } from '../shared/build.ts';
 import { readPluginRegistry, type RegistryView } from './registry.ts';
 import type { ProjectService } from '../service.ts';
 
+/**
+ * 校验客户端上报的"面板作用域"形状（0.3.2）。
+ *
+ * 只做形状校验、不加工内容：这一段是**客户端的自述**，宿主的职责是如实存档并显示，
+ * 而不是替它解释。形状不对就整个丢掉（宁可 `scope` 缺失，也不要存一条半真半假的记录）。
+ */
+function isClientScope(value: unknown): value is NonNullable<ClientSelfReport['scope']> {
+  if (typeof value !== 'object' || value === null) return false;
+  const scope = value as Record<string, unknown>;
+  if (typeof scope['workspaceCount'] !== 'number') return false;
+  const hooks = scope['hooks'];
+  if (typeof hooks !== 'object' || hooks === null) return false;
+  const hookRecord = hooks as Record<string, unknown>;
+  for (const key of ['workspaces', 'sessions']) {
+    if (typeof hookRecord[key] !== 'boolean') return false;
+  }
+  return true;
+}
+
 /** 从 body 或 query 里取会话 id（面板会带上它来精确解析工作区根）。 */
 function readSessionId(body: string, params: URLSearchParams): string | undefined {
   const fromQuery = params.get('sessionId');
@@ -202,9 +221,24 @@ export function registerRoutes(
             return;
 
           case 'GET /pm/board': {
-            // 面板带上当前会话 id 时，工作区根可以**精确**解析到那个会话的工作区
+            /**
+             * 面板的作用域：**工作区路径是主角**（0.3.2）。
+             *
+             * 修复前只认 `sessionId`，而客户端读它用的是 `useSessions(state => state.current)` ——
+             * 那个快照里没有 `current`，于是请求里**什么都没带**，宿主退回"当前已绑定的工作区根"
+             * （`source: 'bound'`，也就是最后一个动过树的那个工作区）；
+             * 表现为用户在看 A 工作区、看到 B 的进度，且随别的会话活动而变（"时灵时不灵"）。
+             *
+             * 现在面板用 DSH 自己的工作区列表算出路径并显式声明（判据见 `client/workspace-select.ts`）：
+             * 路径说话，不再猜"宿主觉得我在哪"。`sessionId` 仍然接受（会话记账 + 旧客户端退路）。
+             */
             const sessionId = params.get('sessionId');
-            sendJson(res, 200, await service.board(sessionId ?? undefined));
+            const root = params.get('root');
+            sendJson(
+              res,
+              200,
+              await service.board(sessionId ?? undefined, root ?? undefined),
+            );
             return;
           }
 
@@ -628,6 +662,39 @@ export function registerRoutes(
                   kind: errorReport.kind,
                 });
               }
+              /**
+               * **合并规则：谁带来的信息谁生效，绝不互相冲掉**（0.3.2）。
+               *
+               * `state.client` 是**单槽位**记录（`/pm/debug` 只显示一份客户端自述），
+               * 而客户端有**三类**上报都打到它：
+               *
+               * 1. **槽位注册成功**（带 4 个 `registeredSlots`）—— 权威，整份替换；
+               * 2. **作用域**（带 `scope`、`registeredSlots` 为空）—— 随工作区切换反复变化，
+               *    整份替换就会把"4 个槽位注册成功"冲成 `registeredSlots: []`
+               *    （那正好弄丢最有用的诊断信息，实测踩过这个形状）⇒ **只合并 `scope`**；
+               * 3. **崩溃/异常**（带 `error`）—— 同上，**只合并 `error`**。
+               *
+               * 判据用"这份上报带了什么新信息"，而不是"槽位数组空不空"：
+               * 后者会把第 3 类也当成作用域上报（错误发生在首次注册上报之前时尤其明显）。
+               */
+              const scopePatch = isClientScope(parsed.scope) ? { scope: parsed.scope } : {};
+              const patchOnly =
+                Array.isArray(parsed.registeredSlots) &&
+                parsed.registeredSlots.length === 0 &&
+                (scopePatch.scope !== undefined || errorReport !== undefined);
+              if (patchOnly && state.client !== undefined) {
+                state.client = {
+                  ...state.client,
+                  reportedAt: new Date().toISOString(),
+                  ...scopePatch,
+                  ...(errorReport !== undefined ? { error: errorReport } : {}),
+                };
+                sendJson(res, 200, {
+                  ok: true,
+                  merged: scopePatch.scope !== undefined ? 'scope' : 'error',
+                });
+                return;
+              }
               state.client = {
                 panelId: String(parsed.panelId ?? 'unknown'),
                 bundleId: String(parsed.bundleId ?? 'unknown'),
@@ -638,6 +705,7 @@ export function registerRoutes(
                 reportedAt: new Date().toISOString(),
                 ...(typeof parsed.userAgent === 'string' ? { userAgent: parsed.userAgent } : {}),
                 ...(errorReport !== undefined ? { error: errorReport } : {}),
+                ...scopePatch,
               };
               if (errorReport === undefined) {
                 debugBus.info('client', '客户端 bundle 已上报自我描述', {

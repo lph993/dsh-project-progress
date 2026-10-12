@@ -18,6 +18,29 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 
 import { structureDomainSpec, progressDomainSpec } from '../../src/storage/kv-port.ts';
+import { normalizeRootPath } from '../../src/shared/path.ts';
+
+/**
+ * **假 agent 也要守宿主 v4 的来源准入口径**（0.3.2 加）。
+ *
+ * 为什么测试替身要主动做这件事：0.3.1 的 P0（注入消息用已退役的 `kind: "plugin"`，
+ * 被宿主拒绝后**整个回合中断**）之所以一路走到真机，部分原因是测试替身只读
+ * `message.source.plugin`、**从不校验 kind** —— 一个真机会拒绝的形状，在测试里畅通无阻。
+ * 现在把宿主的判据（`dsh-session-format-v3-to-v4/lib/index.js:126`：非空且不是字面量 `plugin`）
+ * 照抄进替身：形状不对就**当场失败**，而不是留到真机上表现为"工具故障、当轮工作丢失"。
+ *
+ * @param kind - 消息的 `source.kind`（可能是 undefined，那就是不合法）。
+ * @param where - 出错的通道名（注入 / 回写），用于报错定位。
+ */
+function assertAdmissibleKind(kind: unknown, where: string): string {
+  assert.equal(
+    typeof kind === 'string' && kind.length > 0 && kind !== 'plugin',
+    true,
+    `${where}：宿主 v4 只接受生产者自有的、非空的 source.kind，且拒绝已退役的 "plugin"` +
+      `（收到 ${JSON.stringify(kind)}）—— 这个形状会让宿主拒绝整条事件并**中断整个回合**`,
+  );
+  return kind as string;
+}
 
 /** 按 DomainSpec 的 zod schema 校验的存储替身。 */
 function createFakeStorageDomain() {
@@ -751,6 +774,220 @@ test('多工作区：每个工作区根绑定自己的项目（切换不串树�
   ctx.disposeAll();
   rmSync(wsA, { recursive: true, force: true });
   rmSync(wsB, { recursive: true, force: true });
+});
+
+/**
+ * **看板作用域：面板显式声明的工作区路径说话**（0.3.2 修"时灵时不灵"）。
+ *
+ * ## 现场
+ *
+ * 用户原话："项目进度看板(菜单)，工作区切换不方便，现有的还时灵时不灵"。
+ * 真机对照（同一时刻、同一个接口）：
+ *
+ * ```
+ * GET /pm/board                   → bound     → E:\WxObj\COP（最后一个动过树的）77 节点
+ * GET /pm/board?sessionId=<本会话> → tool-call → E:\thirty\dsh-project-progress  未命名项目
+ * ```
+ *
+ * 根因在客户端：面板读当前会话用的是 `useSessions(state => state.current)`，
+ * 而该标准源的快照（`SessionListState`，源见 `dsh-client-ui-session/lib/client.js:471`）
+ * **根本没有 `current` 字段** ⇒ 请求里什么都没带 ⇒ 宿主退回"最后绑过的那个工作区"。
+ *
+ * ## 本测试钉住的口径
+ *
+ * 1. `board(sessionId, root)` 里 **root 压过一切**（面板说的就是准的）；
+ * 2. **只认存在的目录** —— 路径不存在就照常退回，不报错、不新建项目
+ *    （面板不该因为一个过期路径就空白，更不该凭一个路径字符串造项目）；
+ * 3. 路径**按比较口径归一**：`E:\A\` 与 `e:/A` 是同一个工作区，不许各建一个项目。
+ */
+test('看板作用域：面板声明的工作区路径优先，且只认存在的目录', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-scope-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-scope-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    board(
+      sessionId?: string,
+      root?: string,
+    ): Promise<{
+      projectId: string;
+      nodes: Array<{ name: string }>;
+      workspaceRoot: { value: string | null; source: string };
+    }>;
+  };
+
+  /**
+   * A 工作区建一棵树。
+   *
+   * `noteWorkspaceRoot` 就是工具层每次执行时做的事（`exec.agent.session.header.cwd`）——
+   * 这里必须显式给，否则写路径按"匿名兜底"落到别处，本测试就变成在测另一件事了。
+   */
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
+  const projectA = (await service.board()).projectId;
+
+  // ① 面板声明 B（而 B 还没建过项目）⇒ 必须换到 B 的项目，而不是继续显示 A
+  const scopedB = await service.board(undefined, wsB);
+  assert.equal(scopedB.workspaceRoot.source, 'panel-scope', '作用域来源要能看出来是面板声明的');
+  assert.equal(
+    normalizeRootPath(scopedB.workspaceRoot.value ?? ''),
+    normalizeRootPath(wsB),
+    '回报的根必须是面板声明的那个工作区（按比较口径比，容忍盘符大小写/斜杠）',
+  );
+  assert.notEqual(scopedB.projectId, projectA, '面板声明了另一个工作区 ⇒ 必须是另一个项目');
+  assert.deepEqual(scopedB.nodes, [], 'B 是新建的空项目');
+
+  // B 里写点东西，再用**归一前的写法**声明同一个工作区 ⇒ 必须是同一个项目（不许各建一个）
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  const nodeInB = await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  assert.equal(nodeInB.status, 'ok', `B 工作区里应当能建节点：${JSON.stringify(nodeInB)}`);
+  const projectB = (await service.board(undefined, wsB)).projectId;
+  /**
+   * 造一个"同一个目录的另一种写法"：反斜杠 + 大写盘符 + 结尾斜杠。
+   *
+   * ⚠️ **只大写盘符**，不整串大写 —— Windows 上目录名对大小写不敏感，但这里要验的是
+   * `normalizeRootPath` 的口径（它只统一**盘符**大小写，路径其余部分大小写敏感），
+   * 把整串大写会造出一个"路径其实变了"的假反例（第一次写这个测试就是这么错的）。
+   */
+  const variant = `${(wsB[0] ?? 'C').toUpperCase()}${wsB.slice(1).replace(/\//g, '\\')}\\`;
+  const sameByVariant = await service.board(undefined, variant);
+  assert.equal(
+    sameByVariant.projectId,
+    projectB,
+    `路径写法不同但指向同一目录时必须认成同一个项目：${variant}`,
+  );
+  assert.deepEqual(
+    sameByVariant.nodes.map((n) => n.name),
+    ['B树'],
+  );
+
+  /**
+   * ② 路径不存在 ⇒ 退回原判据（这里是"已绑定的 B"），**不报错、不新建**。
+   *    这条守的是"面板不该因为一个过期路径而空白"。
+   */
+  const stale = await service.board(undefined, join(wsB, '早就删掉的子目录'));
+  assert.equal(stale.projectId, projectB, '过期路径必须退回当前绑定，而不是新建一个项目');
+  assert.deepEqual(
+    stale.nodes.map((n) => n.name),
+    ['B树'],
+  );
+
+  /**
+   * ③ **面板声明的 scope 必须压过"调用会话自己的 cwd"**（0.3.5 修的"切了工作区还是同一棵树"）。
+   *
+   * 这是最初漏掉的那半：上面的用例里"面板所在会话"和"面板要看的工作区"是同一个，
+   * 所以 `derive(sessionId)` 内部的 `resolveRoot(sessionId)` 拨回去也看不出来。
+   * 真机现场是：用户在 P0 工作区的会话里打开面板、把作用域切到 COP ——
+   * 宿主按 root 绑了 COP，紧接着 `derive(sessionId)` 又按该会话的 cwd 拨回 P0，
+   * 于是**无论切到哪个工作区，读出来永远是同一棵树**（探针实测 `root=e:/WxObj/COP → 节点=4`）。
+   */
+  const crossScope = await service.board('session-A', wsB);
+  assert.equal(
+    crossScope.projectId,
+    projectB,
+    '面板声明 B 时，即使调用会话自己的 cwd 是 A，也必须读 B 的项目',
+  );
+  assert.deepEqual(
+    crossScope.nodes.map((n) => n.name),
+    ['B树'],
+    '读数必须来自 B（不是会话自己那个工作区）',
+  );
+  assert.equal(crossScope.workspaceRoot.source, 'panel-scope');
+
+  // ④ 同一个会话紧接着不带 root 读 ⇒ 回到"该会话自己的工作区"（scope 只作用于读路径，且要能退回）
+  const backToOwn = await service.board('session-X-not-in-scope');
+  assert.equal(
+    backToOwn.projectId,
+    projectA,
+    '不带 root 的读回到会话/绑定语义（作用域不劫持别的东西）',
+  );
+
+  // ⑤ 不给 root ⇒ 行为与修复前一致（旧客户端仍然能用）
+  const legacy = await service.board('session-A');
+  assert.equal(legacy.projectId, projectA, '不带 root 时按会话解析（旧路径不受影响）');
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
+/**
+ * **优先级的写入通道**（0.3.9 补的那条缺口）。
+ *
+ * ## 为什么必须有这条测试
+ *
+ * 在 0.3.9 之前 `priority` **只有两个写入者**：AI 建树初判、面板里逐个手改。
+ * 于是"某一整枝没有优先级"这个真实处境（真机现场：`COP 系统` 整枝 **59 个叶全空**）
+ * 在工具侧**无路可走** —— 而 `pm_next` 的排序里正好有"优先级"这一档，
+ * 数据填不进去，那一档就等于不存在（用户原话："优先级是不是没跑起来"）。
+ *
+ * 本测试钉三件事：
+ * 1. `pm_progress` 能单独写优先级（不带进度/状态也生效）；
+ * 2. `pm_report` 能**批量**写（这才是解决"59 个叶全空"的现实手段）；
+ * 3. 写入来源标成 `user` —— 后续 AI 建树**不会静默覆盖**人的表态。
+ */
+test('优先级写入通道：单条能写、批量能写、来源标成 user（AI 重建不覆盖）', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'pm-e2e-prio-'));
+  const ctx = createFakeContext({ workspace: ws });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string }>;
+    reportBatch(input: Record<string, unknown>): Promise<{ applied: number; failed: number }>;
+    nodeView(
+      nodeId: string,
+      sessionId?: string,
+    ): Promise<{ priority?: number; prioritySource?: string } | undefined>;
+  };
+
+  service.noteWorkspaceRoot(ws, 'session-prio');
+  const a = await service.addNode({ parentId: null, name: '甲', sessionId: 'session-prio' });
+  const b = await service.addNode({ parentId: null, name: '乙', sessionId: 'session-prio' });
+  assert.equal(a.status, 'ok');
+  assert.equal(b.status, 'ok');
+  const idA = a.nodeId as string;
+  const idB = b.nodeId as string;
+
+  // ① 单条：只给 priority（不给 progress/selfState），必须落库
+  const one = await service.progress({ nodeId: idA, priority: 3, sessionId: 'session-prio' });
+  assert.equal(one.status, 'ok', `只写优先级应当成功：${JSON.stringify(one)}`);
+  const viewA = await service.nodeView(idA, 'session-prio');
+  assert.equal(viewA?.priority, 3, '优先级要真的写进去');
+  assert.equal(
+    viewA?.prioritySource,
+    'user',
+    '通过工具写 = 人/会话的表态 ⇒ 来源标 user，AI 重建时不覆盖',
+  );
+
+  // ② 批量：pm_report 一次给多个节点排先后（真机上 59 个叶就是这么补的）
+  const batch = await service.reportBatch({
+    updates: [
+      { nodeId: idA, priority: 1 },
+      { nodeId: idB, priority: 9 },
+    ],
+    sessionId: 'session-prio',
+  });
+  assert.equal(batch.applied, 2, `两项都应写入成功：${JSON.stringify(batch)}`);
+  assert.equal(batch.failed, 0);
+  assert.equal((await service.nodeView(idA, 'session-prio'))?.priority, 1, '批量要覆盖旧值');
+  assert.equal((await service.nodeView(idB, 'session-prio'))?.priority, 9);
+  assert.equal(
+    (await service.nodeView(idB, 'session-prio'))?.prioritySource,
+    'user',
+    '批量写入同样标 user',
+  );
+
+  ctx.disposeAll();
+  rmSync(ws, { recursive: true, force: true });
 });
 
 /**
@@ -2194,16 +2431,22 @@ test('进度回写会话投影：关键事件才推、按会话裁剪、去重�
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-notify-'));
 
   /** 记录 inbox 投递的假 agent（官方通道是 `agent.inbox.append('next-step', message)`）。 */
-  const delivered: Array<{ sessionId: string; target: string; text: string; plugin: string }> = [];
+  const delivered: Array<{ sessionId: string; target: string; text: string; kind: string }> = [];
   const agentFor = (sessionId: string) => ({
     session: { header: { cwd: workspace } },
     inbox: {
-      append(target: string, message: { content?: Array<{ text?: string }>; source?: { plugin?: string } }) {
+      append(target: string, message: { content?: Array<{ text?: string }>; source?: { kind?: string } }) {
         delivered.push({
           sessionId,
           target,
           text: message?.content?.[0]?.text ?? '',
-          plugin: message?.source?.plugin ?? '',
+          /**
+           * 读 `source.kind`（**不是** `source.plugin`）：v4 会话格式没有兜底的 `plugin` kind，
+           * 存进去的消息必须带生产者自有的 kind。假 agent 在这里照抄宿主的准入口径：
+           * 见到已退役的 `'plugin'` 或空 kind 就当场判失败 —— 免得测试放行一个真机会拒绝的形状
+           * （0.3.1 的 P0 正是这个形状，而当时的测试读 `source.plugin`，所以它没拦住）。
+           */
+          kind: assertAdmissibleKind(message?.source?.kind, '回写会话'),
         });
       },
     },
@@ -2254,7 +2497,7 @@ test('进度回写会话投影：关键事件才推、按会话裁剪、去重�
   await service.finish({ nodeId });
   assert.equal(delivered.length, 1, `应推一条：${JSON.stringify(delivered)}`);
   assert.equal(delivered[0]?.target, 'next-step', '用 next-step（下一个步边界可见）');
-  assert.equal(delivered[0]?.plugin, 'dsh-project-progress', '来源必须标明是本插件');
+  assert.equal(delivered[0]?.kind, 'dsh-project-progress', '来源 kind 必须是本插件自有的（v4 没有兜底 plugin kind）');
   assert.match(delivered[0]?.text ?? '', /^\[pm\] \S+ 「登录页」 done 100%$/);
 
   // ③ 去重：同一状态再写一次不重复推
@@ -3048,16 +3291,17 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-boundary-'));
 
   /** `agent.inject` 的投递（边界提醒走这条：官方口径是"不唤醒 driver"）。 */
-  const injected: Array<{ sessionId: string; text: string; plugin: string }> = [];
+  const injected: Array<{ sessionId: string; text: string; kind: string }> = [];
   /** inbox 投递（回写通道）：用来证明"提醒"与"关键事件回写"是两条分开的路。 */
   const inboxed: Array<{ sessionId: string; target: string; text: string }> = [];
   const agentFor = (sessionId: string) => ({
     session: { header: { cwd: workspace } },
-    inject(message: { content?: Array<{ text?: string }>; source?: { plugin?: string } }) {
+    inject(message: { content?: Array<{ text?: string }>; source?: { kind?: string } }) {
       injected.push({
         sessionId,
         text: message?.content?.[0]?.text ?? '',
-        plugin: message?.source?.plugin ?? '',
+        /** 同上：按宿主 v4 的口径校验来源 kind，而不是读已退役的 `plugin` 字段。 */
+        kind: assertAdmissibleKind(message?.source?.kind, '注入上下文'),
       });
     },
     inbox: {
@@ -3228,7 +3472,7 @@ test('会话边界进度修正 + 提示词纪律 + pm_report：零 token 的收�
   assert.equal(branchView?.selfState, 'pending', '父节点不写自身状态（C5），边界也不许碰它');
 
   assert.equal(injected.length, 1, `应投一条边界提醒：${JSON.stringify(injected)}`);
-  assert.equal(injected[0]?.plugin, 'dsh-project-progress', '来源必须标明是本插件');
+  assert.equal(injected[0]?.kind, 'dsh-project-progress', '来源 kind 必须是本插件自有的（v4 没有兜底 plugin kind）');
   assert.match(injected[0]?.text ?? '', /仍在进行/);
   assert.match(injected[0]?.text ?? '', /登录页/);
   assert.equal(inboxed.length, 0, '边界提醒走 inject（不唤醒），不走回写的 next-step 通道');

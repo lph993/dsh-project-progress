@@ -81,6 +81,21 @@ export const nodeStructureSchema = z.object({
   weightDetail: z.record(z.string(), z.unknown()).optional(),
   autoCreated: z.boolean().optional(),
   description: z.string().optional(),
+  /**
+   * **未完成时"还差什么"**（0.3.2 新增，可选，additive）。
+   *
+   * 为什么不能继续借用 `description`：那个字段的语义是"任务简述"，而"还差什么"是
+   * **未完成节点的核心信息**（看板最有价值的部分恰恰是没做完的那些）。真机反馈原文：
+   * "`pm_progress` 的 description 是任务简述，语义上不该承担'还差什么'；而 `pm_finish`
+   * 能写 description + followUp，代价是把 progress 置为 1（对未完成节点是错的）" ——
+   * 于是模型只能把缺口塞进 description，读起来语义错位。
+   *
+   * 与 `hasFollowUp` 的分工：`hasFollowUp` 是"**已完成**但有遗留待处理"的布尔标记
+   * （黄底感叹号），`note` 是"未完成，差在这些"的**文字**。两者可以并存，互不替代。
+   */
+  note: z.string().optional(),
+  /** `note` 最后一次被写入的时间（ISO）：与 `descriptionUpdatedAt` 同理，判断"还新不新鲜"。 */
+  noteUpdatedAt: z.string().optional(),
   refs: z.array(refSchema).optional(),
   /** 稳定身份键（FR-158）：由 refs 路径派生，不由名称派生。老记录缺该字段仍然合法。 */
   identity: z.string().min(1).optional(),

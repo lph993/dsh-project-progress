@@ -332,7 +332,117 @@
  *
  * 对照 0.3.0：那一版只带批次 69/70 两个功能批；0.3.1 带的是 **9 个修复**（其中 4 个是真 bug）。
  */
-export const HOST_BATCH = 80;
+/**
+ * ## 批次 81 的用途
+ *
+ * **修 0.3.1 使用报告里的 9 条反馈**（报告见插件仓库外的《dsh-project-progress 使用报告》，
+ * 本文只记"动了什么、为什么"）。其中最重的是 **P0：整个回合被中断**。
+ *
+ * ### ① P0：运行期注入的消息用了已退役的 `kind: "plugin"`
+ *
+ * 0.3.1 在 **4 个位置**构造运行期消息时写 `source: { kind: 'plugin', plugin: 'dsh-project-progress' }`。
+ * 而 v4 会话格式**没有**共同的兜底 `plugin` kind，准入校验明确拒绝它：
+ *
+ * ```js
+ * // dsh-session-format-v3-to-v4/lib/index.js:126（经 :145-151 逐条检查 agent/inbox/spliced）
+ * if (… || value["kind"] === "plugin")
+ *   throw new SessionFormatError("format v4 message requires a producer-owned source kind");
+ * ```
+ *
+ * 后果**不是"一条提醒没送到"**，而是真机报 `工具使用有故障 本轮运行失败` ——
+ * **整个回合被判失败、当轮工作全部丢失**，且插件诊断里一条记录都没有
+ * （`inject()` 返回 void，拒绝发生在宿主持久化管线里，插件的 `try/catch` 等不到）。
+ * 而且它依赖并发时序（12 个并行 `pm_progress` 只有前 1–2 个成功），**极难自查**。
+ *
+ * 改法：**四处全部收口到一个模块** `src/shared/message.ts` ——
+ * `PM_PRODUCER_KIND = 'dsh-project-progress'`（裸包名，与一线插件 `dsh-session-title-llm` /
+ * `dsh-cordis-host-runner` 的实测口径一致）+ `pmUserMessage()` 唯一构造入口
+ * + 发出去之前先做一次 v4 准入自证（`isAdmissibleSourceKind`）。
+ * 附 `tests/shared/message.test.ts` 钉住"不许再写回 `plugin`"。
+ *
+ * ### ② 投递失败不再静默（可观测性）
+ *
+ * `injectContext` / `deliverNotice` 的失败路径补 `debugBus.warn`，并新增
+ * `boundary.deliveryFailures` 计数（`/pm/settings` 可见）—— 0.3.1 那条 P0 排查最费时的
+ * 原因正是"插件自己看不见失败"。
+ *
+ * ### ③ `pm_report` 支持 `refs` 与 `note`（P1 效率，改动最小收益最大）
+ *
+ * 真机反馈：`pm_report` 是**唯一**的批量工具却不接受 `refs`，而 `pm_progress` 接受 `refs`
+ * 又是单节点的 —— 两者不交叉，于是"建树时忘带 refs"**没有批量退路**，只能逐个补
+ * （真机上为此花了 46 次单节点调用）。现在每一项都可以带 `refs` / `note`，
+ * 与 `pm_progress` **共用 `updateRefs` 与 `progress`**（不存在第二套写入规则）。
+ *
+ * ### ④ 清空 refs：`refs: []` 是显式清空，不再与"没传"混淆
+ *
+ * 0.3.1 里写错的 refs 撤不掉（`[]` → `E_NOTHING_TO_DO`，`null` → 参数类型错）。
+ * 现在工具层用 `'refs' in args` 判定"到底传了没有"，传空数组就真的清空；
+ * `updateRefs` 也只在"归一化后为空且不是显式清空"时才拒绝。
+ *
+ * ### ⑤ `refs` 路径存在性：**接受写入，但如实报出来**
+ *
+ * 此前只校验逃逸（`C7`），不存在的相对路径被静默接受（真机误写过 `.pm`，
+ * 库里还留着 `miniapp/components`、`miniapp/services` 两条指向不存在目录的引用）。
+ * 现在写入后回告 `warnings` 并记 `debugBus.warn`。**刻意不拒绝**：路径可以"先声明后创建"，
+ * 分支切换/改名也会让正确引用暂时消失 —— 拿存在性拦写入会让人无法修树。
+ *
+ * ### ⑥ `note`：未完成节点的"还差什么"有了结构化字段
+ *
+ * 此前只能挤进 `description`（语义错位），或用 `pm_finish` 的 `followUp` 表达
+ * （那条路会把 `progress` 置为 1，对未完成节点是错的）。现在 `pm_progress` / `pm_report`
+ * 都能写 `note`，落库为 `note` + `noteUpdatedAt`（自动打时间戳），属性栏单独一格显示。
+ * **三处白名单同步登记**（`shared/types.ts` / `kv-port` / `schema.ts` + 文件档），
+ * 并进 `DROPPABLE_FIELD_HINTS` —— 漏登记会让它"存了读不出来"。
+ *
+ * 工具数仍是 **32**（没有新增工具，只是给两个已有工具加了参数与语义）。
+ *
+ * ### ⑦ 看板作用域：路径说话（修"时灵时不灵"）
+ *
+ * 用户报"项目进度看板(菜单)，工作区切换不方便，现有的还时灵时不灵"。查出根因在客户端：
+ * 面板读当前会话用的是 `useSessions(state => state.current)`，而该标准源的快照
+ * （`SessionListState`，源见 `dsh-client-ui-session/lib/client.js:471`）**没有 `current`**
+ * ⇒ 选择器恒 `undefined` ⇒ `GET /pm/board` **什么都没带** ⇒ 宿主退回"当前已绑定的工作区根"
+ * （`source: 'bound'` = 最后一个动过树的那个工作区）。真机同一时刻：
+ * `GET /pm/board` → `E:\WxObj\COP`（77 节点），`GET /pm/board?sessionId=<本会话>` →
+ * `E:\thirty\dsh-project-progress`（未命名项目）—— 同一接口两种答案。
+ *
+ * 改法：面板用 DSH 自己的工作区列表（`useWorkspaces`，源见
+ * `dsh-client-ui-workspace/lib/client.js:4142`）算出作用域路径，并在请求里**显式声明**
+ * （`GET /pm/board?root=…`）；宿主优先按它绑定项目，`source` 记为 `panel-scope`
+ * （与"猜出来"的来源分开，便于排查）。判据链落在一个**纯函数**里：
+ * 显式选择 > 当前显示的会话所属 > 最近变更 > 列表首个（`client/workspace-select.ts`，17 条测试）。
+ * 另外给面板加了工作区切换条（下拉 = 只切看板作用域；「在侧边栏打开」= 真的导航过去）。
+ *
+ * 顺带修掉一处**真实的安全边界**：`normalizeRootPath` 原先住在
+ * `adapter/workspace-root.ts`（那个文件 `import { existsSync } from 'node:fs'`），
+ * 浏览器侧想比一条路径就会把 `node:fs` 拖进客户端产物 —— 已搬到纯函数模块 `shared/path.ts`
+ * 并在宿主侧再导出（对外 API 不变）。面板给的路径**只认存在的目录**（归一化 + `existsSync`），
+ * 不通过就退回原判据：不报错、也不凭一个字符串新建项目。
+ */
+/**
+ * ## 批次 82 的用途
+ *
+ * **0.3.4–0.3.8 这一串真机修复**（都不引入新工具，工具数仍是 **32**）：
+ *
+ * - **0.3.4**：`openWorkspace is not defined` —— 可选能力的声明被放进了 `registerRightTab()`，
+ *   而 `apply()` 里的主面板槽位注册引用它 ⇒ `ctx.slots.inject('main', …)` 整条失败、**看板全黑**。
+ * - **0.3.5**：`React #311` —— 把**键控** Hook `useSessionRetainInfo` 放进 `useMemo` 按会话数
+ *   可变次数调用（Hook 次数必须每次渲染一致）⇒ `main` 槽位崩溃、仍全黑。改成只用非键控的
+ *   `useSessions` 快照（`cwd` + `updatedAt`，排除 subagent）。
+ * - **0.3.6**：**切了工作区还是同一棵树** —— `board()` 按面板 `root` 绑好项目后，
+ *   内部 `derive(sessionId) → resolveRoot(sessionId)` 又按"该会话工具调用 cwd"拨回去。
+ *   新增 `panelScopeRoot`：**读路径上面板显式声明优先于会话 cwd**（写路径不变），
+ *   不带 `root` 则清掉作用域，2 分钟 TTL。
+ * - **0.3.7**：面板里选的工作区**不记忆** —— 手动选择只存在组件 `useState`，面板一卸载就丢。
+ *   改为按会话存 `localStorage`（`dsh.pm.scope.<sessionId>`）：同会话跨挂载记住、跨会话自动失效。
+ * - **0.3.8**：去掉「在侧边栏打开」—— 它绑的是 `uiWorkspace.openWorkspace`（连接工作区并打开
+ *   **复用或新建的空白会话**），点下去常常只是新建空会话，名不副实（用户要求去掉）。
+ *
+ * 教训（写在批次里，因为代价是用户的面板连续两版打不开）：**客户端渲染路径的错误
+ * （`apply()` 里的引用、Hook 规则）单元测试、类型检查、产物自检都执行不到** ——
+ * 唯一判据是**真浏览器里把面板打开**（`--port` 测试宿主 + Playwright 看 `[data-slot-error]` 与控制台）。
+ */
+export const HOST_BATCH = 82;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

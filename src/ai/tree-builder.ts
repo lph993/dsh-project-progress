@@ -3,15 +3,17 @@
  *
  * 形态照抄 DSH 自己的 `dsh-session-title-llm`（那是"插件里怎么正确调一次模型"的
  * 官方样板）：`ctx.llm.stream(options)` + `BlockAssembler`，用 `deadline` 限时，
- * 只发文本消息（`createUserMessage` + `source.plugin` 标注来源）。
+ * 只发文本消息（来源 kind 由 `shared/message.ts` 统一提供 —— 0.3.1 曾在这里写已退役的
+ * `kind: "plugin"`，被宿主 v4 准入拒绝后**中断整个回合**）。
  *
  * 这里**不做确认与预算**：那两件事由上层（service / 面板确认框）负责，
  * 免得"能不能花钱"的判断散落在调用点（§9.5 T1–T3 的收口纪律）。
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler } from '@deepseek-ai/dsh-llm';
 
+import { pmUserMessage } from '../shared/message.ts';
 import { isTruncatedCompletion, parseTreeResponse, type ParseOutcome } from './parse.ts';
 import type { AiRoute } from './route.ts';
 import type { TokenUsageLike } from './usage.ts';
@@ -99,10 +101,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
     };
   }
 
-  const message = createUserMessage({
-    content: [{ type: 'text', text: input.user }],
-    source: { kind: 'plugin', plugin: 'dsh-project-progress' },
-  });
+  const message = pmUserMessage(input.user);
 
   let text = '';
   /** 终止原因（`stop` / `length` …）：`length` 意味着输出被 token 上限截断。 */

@@ -115,6 +115,17 @@ export interface NodeRecord {
    */
   descriptionUpdatedAt?: string;
   /**
+   * **未完成时"还差什么"**（0.3.2 新增，可选）。
+   *
+   * 与 `description`（任务简述）分开的理由：看板上**最有价值的部分是没做完的那些**，
+   * 而"还差什么"既不该塞进"任务简述"（语义错位），也不该靠 `pm_finish` 的 `followUp`
+   * 表达（那条路会把 `progress` 置为 1，对未完成节点是错的）。真机反馈正是这两条路都堵着，
+   * 模型只能把缺口写进 description。**可选、additive**：老数据没有它就是没有，不需要迁移。
+   */
+  note?: string;
+  /** **`note` 最后一次被写入的时间**（ISO）。理由与 `descriptionUpdatedAt` 完全相同。 */
+  noteUpdatedAt?: string;
+  /**
    * **完成简报里还留着"需要补充和处理"的事**（用户口径："完成后是简报…任务完成情况
    * (需要补充和处理的) 节点黄色警告背景加感叹号图标示警"）。
    *

@@ -9,6 +9,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 // 纯类型导入：加载 DSH 的服务接口增补（`ctx.fs` / `ctx.storageDomain` / `ctx.settings`）。
 // 这些增补写在各自包的 `.d.ts` 里，只有该模块进入编译图时才会生效。
 import type {} from '@deepseek-ai/dsh-fs';
@@ -60,6 +62,7 @@ import {
   type IdentityNode,
 } from './domain/identity.ts';
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
+import { describeMissingRefTargets, missingRefTargets } from './domain/refs-exists.ts';
 import { nextTaskOf, type TaskCandidate } from './domain/next-task.ts';
 import {
   DEFAULT_SCAN_OPTIONS,
@@ -200,8 +203,8 @@ import {
   type CandidateNode,
   type ReportCandidate,
 } from './session/report-candidate.ts';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { clampTimeout } from '@deepseek-ai/dsh-timeout';
+import { pmUserMessage } from './shared/message.ts';
 
 /**
  * 订阅的风险等级与等待数（FR-110）。
@@ -382,6 +385,14 @@ export interface NodeView {
   gate: NodeRecord['gate'];
   flags: NodeFlag[];
   description?: string;
+  /**
+   * **未完成时"还差什么"**（0.3.2 新增）：与 `description`（任务简述）分开。
+   *
+   * 客户端 `client/contract.ts` 里有同名字段（跨 HTTP 传输，两处必须同步）。
+   */
+  note?: string;
+  /** `note` 最后一次被写入的时间（ISO）。 */
+  noteUpdatedAt?: string;
   refs?: Ref[];
   autoCreated: boolean;
   childCount: number;
@@ -507,7 +518,21 @@ export interface BoardSnapshot {
 
 /** 一次写入的对外结果（工具返回与 UI 都用它，保证行为一致 FR-71）。 */
 export type ApplyResult =
-  | { status: 'ok'; nodeId: string; revision: number; autoFixes: string[]; attempts: number }
+  | {
+      status: 'ok';
+      nodeId: string;
+      revision: number;
+      autoFixes: string[];
+      attempts: number;
+      /**
+       * **接受了写入、但有话要说**（0.3.2 新增，可选）。
+       *
+       * 与 `denied` 的区别是决定性的：`warnings` 表示**写进去了**，只是有些事实需要如实告知
+       * （当前唯一来源：`refs` 里有指向不存在路径的条目）。用它来消灭"静默接受" ——
+       * 真机教训是写错的 `refs` 被照单全收、事后无从察觉（使用报告 §5.6 第 9 条）。
+       */
+      warnings?: string[];
+    }
   | {
       status: 'denied';
       reason: string;
@@ -745,6 +770,21 @@ export class ProjectService {
   private readonly agentGoneNoted = new Set<string>();
   /** 投递通道形状不对只警告一次（见 warnDeliveryShape）。 */
   private deliveryShapeWarned = false;
+  /**
+   * **注入失败的累计次数**（0.3.2 新增）。
+   *
+   * 为什么要有这个数：`agent.inject()` 声明为 `void`，真正拒绝这条消息的是**宿主的持久化
+   * 管线**（v4 准入校验），异常可能落在 `inject()` 之外 —— 那时插件侧既没有返回值也没有
+   * 异常，`/pm/debug/logs` 一条都不会有。真机教训（0.3.1 的 P0）：插件的诊断里 20 条全是
+   * 加载期记录，注入失败**完全不可见**，排查只能去逐帧解压会话文件。
+   *
+   * 现在两步都做：① 本地 `try/catch` 记 warn（能看到的那部分）；② 同步计数，投递失败
+   * 就会在 `/pm/settings` 的边界统计里留下痕迹 —— **失败不再只留在宿主的错误里**。
+   *
+   * 计数**覆盖两条投递通道**（`injectContext` 与 `deliverNotice`）：二者的失败对插件而言
+   * 是同一件事（"这轮该提醒的没送到"），分开记只会让人对不上账。
+   */
+  private deliveryFailures = 0;
   /**
    * 插件自身的 AI 用量账本（`.pm/ai-usage.json`，懒加载）。
    *
@@ -1138,6 +1178,46 @@ export class ProjectService {
 
   private resolveRoot(sessionId?: string): WorkspaceRootResolution {
     /**
+     * **① 面板显式声明的作用域优先于一切**（0.3.5 修"切了工作区还是同一棵树"）。
+     *
+     * ## 真机症状与证据
+     *
+     * 面板已经把 `?root=e:/WxObj/COP` 发过来了，宿主也照它绑了项目 —— 可面板显示的还是
+     * 本会话那个工作区（P0）的树。探针实测（同一秒内）：
+     *
+     * ```
+     * root=e:/WxObj/COP  →  项目=未命名项目  节点=4     ← COP 应该是 83 个节点
+     * ```
+     *
+     * ## 为什么会被拨回去
+     *
+     * `board()` 的顺序是"先按面板的 root 绑项目 → 再 `derive(sessionId)`"，而 `derive` 内部
+     * 又调了一次 `resolveRoot(sessionId)`，那里**第一条判据就是"该会话工具调用报告的 cwd"**
+     * （`sessionRoots.get(sessionId)`）—— 而面板所在会话的 cwd 正是 P0 工作区 ⇒ **刚绑好的
+     * 项目被会话根覆盖回去**。于是无论面板声明哪个工作区，读出来永远是"这个会话自己那个"。
+     *
+     * ## 口径（谁是"当前意图"）
+     *
+     * - **面板显式声明**（`panelScopeRoot`，由 `board(sessionId, root)` 写入）＝"用户此刻在看哪个工作区"，
+     *   读路径上它最准；
+     * - 会话工具调用的 cwd（`sessionRoots`）＝"这个会话在哪个工作区干活"，**写路径**必须用它 ——
+     *   所以本函数只在**读**路径上让面板优先，写路径（`operationRoot`）不受影响；
+     * - 面板声明只对**同一个会话**生效，且**两分钟**后失效（见 `PANEL_SCOPE_TTL_MS`），
+     *   免得一个过期的作用域长期劫持这个会话的读。
+     */
+    const scope = this.panelScopeRoot;
+    if (
+      scope !== undefined &&
+      (sessionId === undefined || sessionId === '' || scope.sessionId === sessionId) &&
+      Date.now() - scope.at <= PANEL_SCOPE_TTL_MS
+    ) {
+      return {
+        root: scope.root,
+        source: 'panel-scope',
+        detail: '由面板显式声明的工作区路径（看板作用域）',
+      };
+    }
+    /**
      * **匿名读（无会话上下文，如浏览器面板轮询）不认任何"全局最近值"** —— 一律交给
      * `operationRoot(sessionId)` 的已绑定/匿名兜底语义。
      *
@@ -1146,7 +1226,7 @@ export class ProjectService {
      * **别的会话**的工作区，再绑过去 —— 本工作区的流程图读到 0 节点、一个 loading 都不显示。
      */
     if (sessionId === undefined || sessionId === '') return this.operationRoot(sessionId);
-    // ① 该会话自己的工具调用报告过 cwd → 这就是它的工作区（最精确，且不会串会话）
+    // ② 该会话自己的工具调用报告过 cwd → 这就是它的工作区（最精确，且不会串会话）
     const own = this.sessionRoots.get(sessionId);
     if (own !== undefined && own !== '') {
       return {
@@ -1155,7 +1235,7 @@ export class ProjectService {
         detail: `由会话 ${sessionId} 的工具调用报告的 cwd`,
       };
     }
-    // ② 全局最近一次工具调用报告：只对"无会话上下文"的调用，或同一个会话生效。
+    // ③ 全局最近一次工具调用报告：只对"无会话上下文"的调用，或同一个会话生效。
     //    否则 A 会话的工具调用会把 B 会话的面板带到 A 的工作区去。
     const sameSession =
       this.workspaceRootOverrideSession === undefined ||
@@ -1172,6 +1252,13 @@ export class ProjectService {
     });
   }
 
+  /**
+   * 面板最后一次显式声明的工作区（`GET /pm/board?root=…`）。
+   *
+   * 只服务**读**路径的"当前意图"判定（见 `resolveRoot` 的第 ① 条判据），
+   * 不参与写路径的项目选择 —— 写路径必须跟着"调用会话的 cwd"。
+   */
+  private panelScopeRoot: { root: string; sessionId?: string; at: number } | undefined;
   /**
    * 由工具层在每次执行时写入当前会话的工作区根。
    *
@@ -1913,6 +2000,19 @@ export class ProjectService {
   async updateRefs(input: {
     nodeId: string;
     paths: readonly string[];
+    /**
+     * **显式清空**（0.3.2 新增）。
+     *
+     * 为什么需要这个开关：`refs: []` 与"没传 refs"在工具参数层**长得一样**
+     * （都是空数组 / 缺省），而二者的语义相反 —— 前者是"把这个节点的归属清掉"，
+     * 后者是"这次不动 refs"。真机反馈（使用报告 §5.6 第 3 条）：
+     * 写错路径后想撤销，`refs: []` 报 `E_NOTHING_TO_DO`、`refs: null` 报参数类型错，
+     * **两条退路都被堵死**，只能"再写一个正确的"覆盖，无法真正清空。
+     *
+     * 所以由调用方（工具层）用 `'refs' in args` 判定"用户到底传了没有"，
+     * 传了就把它翻成这个显式开关，与"没传"彻底分开。
+     */
+    explicitClear?: boolean;
     by?: 'user' | 'session' | 'subagent' | 'job';
     actorId?: string;
     sessionId?: string;
@@ -1931,12 +2031,15 @@ export class ProjectService {
 
     // 归一化 + 去重 + 判类型（转换规则只有一份：`refsFromPaths`，与身份键口径一致）
     const refs = refsFromPaths(input.paths);
-    if (refs.length === 0) {
+    if (refs.length === 0 && input.explicitClear !== true) {
       return {
         status: 'denied',
         reason: 'validation',
         code: 'E_EMPTY_REFS',
-        message: 'refs 归一化后为空（路径都非法或重复），没有可写的内容',
+        message:
+          'refs 归一化后为空（路径都非法或重复），没有可写的内容。' +
+          '若本意是**清空**该节点的 refs，请显式传空数组（`refs: []`）——' +
+          '那条路径会真的清掉归属，而不是被当成"没传参数"',
       };
     }
 
@@ -1958,21 +2061,72 @@ export class ProjectService {
       };
     }
 
-    return this.patchNode({
+    /**
+     * **写之前如实报出"指向不存在路径"的条目**（0.3.2 新增）。
+     *
+     * 判据是**工作区相对路径**：绝对路径逃逸由 `C7` 先拦（`escapingTargets`），
+     * 这里只回答"这条引用现在指得到东西吗"。根拿不到就整段跳过 ——
+     * 宁可不说，也不要在没有依据时编一条"路径不存在"出来。
+     */
+    const missing =
+      this.boundRoot === undefined || this.boundRoot === ''
+        ? []
+        : missingRefTargets(refs, (target) => existsSync(join(this.boundRoot as string, target)));
+    const warnings =
+      missing.length === 0
+        ? []
+        : [
+            `refs 里有 ${missing.length} 条指向**工作区里不存在的路径**：` +
+              `${describeMissingRefTargets(missing)} —— 已按原样写入（路径可能"先声明后创建"，` +
+              '不拦写入），但身份键是按这些路径算的，写错会让下次建树认错节点；' +
+              '确认是笔误就用 `refs: []` 清空后重写正确的',
+          ];
+    if (missing.length > 0) {
+      debugBus.warn(
+        'tree',
+        `节点 ${input.nodeId}（${node.name}）的 refs 有 ${missing.length} 条路径在工作区里不存在：` +
+          describeMissingRefTargets(missing),
+        { sessionId: input.sessionId ?? null },
+      );
+    }
+
+    const written = await this.patchNode({
       nodeId: input.nodeId,
       patch: { refs, identity: nextIdentity },
       by: input.by ?? 'session',
       ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
-      reason: '补/改 refs（盲区提醒的闭环动作）',
+      reason:
+        refs.length === 0
+          ? '清空 refs（写错的引用要能撤掉）'
+          : '补/改 refs（盲区提醒的闭环动作）',
       ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
     });
+    // 把告警挂在成功结果上：**写成功了**是有话要说，不是失败
+    return written.status === 'ok' && warnings.length > 0 ? { ...written, warnings } : written;
   }
 
-  /** 推进进度/状态（`pm_progress`）。 */
+  /** 推进进度/状态（`pm_progress`）；也可以只写"还差什么"（`note`，0.3.2 新增）。 */
   async progress(input: {
     nodeId: string;
     progress?: number;
     selfState?: SelfState;
+    /**
+     * **未完成时"还差什么"**（0.3.2 新增）。与进度/状态同一次写入：
+     * 二者本来就是同一件事的两面（"做到哪了" + "还缺什么"），分两次调用迟早有人只做一半。
+     */
+    note?: string;
+    /**
+     * **优先级 1..10（1 最高）**（0.3.9 新增的写入通道）。
+     *
+     * 为什么必须补这条路：在 0.3.9 之前，`priority` **只有两个写入者** —— AI 建树初判、
+     * 以及面板里逐个手改。于是 AI 没给优先级的那些节点（真机现场：`COP 系统` 整枝 **59 个叶一个都没有**）
+     * 就只能靠人点 59 次右键。而 `pm_next` 的排序里有"优先级"这一档 ——
+     * 数据填不进去，那一档就等于不存在（用户原话："优先级是不是没跑起来"）。
+     *
+     * **写它就等于表态**：`prioritySource` 一并写成 `'user'`，于是后续 AI 建树**不会**覆盖
+     * （`applyAiTree` 遇到 `prioritySource === 'user'` 只登记"想覆盖"并来问人，不静默改）。
+     */
+    priority?: number;
     rev?: number;
     force?: boolean;
     reason?: string;
@@ -1984,6 +2138,12 @@ export class ProjectService {
     const patch: PatchFields = {};
     if (input.progress !== undefined) patch.progress = input.progress;
     if (input.selfState !== undefined) patch.selfState = input.selfState;
+    if (input.note !== undefined) patch.note = input.note;
+    if (input.priority !== undefined) {
+      patch.priority = input.priority;
+      // 通过工具写 = 人/会话的表态 ⇒ 标 user，AI 重建时不覆盖（见 priority 的注释）
+      patch.prioritySource = 'user';
+    }
     return this.patchNode({
       nodeId: input.nodeId,
       patch,
@@ -2037,6 +2197,30 @@ export class ProjectService {
       finish?: boolean;
       rev?: number;
       evidence?: string;
+      /**
+       * **批量补/改/清空 refs**（0.3.2 新增，与 `pm_progress` 同语义）。
+       *
+       * ## 为什么这条最该补
+       *
+       * 真机反馈（使用报告 §5.6 第 7 条，标为 **P1 效率**）：`pm_report` 是**唯一**的批量工具，
+       * 而它不接受 `refs`；`pm_progress` 接受 `refs` 又是**单节点**的。于是"建树时忘了带 refs"
+       * 这条退路**不存在** —— 只能 46 次单节点调用去补（真机上就是这么花掉的 46 次）。
+       * 两个能力不交叉，缺的正是"**批量补归属**"这条路。
+       *
+       * 语义与 `pm_progress` 完全一致（共用 `updateRefs`，不另写一套规则）：
+       * 传数组 = 替换；传**空数组** = 显式清空；不传 = 不动 refs。
+       */
+      refs?: readonly string[];
+      /** **未完成时"还差什么"**（与 `pm_progress.note` 同语义）。 */
+      note?: string;
+      /**
+       * **批量补"优先级"**（0.3.9 新增，与 `pm_progress.priority` 同语义）。
+       *
+       * 这条是"批量补 refs"的**同类缺口**：`priority` 以前只有 AI 建树与面板逐个手改两个写入者，
+       * 于是"某整枝没优先级"只能靠人一个个点（真机现场 `COP 系统` 59 个叶全空）。
+       * 有了它，一句话就能给一批节点排好先后。
+       */
+      priority?: number;
     }>;
     reason?: string;
     by?: 'session' | 'subagent' | 'job' | 'user';
@@ -2053,6 +2237,11 @@ export class ProjectService {
       revision?: number;
       code?: string;
       message?: string;
+      /**
+       * 该项**写成功但有问题**时的告警（0.3.2 新增，目前来源是 refs 指向不存在的路径）。
+       * 与 `message` 分开：`message` 是失败原因，`warnings` 是"落库了、但你要知道"。
+       */
+      warnings?: string[];
     }>;
   }> {
     const limit = 50;
@@ -2064,12 +2253,62 @@ export class ProjectService {
       revision?: number;
       code?: string;
       message?: string;
+      warnings?: string[];
     }> = [];
     let applied = 0;
     let failed = 0;
     for (const update of updates) {
       let result: ApplyResult;
+      /** refs 那一步的告警要先攒住：后面 `progress`/`finish` 会覆盖 `result`。 */
+      let warnings: string[] | undefined;
       try {
+        /**
+         * **`'refs' in update`**（而不是"是不是非空数组"）是刻意的：
+         * 传空数组是"显式清空"，与"这一项不动 refs"必须区分开 ——
+         * 与 `pm_progress` 用同一个判据，免得两条路对"空数组"给出两种解释。
+         */
+        if ('refs' in update) {
+          const refsResult = await this.updateRefs({
+            nodeId: update.nodeId,
+            paths: Array.isArray(update.refs) ? update.refs : [],
+            explicitClear: true,
+            ...(input.by !== undefined ? { by: input.by } : {}),
+            ...(input.actorId !== undefined ? { actorId: input.actorId } : {}),
+            ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+          });
+          if (refsResult.status !== 'ok') {
+            result = refsResult;
+            failed += 1;
+            results.push({
+              nodeId: update.nodeId,
+              status: refsResult.status,
+              ...('code' in refsResult ? { code: refsResult.code } : {}),
+              ...('message' in refsResult ? { message: refsResult.message } : {}),
+            });
+            continue;
+          }
+          warnings = refsResult.warnings;
+        }
+        /**
+         * refs 写成功、但这一项**只**想改 refs（没有进度/状态/note）⇒ 到此为止，
+         * 不要顺手写一次空的 progress —— 那会把"只补归属"变成一次无意义的进度写入。
+         */
+        const touchesProgress =
+          update.finish === true ||
+          update.progress !== undefined ||
+          update.selfState !== undefined ||
+          update.note !== undefined ||
+          update.priority !== undefined;
+        if (!touchesProgress) {
+          result = { status: 'ok', nodeId: update.nodeId, revision: 0, autoFixes: [], attempts: 1 };
+          applied += 1;
+          results.push({
+            nodeId: update.nodeId,
+            status: 'ok',
+            ...(warnings !== undefined ? { warnings } : {}),
+          });
+          continue;
+        }
         result =
           update.finish === true
             ? await this.finish({
@@ -2088,6 +2327,8 @@ export class ProjectService {
                 nodeId: update.nodeId,
                 ...(update.progress !== undefined ? { progress: update.progress } : {}),
                 ...(update.selfState !== undefined ? { selfState: update.selfState } : {}),
+                ...(update.note !== undefined ? { note: update.note } : {}),
+                ...(update.priority !== undefined ? { priority: update.priority } : {}),
                 ...(update.rev !== undefined ? { rev: update.rev } : {}),
                 ...(input.reason !== undefined ? { reason: input.reason } : {}),
                 ...(input.by !== undefined ? { by: input.by } : {}),
@@ -2105,7 +2346,13 @@ export class ProjectService {
       }
       if (result.status === 'ok') {
         applied += 1;
-        results.push({ nodeId: update.nodeId, status: 'ok', revision: result.revision });
+        const merged = warnings ?? result.warnings;
+        results.push({
+          nodeId: update.nodeId,
+          status: 'ok',
+          revision: result.revision,
+          ...(merged !== undefined && merged.length > 0 ? { warnings: merged } : {}),
+        });
       } else {
         failed += 1;
         results.push({
@@ -3145,6 +3392,15 @@ export class ProjectService {
      * 还没回写 —— 下一个回合边界就会催；长期恒为 0 则说明采集没生效（而不是"大家都汇报得很好"）。
      */
     nudgeArmed: number;
+    /**
+     * **投递失败的累计次数**（0.3.2 新增）：`injectContext` / `deliverNotice` 抛错的次数。
+     *
+     * 为什么必须暴露：0.3.1 的 P0 是"投一条消息 ⇒ 宿主拒绝 ⇒ 整个回合中断"，而插件诊断里
+     * **一条记录都没有**（`inject()` 返回 void，拒绝发生在宿主持久化管线里）。这个计数是
+     * 插件**能**掌握的那部分证据 —— 它一旦 > 0，就说明"该送到的提醒没送到"，不必再去
+     * 解压会话文件才知道。恒为 0 才是正常。
+     */
+    deliveryFailures: number;
     lastKind: string;
     lastActorId: string;
     lastAt: string;
@@ -3156,6 +3412,7 @@ export class ProjectService {
     return {
       ...this.boundaryStats,
       nudgeArmed: this.sessionTouched.size,
+      deliveryFailures: this.deliveryFailures,
       enabled: this.deps.config.sessionBoundaryWriteback !== false,
       prompt: this.deps.config.sessionBoundaryPrompt !== false,
       promptState: this.promptRegistration,
@@ -3863,17 +4120,17 @@ export class ProjectService {
       return false;
     }
     try {
-      agent.inject(
-        createUserMessage({
-          content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: 'dsh-project-progress' },
-        }) as never,
-      );
+      agent.inject(pmUserMessage(text) as never);
       return true;
     } catch (error) {
+      this.deliveryFailures += 1;
       debugBus.warn(
         'session',
-        `注入上下文到会话 ${sessionId} 失败：${error instanceof Error ? error.message : String(error)}`,
+        `注入上下文到会话 ${sessionId} 失败（第 ${this.deliveryFailures} 次）：` +
+          `${error instanceof Error ? error.message : String(error)}；` +
+          '本条提醒没有送达，也不会计入边界统计 —— 若报错里出现 "producer-owned source kind"，' +
+          '说明消息来源 kind 被宿主 v4 准入拒绝（见 src/shared/message.ts）',
+        { sessionId },
       );
       return false;
     }
@@ -3903,11 +4160,10 @@ export class ProjectService {
       else this.noteAgentGone(sessionId, '回写会话');
       return false;
     }
-    const message = createUserMessage({
-      content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'dsh-project-progress' },
-    });
     try {
+      // 消息**在 try 内**构造：`pmUserMessage` 会在来源 kind 非法时同步抛出（见 shared/message.ts），
+      // 那也属于"这条没送到"，必须记进同一个失败计数，而不是漏出去。
+      const message = pmUserMessage(text);
       if (typeof agent.send === 'function') {
         // 官方入口：target 用文档里的 'next-step'，wakeup=false（不唤醒 agent ⇒ 不产生 token）
         agent.send(message, 'next-step', false);
@@ -3923,7 +4179,13 @@ export class ProjectService {
       this.warnDeliveryShape(sessionId, agent);
       return false;
     } catch (error) {
-      debugBus.warn('notify', `回写会话 ${sessionId} 失败：${error instanceof Error ? error.message : String(error)}`);
+      this.deliveryFailures += 1;
+      debugBus.warn(
+        'notify',
+        `回写会话 ${sessionId} 失败（第 ${this.deliveryFailures} 次）：` +
+          `${error instanceof Error ? error.message : String(error)}`,
+        { sessionId },
+      );
       return false;
     }
   }
@@ -4666,13 +4928,65 @@ export class ProjectService {
    *
    * @param sessionId 面板当前会话 id。带上它才能**精确**报告/解析工作区根
    *                  （见 `adapter/workspace-root.ts` 的解析顺序）。
+   * @param root **面板要看哪个工作区**（0.3.2 新增，可选）。
+   *
+   * ## 为什么必须有 `root`
+   *
+   * 面板以前只带 `sessionId`，而客户端读它的方式是
+   * `useSessions(state => state.current)` —— 该标准源的快照是 `SessionListState`，
+   * **没有 `current` 字段** ⇒ 请求里什么都没带 ⇒ 这里解析出 `source: 'bound'`
+   * （"沿用当前项目已绑定的工作区根"，也就是**最后一个动过树的那个工作区**）。
+   * 实测对照：同一个时刻 `GET /pm/board` 给出 `E:\WxObj\COP`（77 节点），
+   * 而 `GET /pm/board?sessionId=<本会话>` 给出 `E:\thirty\dsh-project-progress` —— 这就是"时灵时不灵"。
+   *
+   * 现在面板用 DSH 自己的工作区列表算出路径并**显式声明**，宿主按它绑定项目。
+   *
+   * ## 安全性：只认**存在**的目录
+   *
+   * 路径来自浏览器（同源 HTTP，与既有 `sessionId` 同等信任级别），但仍然不拿它乱建项目：
+   * - 用 `normalizeRootPath` 归一（与项目侧 `isSameRoot` 同一口径，避免同一工作区两种写法各建一个项目）；
+   * - `existsSync` 不通过就**照常返回当前绑定**（不报错、不新建）—— 面板不应因为一个过期路径而空白。
    */
-  async board(sessionId?: string): Promise<BoardSnapshot> {
-    // 面板是"用户正在看的那个会话" → 先按会话把根定下来并绑定项目，
-    // 再派生（否则会读到"上一个操作根"的项目）。
-    const resolution = this.resolveRoot(sessionId);
+  async board(sessionId?: string, root?: string): Promise<BoardSnapshot> {
+    /**
+     * 面板显式声明的工作区**优先**：它比任何"猜"都准（用户就在看这块）。
+     * 拿不到/不合法就退回原路径（按会话解析 → 已绑定），行为与修复前一致。
+     */
+    const demanded = typeof root === 'string' && root.trim() !== '' ? normalizeRootPath(root) : undefined;
+    const scoped = demanded !== undefined && existsSync(demanded);
+    if (scoped) {
+      /**
+       * **记下"面板当前在看这里"**，让**整条读链路**（含内部的 `derive(sessionId)`）都用它。
+       *
+       * 不这么做就会出现 0.3.5 之前那个真机缺陷：这里按 root 绑好了项目，
+       * 紧接着 `derive(sessionId)` 里的 `resolveRoot(sessionId)` 又按"该会话工具调用的 cwd"
+       * 把项目拨回会话自己那个工作区 —— 于是切了工作区还是同一棵树（探针实测：
+       * `root=e:/WxObj/COP → 节点=4`，而 COP 实际 83 个节点）。
+       */
+      this.panelScopeRoot = {
+        root: demanded,
+        ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
+        at: Date.now(),
+      };
+    } else {
+      /**
+       * **不带 `root`（或路径不存在）⇒ 清掉作用域，回到原有语义**。
+       *
+       * 这条是 e2e 逼出来的真问题：面板的作用域如果一直留着，那么**旧客户端**
+       * （或不带 scope 的任何读）就会被上一次的作用域劫持 —— 它想按"会话自己的 cwd"读，
+       * 却拿到面板最后看过的那个工作区。取消声明就等于取消作用域，这是唯一不会串的语义。
+       */
+      this.panelScopeRoot = undefined;
+    }
+    const resolution = scoped
+      ? {
+          root: demanded,
+          source: 'panel-scope' as const,
+          detail: '由面板显式声明的工作区路径（看板作用域）',
+        }
+      : this.resolveRoot(sessionId);
     if (resolution.root !== undefined) {
-      // 面板正在看这个会话 → 它的工作区就是"当前意图"，与工具调用报告同级（后写者赢）
+      // 面板正在看这个会话/这个工作区 → 它就是"当前意图"，与工具调用报告同级（后写者赢）
       this.notePendingRoot(resolution, sessionId);
       await this.bindProjectToRoot(resolution.root, sessionId);
     }
@@ -4818,6 +5132,12 @@ export class ProjectService {
       branchPath: branchPath(derived.index, nodeId),
     };
     if (d.node.description !== undefined) view.description = d.node.description;
+    /**
+     * **未完成时"还差什么"**（0.3.2）：与 `description`（任务简述）分开暴露。
+     * 不暴露出去的话，这个字段就只是"存进去了但谁也看不见"—— 等于没做。
+     */
+    if (d.node.note !== undefined) view.note = d.node.note;
+    if (d.node.noteUpdatedAt !== undefined) view.noteUpdatedAt = d.node.noteUpdatedAt;
     if (d.node.refs !== undefined) view.refs = d.node.refs;
     // FR-158 ③：疑似遗留（本轮建树没再提到）。**照常计入统计**，只是可被看板标出来让用户决定去留。
     if (d.node.stale === true) view.stale = true;
@@ -7829,6 +8149,16 @@ function collectBranch(index: ReturnType<typeof buildIndex>, rootId: string): st
 function isSameRoot(a: string, b: string): boolean {
   return normalizeRootPath(a) === normalizeRootPath(b);
 }
+
+/**
+ * 面板显式声明的作用域**保质期**（毫秒）。
+ *
+ * 为什么要有上限：`panelScopeRoot` 是"用户此刻在看哪个工作区"的记账，而用户可能
+ * 关掉面板、去别的会话干活 —— 那时这条记账就该失效，让读路径回到"按会话 cwd"。
+ * 面板正常轮询是 1s 一次，两分钟足够宽松（连续 120 次没刷新才判失效），
+ * 又不会让一个废弃的作用域长期劫持这个会话的读。
+ */
+const PANEL_SCOPE_TTL_MS = 120_000;
 
 /**
  * 尽力从环境推断工作区根。

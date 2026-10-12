@@ -57,14 +57,59 @@ export interface FetchOutcome<T> {
   }
 }
 
+/**
+ * 看板请求的查询串：**工作区路径是主角，会话 id 只是补充**。
+ *
+ * 为什么必须显式给路径（0.3.2 修复的"时灵时不灵"）：
+ *
+ * - 以前只给 `sessionId`，而面板拿不到当前会话（`useSessions` 的状态里**没有** `current`
+ *   字段，见 `client/workspace-select.ts` 的说明）⇒ 请求里**什么都没带**；
+ * - 宿主于是退回"当前已绑定的工作区根"（`source: 'bound'`），也就是**最后一个动过树的那个工作区** ——
+ *   用户在看 A 工作区，看到 B 的进度，且随别的会话活动而变 ⇒ "时灵时不灵"。
+ *
+ * 现在面板用 DSH 自己的工作区列表算出路径（判据见 `pickWorkspace`），把它交给宿主：
+ * **路径说话**，不再猜"宿主觉得我在哪"。`sessionId` 仍一并带上 —— 它让宿主能把
+ * `sessionRoots` 记到正确的会话上，也为路径缺失时的旧逻辑留退路。
+ *
+ * ## ⚠️ 为什么这里要 `encodeURIComponent` 而不是 `URLSearchParams`（真机踩过）
+ *
+ * `URLSearchParams` 会把**反斜杠原样留下**，而 `%5C` 在 HTTP 层到不了宿主就已经变成了 `/`：
+ *
+ * ```
+ * 请求 ?root=E%3A%5CWxObj%5ACOP        → 宿主收到 E:/WxObj/COP（⚠️ 盘符没被小写！）
+ * 请求 ?root=E%3A%2FWxObj%2FCOP        → 宿主收到 E:/WxObj/COP ✅
+ * 只有前者的 `source` 是 `bound` —— 路径白名单（存在性校验）把它拒了，用户看到的是"我又选错了"
+ * ```
+ *
+ * 事故形态很隐蔽：`%5C` 解码后是 `\`，但**这一层转换发生在宿主拿到查询串之前**，
+ * 于是 `existsSync` 面对的是一个拼错的路径。统一用 `encodeURIComponent` 把分隔符钉成
+ * `%2F`，从源头去掉这个歧义（路径本就是归一化后的正斜杠形式）。
+ */
+function boardQuery(sessionId?: string, rootPath?: string): string {
+  const parts: string[] = [];
+  if (rootPath !== undefined && rootPath !== '') parts.push(`root=${encodeURIComponent(rootPath)}`);
+  if (sessionId !== undefined && sessionId !== '') parts.push(`sessionId=${encodeURIComponent(sessionId)}`);
+  return parts.length === 0 ? '' : `?${parts.join('&')}`;
+}
+
 /** 会话查询串（带上它宿主才能把工作区根精确解析到该会话的工作区）。 */
 function sessionQuery(sessionId?: string): string {
   return sessionId !== undefined && sessionId !== '' ? `?sessionId=${encodeURIComponent(sessionId)}` : '';
 }
 
-/** 拉取看板快照。 */
-export function fetchBoard(signal?: AbortSignal, sessionId?: string): Promise<FetchOutcome<BoardSnapshot>> {
-  return getJson<BoardSnapshot>(`/board${sessionQuery(sessionId)}`, signal);
+/**
+ * 拉取看板快照。
+ *
+ * @param signal - 取消信号。
+ * @param sessionId - 当前会话 id（可选；用于宿主侧会话记账与旧逻辑兜底）。
+ * @param rootPath - **要看哪个工作区**（可选但强烈建议给；见 {@link boardQuery}）。
+ */
+export function fetchBoard(
+  signal?: AbortSignal,
+  sessionId?: string,
+  rootPath?: string,
+): Promise<FetchOutcome<BoardSnapshot>> {
+  return getJson<BoardSnapshot>(`/board${boardQuery(sessionId, rootPath)}`, signal);
 }
 
 /** 拉取项目列表。 */
@@ -496,6 +541,20 @@ export function reportClient(input: {
    * 宿主侧完全不知情。把错误报上来，`/pm/debug?format=json` 里就能看到哪一行炸的。
    */
   error?: { kind: string; message: string; stack?: string };
+  /**
+   * **面板作用域自报**（0.3.2 新增）。
+   *
+   * 判据链（选哪个工作区）全在浏览器侧，宿主只能看到"请求里带没带 `root`"。
+   * 一旦某个标准源在真机上不可用，表现是"看板看错工作区"，而宿主只看到一个没带参数的请求
+   * —— 与"旧客户端"无法区分。把这个报上去，"为什么选中它 / 为什么一个都没选到"就不用猜了。
+   */
+  scope?: {
+    workspaceCount: number;
+    pickedPath?: string;
+    source?: string;
+    hooks: { workspaces: boolean; sessions: boolean };
+    activeSessionId?: string;
+  };
 }): void {
   try {
     const target = (path: string): string =>

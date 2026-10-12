@@ -103,6 +103,14 @@ export interface PatchFields {
    * 由收尾方（会话/人）在写完成简报时一并设置：`pm_finish({ ..., followUp: true })`。
    */
   hasFollowUp?: boolean;
+  /**
+   * **未完成时"还差什么"**（0.3.2 新增）。见 `NodeRecord.note`。
+   *
+   * 与 `description` 一样属于"描述块"：写它会刷新 `noteUpdatedAt`（`mutatePatch` 自动打）。
+   */
+  note?: string;
+  /** `note` 最后一次被写入的时间（ISO）。通常不用手动传。 */
+  noteUpdatedAt?: string;
   gate?: Gate;
   focus?: boolean;
   dependsOn?: string[];

@@ -324,6 +324,22 @@ export function NodeInspector(props: NodeInspectorProps): React.ReactElement {
         )
       : null,
     /**
+     * **未完成时"还差什么"**（0.3.2 新增的 `note` 字段）。
+     *
+     * 为什么单独一格而不是并进描述：描述回答"这个功能点是干什么的"（相对稳定），
+     * `note` 回答"现在卡在哪、还缺什么"（随进展变化）。混在一起时，读的人分不清
+     * 哪句是功能定义、哪句是当下缺口 —— 而"未完成节点的缺口"正是看板最有价值的信息。
+     * `noteUpdatedAt` 一并显示，好让人判断这条说明是不是已经过期了。
+     */
+    node.note !== undefined && node.note !== ''
+      ? React.createElement(
+          'div',
+          { style: styles.staleNotice },
+          `还差什么：${node.note}` +
+            (node.noteUpdatedAt !== undefined ? `（${node.noteUpdatedAt} 写入）` : ''),
+        )
+      : null,
+    /**
      * **用新会话开始处理**（用户诉求："从未完成节点发起会话进行开始处理的能力"）。
      *
      * 只在**未完成**的节点上给：已完成的活没有"开始处理"可言。

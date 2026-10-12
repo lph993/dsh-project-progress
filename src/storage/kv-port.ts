@@ -286,6 +286,13 @@ export class KvStoragePort implements StoragePort {
       identity: node.identity,
       stale: node.stale,
       descriptionUpdatedAt: node.descriptionUpdatedAt,
+      /**
+       * `note` / `noteUpdatedAt`（0.3.2）：**未完成节点"还差什么"**。
+       * 与 `identity`/`stale` 同一条纪律 —— 加了 NodeRecord 字段就必须在这里登记，
+       * 否则它在主路线（KV）里会被静默丢掉，功能"实现了但不生效"。
+       */
+      note: node.note,
+      noteUpdatedAt: node.noteUpdatedAt,
       hasFollowUp: node.hasFollowUp,
       lastSessionId: node.lastSessionId,
       priority: node.priority,
@@ -461,6 +468,8 @@ function mergeRecords(
   if (structure.identity !== undefined) node.identity = structure.identity;
   if (structure.stale !== undefined) node.stale = structure.stale;
   if (structure.descriptionUpdatedAt !== undefined) node.descriptionUpdatedAt = structure.descriptionUpdatedAt;
+  if (structure.note !== undefined) node.note = structure.note;
+  if (structure.noteUpdatedAt !== undefined) node.noteUpdatedAt = structure.noteUpdatedAt;
   if (structure.hasFollowUp !== undefined) node.hasFollowUp = structure.hasFollowUp;
   if (structure.lastSessionId !== undefined) node.lastSessionId = structure.lastSessionId;
   if (structure.priority !== undefined) node.priority = structure.priority;
@@ -492,7 +501,7 @@ const STRUCTURE_FIELD_ALIASES: Record<string, string> = { revision: 'structRev' 
  * **只查"疑点字段"**（身份 / 标记 / 计时 / 计数这类容易被忘的），不查全部字段：
  * 有些字段本来就只在某个域（如 `derivedState` 是派生值、不进存储），一律报错会变成噪音。
  */
-const DROPPABLE_FIELD_HINTS = ['identity', 'stale', 'descriptionUpdatedAt', 'hasFollowUp', 'lastSessionId', 'priority', 'prioritySource', 'needsReview', 'actualMin', 'estimateMin', 'lastRollbackAt', 'focusShadow', 'dependsOn', 'bindings', 'weightDetail'];
+const DROPPABLE_FIELD_HINTS = ['identity', 'stale', 'descriptionUpdatedAt', 'note', 'noteUpdatedAt', 'hasFollowUp', 'lastSessionId', 'priority', 'prioritySource', 'needsReview', 'actualMin', 'estimateMin', 'lastRollbackAt', 'focusShadow', 'dependsOn', 'bindings', 'weightDetail'];
 
 function assertNoDroppedFields(source: NodeRecord, saved: NodeStructureRecord): void {
   const savedKeys = new Set(Object.keys(saved));

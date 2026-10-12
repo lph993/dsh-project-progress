@@ -11,8 +11,9 @@
  * - **T6 缓存**：同一份提示词命中内容哈希缓存就直接复用，一次调用都不发。
  */
 
-import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm';
+import { BlockAssembler } from '@deepseek-ai/dsh-llm';
 
+import { pmUserMessage } from '../shared/message.ts';
 import { extractJsonObject } from './parse.ts';
 import type { AiRoute } from './route.ts';
 import { readUsage, type LlmStreamLike } from './tree-builder.ts';
@@ -187,12 +188,7 @@ export async function callHandoffSupplement(
     for await (const chunk of input.stream!.stream({
       provider: input.route.provider,
       model: input.route.model,
-      messages: [
-        createUserMessage({
-          content: [{ type: 'text', text: input.user }],
-          source: { kind: 'plugin', plugin: 'dsh-project-progress' },
-        }),
-      ],
+      messages: [pmUserMessage(input.user)],
       system: input.system,
       maxTokens: input.maxTokens,
     })) {

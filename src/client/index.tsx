@@ -179,36 +179,26 @@ function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
   } catch {
     // 全局只读时忽略
   }
-  /**
-   * **会话导航能力**（用户诉求："点击能跳转到对应会话" / "从节点发起会话"）。
-   *
-   * 用 `ctx.get` 按需读取而不是写进 `inject`：这是**可选能力** ——
-   * 宿主没装 `ui-workspace` 时整条链路仍然可用（只是那一行退化成纯文本），
-   * 写进 `inject` 反而会让插件在缺它时加载不起来。与 §19 的"可选能力降级"同一条口径。
-   */
-  const sessionNav = readSessionNavigation(ctx);
-  /**
-   * 写进**模块级注册表**（用户诉求：节点 → 跳转会话 / 新会话开始处理）。
-   *
-   * 为什么不是 props：主面板 `BoardView` 与右栏 `RightProgressTab` 是两个独立 slot，
-   * 只有后者能收到 `inject`，而属性栏两边都要用。`undefined` 时不写 ⇒ 那两行退化成纯文本。
-   */
-  if (sessionNav !== undefined) {
-    setSessionNavigation({
-      openSession: (id: string) => {
-        (sessionNav['openSession'] as ((sessionId: string) => void) | undefined)?.(id);
-      },
-      startSession: () => {
-        (sessionNav['startSession'] as (() => void) | undefined)?.();
-      },
-    });
-  }
   ctx.slots.inject('sidebar.right.pane.tab', () => {
     const dispose = ctx.slots.register(
       {
         name: 'sidebar.right.pane.tab',
         key: RIGHT_TAB_ID,
-        ...(sessionNav !== undefined ? { inject: () => sessionNav } : {}),
+        /**
+         * ⚠️ **这里只能引用 `registerRightTab` 自己的作用域**。
+         *
+         * 0.3.3 曾经把 `sessionNav` / `openWorkspace` 的声明写在本函数**之后**的
+         * `apply()` 里（那两个是在 `apply` 里读的），却在这里引用 —— 于是产物里
+         * `const openWorkspace` 落在 `registerRightTab` 内、而用它的是 `apply` 里的主面板槽位注册：
+         * `apply` 执行时报 `ReferenceError: openWorkspace is not defined`，
+         * 槽位 `main` 整条注册失败 ⇒ **看板一片黑**（外壳还在）。
+         * 现在可选能力的读取集中在 `apply()` 开头（见那里的 `readSessionNavigation`），
+         * 右栏的 inject 只把 `ctx` 自己读一遍，**不跨函数引用**。
+         */
+        inject: () => {
+          const nav = readSessionNavigation(ctx);
+          return nav !== undefined ? nav : {};
+        },
       },
       RightProgressTab,
     );
@@ -217,7 +207,6 @@ function registerRightTab(ctx: ClientContext, registeredSlots: string[]): void {
     return dispose;
   });
 }
-
 /** 会话导航面（DSH `uiWorkspace` 的最小子集）。 */
 export interface SessionNavigation {
   /** 选中该会话并显示它的对话。 */
@@ -229,16 +218,26 @@ export interface SessionNavigation {
 /**
  * 从宿主读会话导航能力；**拿不到就返回 undefined**（绝不抛 —— 这只是可选增强）。
  *
+ * ⚠️ **不要在这里加 `uiWorkspace.openWorkspace`**（0.3.8 核对过它的真实语义）：
+ * 它是"连接该工作区并打开**复用或新建的空白会话**"，用在看板上就是"点一下新建空会话"，
+ * 与"切到这个工作区"并不等价 —— 那个入口已按用户要求去掉（"点一下只是新建会话，价值不大"）。
+ * 要在某个工作区干活，正确入口是左侧栏的工作区列表。
+ *
  * @returns 能与不能都给得出结论：不能时界面上那一行会退化成纯文本，而不是一个点了没反应的按钮。
  */
 function readSessionNavigation(ctx: ClientContext): Record<string, unknown> | undefined {
   try {
     const workspace = ctx.get?.('uiWorkspace') as
-      | { openSession?: (id: string) => void; startSession?: () => void }
+      | {
+          openSession?: (id: string) => void;
+          startSession?: () => void;
+        }
       | undefined;
     if (workspace === undefined) return undefined;
     const { openSession, startSession } = workspace;
-    if (typeof openSession !== 'function' && typeof startSession !== 'function') return undefined;
+    if (typeof openSession !== 'function' && typeof startSession !== 'function') {
+      return undefined;
+    }
     return {
       openSession: (id: string) => {
         try {
@@ -309,6 +308,37 @@ export function apply(ctx: ClientContext): void {
 
   /** 已注册的槽位（错误上报里一并带上，便于判断"是注册失败还是渲染失败"）。 */
   const registeredSlots: string[] = [];
+
+  /**
+   * **会话导航能力**（用户诉求："点击能跳转到对应会话" / "从节点发起会话"）。
+   *
+   * 用 `ctx.get` 按需读取而不是写进 `inject`：这是**可选能力** ——
+   * 宿主没装 `ui-workspace` 时整条链路仍然可用（只是那一行退化成纯文本），
+   * 写进 `inject` 反而会让插件在缺它时加载不起来。与 §19 的"可选能力降级"同一条口径。
+   *
+   * ⚠️ **必须在 `apply()` 里读、也只能在这里读**：0.3.3 一度把这段声明放进了
+   * `registerRightTab()`（那是另一个函数），于是 `apply` 执行时引用到未定义的局部变量 ⇒
+   * **槽位 `main` 注册整条失败、看板一片黑**。跨函数引用别人的局部变量，
+   * 打包后只会以"运行时未定义"的形式暴露 —— 现在这里只读一次、就地使用。
+   */
+  const sessionNav = readSessionNavigation(ctx);
+
+  /**
+   * 写进**模块级注册表**（用户诉求：节点 → 跳转会话 / 新会话开始处理）。
+   *
+   * 为什么不是 props：主面板 `BoardView` 与右栏 `RightProgressTab` 是两个独立 slot，
+   * 只有后者能收到 `inject`，而属性栏两边都要用。`undefined` 时不写 ⇒ 那两行退化成纯文本。
+   */
+  if (sessionNav !== undefined) {
+    setSessionNavigation({
+      openSession: (id: string) => {
+        (sessionNav['openSession'] as ((sessionId: string) => void) | undefined)?.(id);
+      },
+      startSession: () => {
+        (sessionNav['startSession'] as (() => void) | undefined)?.();
+      },
+    });
+  }
 
   /**
    * 客户端崩溃上报。
@@ -394,7 +424,15 @@ export function apply(ctx: ClientContext): void {
       {
         name: 'main',
         key: PANEL_ID,
-        inject: () => ({ hooks: {} }),
+        /**
+         * 面板要用的标准源（`useSessions` / `useWorkspaces`）由渲染器摊进来，
+         * **不需要**自己注入 hook（见 `BoardPanelProps` 的说明）。
+         *
+         * 0.3.8 起这里**不再注入任何 prop**：唯一那个（`onOpenWorkspace`）已随
+         * 「在侧边栏打开」按钮一起去掉。留空对象是刻意的 —— 它明确表达"主面板自给自足"，
+         * 也免得下次有人以为漏了什么。
+         */
+        inject: () => ({}),
       },
       BoardPanel,
     );

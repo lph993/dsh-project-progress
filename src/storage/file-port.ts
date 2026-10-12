@@ -118,6 +118,13 @@ export function toStorageRecords(
   if (node.weightDetail !== undefined) structure.weightDetail = node.weightDetail;
   if (node.autoCreated !== undefined) structure.autoCreated = node.autoCreated;
   if (node.description !== undefined) structure.description = node.description;
+  /**
+   * `note` / `noteUpdatedAt`（0.3.2）：未完成节点"还差什么"。
+   * 备用路线（文件档）**同样要登记** —— 两条路线的结构记录共用 `schema.ts` 的 zod 定义，
+   * 这里漏掉就会在 schema 解析时被丢掉（"存了读不出来"，比报错更难查）。
+   */
+  if (node.note !== undefined) structure.note = node.note;
+  if (node.noteUpdatedAt !== undefined) structure.noteUpdatedAt = node.noteUpdatedAt;
   if (node.refs !== undefined) structure.refs = node.refs;
   if (node.focusShadow !== undefined) structure.focusShadow = node.focusShadow;
   if (node.flags !== undefined) structure.flags = node.flags;
@@ -172,6 +179,8 @@ export function fromStorageRecords(
   if (s.weightDetail !== undefined) node.weightDetail = s.weightDetail;
   if (s.autoCreated !== undefined) node.autoCreated = s.autoCreated;
   if (s.description !== undefined) node.description = s.description;
+  if (s.note !== undefined) node.note = s.note;
+  if (s.noteUpdatedAt !== undefined) node.noteUpdatedAt = s.noteUpdatedAt;
   if (s.refs !== undefined) node.refs = s.refs;
   if (s.focusShadow !== undefined) node.focusShadow = s.focusShadow;
   if (s.flags !== undefined) node.flags = s.flags;
