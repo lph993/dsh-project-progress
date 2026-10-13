@@ -27,6 +27,7 @@ import {
   nodeRowLabel,
 } from './api.ts';
 import {
+  useAbsentSessions,
   useAbsentWorkspaces,
   useBoardData,
   type SessionsSelectorHook,
@@ -40,6 +41,7 @@ import {
   type WorkspaceOptionLike,
 } from './workspace-select.ts';
 import { isLiveNode } from './liveness.ts';
+import { livenessArgsOf } from './board-liveness.ts';
 import { nodePercentOf } from './labels.ts';
 import { orderUnfinished } from './unfinished-order.ts';
 import type { BoardSnapshot, NodeView } from './contract.ts';
@@ -183,16 +185,18 @@ export function RightProgressView(props: RightProgressViewProps): React.ReactEle
    * **正在被操作的子项目**（用户诉求："tabs 上要做会话活动标记，就是当前会话在修复哪块有个标记，
    * 好查看正在操作的节点部分剩余工作"）。
    *
-   * 判据与画布图标**同源**（`isLiveNode`）：子树里有节点"所属会话正在忙"，这个 tab 就亮。
+   * 判据与画布图标**同源**（`isLiveNode`）：子树里有节点"正在被跑"，这个 tab 就亮。
    * 早先这里用"最近 90s 有写入"来判，于是**没有任何会话在跑时 tab 也亮**；
-   * 现在改成逐节点的会话信号（`lastSessionId ∈ busySessionIds`），只有真有人在跑才亮。
+   * 现在首选宿主报的 `activeNodeIds`（这轮真被忙碌会话动过的节点），
+   * `busySessionIds` 退成兜底 —— 两处口径必须一致，否则会出现"画布转圈但 tab 不亮"。
    */
   const liveRootIds = (() => {
-    const busy = board.busySessionIds ?? [];
+    // 两个字段的语义差异（undefined ≠ []）只在 board-liveness.ts 里解释一次，别在这里重写
+    const { busySessionIds: busy, activeNodeIds: active } = livenessArgsOf(board);
     const live = new Set<string>();
     const rootIds = new Set(roots.map((root) => root.id));
     for (const node of board.nodes) {
-      if (!isLiveNode(node, busy)) continue;
+      if (!isLiveNode(node, busy, active)) continue;
       // 沿 parentId 往上找它属于哪个子项目
       let cursor: NodeView | undefined = node;
       const seen = new Set<string>();

@@ -477,10 +477,16 @@ export interface BoardSnapshot {
    * 从而判断"这个面板对应的会话是不是正在跑" —— 计数做不到这件事。
    *
    * 为什么要它：`derivedState === 'running'` 只说明"被启动过"，而"有没有人在跑"是**会话的事**。
-   * 只看节点自己的 `updatedAt`（`client/liveness.ts` 的 90s 窗口）会把"会话正在跑但这一会儿没写节点"
-   * 误判成没人跑、画成 ▶（用户口径："正在会话的没有从播放三角切换到 loading"）。
    */
   busySessionIds: string[];
+  /**
+   * **这一轮里真的被忙碌会话动过的节点**（0.3.11）。
+   *
+   * 这是"该不该转圈"的**首选依据**（见 `client/liveness.ts`）：会话忙 ≠ 在动某个节点，
+   * 而"节点最近多少秒内被写过"这种窗口两头都错过（宽了把 32 小时前的旧节点转起来、
+   * 紧了把干活途中还没补记的节点掐掉）。宿主手上有**事实**，就报事实。
+   */
+  activeNodeIds: string[];
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
   /** 最近一次外部改动（R4/R6）；无则为 null。 */
@@ -725,8 +731,42 @@ export class ProjectService {
    *
    * 由 `src/index.ts` 挂在 DSH 的 `agent/status`（`running` 记忙、`idle` 记闲）与
    * `agent/disposed`（移除）上。只放内存：会话本身也是进程内对象，进程重启后重新记账即可。
+   *
+   * ## 为什么带上 `nodeIds`（0.3.11）
+   *
+   * 这里本来只记"这个会话从什么时候开始忙"。但**"忙"不等于"在动某个节点"** ——
+   * 真机两次踩反方向：
+   * - 只看"所属会话在忙" ⇒ 一个忙碌会话历史上写过的 **65/86** 个节点整片转圈
+   *   （最久的 32 小时前写的）：**不该转的转了**；
+   * - 又加一道"90 秒内被写过"的窗口 ⇒ 实测 **0 个**转圈：`updatedAt` 只在
+   *   **插件工具写节点**时刷新，而干活的顺序是"读代码、改代码 → 收尾才补记"，
+   *   干活途中时间戳本来就是旧的 ⇒ **该转的没转**。
+   *
+   * 所以别再用"多少秒算刚动过"去猜，改记**事实**：这个会话在这一轮里**真的动过哪些节点**。
+   * 客户端据此转圈（见 `client/liveness.ts`），窗口那套退成兜底。
    */
-  private readonly busySessions = new Map<string, string>();
+  private readonly busySessions = new Map<
+    string,
+    {
+      /**
+       * **最后一次"会话在忙"信号的时刻**（只有 `agent/status: running` 会刷新它）。
+       *
+       * ⚠️ **写入路径不许碰它**（0.3.13 独立审查的 M2）：它测的是"信号新鲜度"，
+       * 用来兜住"漏收 idle 事件"。早先 `noteNodeTouched` 也刷新它，等于让"仍在写节点的
+       * 会话"永远不会因 TTL 过期 —— 那是把失联检测交给了写活动，语义错了。
+       */
+      at: string;
+      /**
+       * 这一轮动过的节点 → **最后被动它的时刻**（epoch 毫秒）。
+       *
+       * 为什么要存时刻而不只是个集合（M4）：兜底段会把"agent status 仍报 running"的会话
+       * 也算作忙，若那条 status 卡住了，一份几小时前的节点清单会被**重新报成 active** ——
+       * 直接回到用户报的"不相关的节点也在 loading"。所以此处按时刻过滤。
+       */
+      nodeIds: Map<string, number>;
+    }
+  >();
+
   /** 边界修正的累计统计（诊断页/设置页显示"这一层到底有没有在干活"）。 */
   private readonly boundaryStats = {
     runs: 0,
@@ -1178,7 +1218,7 @@ export class ProjectService {
 
   private resolveRoot(sessionId?: string): WorkspaceRootResolution {
     /**
-     * **① 面板显式声明的作用域优先于一切**（0.3.5 修"切了工作区还是同一棵树"）。
+     * **① 面板显式声明的作用域**（0.3.5 修"切了工作区还是同一棵树"）—— **仅 `board()` 读取期间的瞬时上下文**。
      *
      * ## 真机症状与证据
      *
@@ -1196,16 +1236,21 @@ export class ProjectService {
      * （`sessionRoots.get(sessionId)`）—— 而面板所在会话的 cwd 正是 P0 工作区 ⇒ **刚绑好的
      * 项目被会话根覆盖回去**。于是无论面板声明哪个工作区，读出来永远是"这个会话自己那个"。
      *
-     * ## 口径（谁是"当前意图"）
+     * ## ⚠️ 为什么作用域必须"瞬时"且"仅读"（0.3.13 独立审查抓到的缺陷）
      *
-     * - **面板显式声明**（`panelScopeRoot`，由 `board(sessionId, root)` 写入）＝"用户此刻在看哪个工作区"，
-     *   读路径上它最准；
-     * - 会话工具调用的 cwd（`sessionRoots`）＝"这个会话在哪个工作区干活"，**写路径**必须用它 ——
-     *   所以本函数只在**读**路径上让面板优先，写路径（`operationRoot`）不受影响；
-     * - 面板声明只对**同一个会话**生效，且**两分钟**后失效（见 `PANEL_SCOPE_TTL_MS`），
-     *   免得一个过期的作用域长期劫持这个会话的读。
+     * 0.3.6 把面板作用域无条件塞进本函数的第一条判据，而本函数被**所有**路径调用 ——
+     * 包括 `bindForCall()`（每次工具调用与写入的第一步）与 `writeHandoff()`（文件写路径）。
+     * 后果：同一个会话在 A 干活、面板切到 B 时，**工具调用会被绑到 B 的项目**、
+     * 交接文档会落进 **B 的工作区**。也就是说我当时在注释里写的"写路径不受影响"是**错的**。
+     *
+     * 现在的口径：
+     * - `board()` 用 `withPanelScope()` 把作用域**临时**放进 `activePanelScope`，
+     *   读取结束（含它内部 `derive`/`bindForCall` 的那些调用）就恢复；
+     * - 这个字段的时间戳受 `PANEL_SCOPE_TTL_MS` 约束，过期即视为没有；
+     * - **`activePanelScope` 之外的一切调用（工具、写路径、后台任务）看不到面板作用域** ——
+     *   它们只认调用会话自己的 cwd。这个区分有 e2e 专门钉住，不许再被合并。
      */
-    const scope = this.panelScopeRoot;
+    const scope = this.activePanelScope;
     if (
       scope !== undefined &&
       (sessionId === undefined || sessionId === '' || scope.sessionId === sessionId) &&
@@ -1214,7 +1259,7 @@ export class ProjectService {
       return {
         root: scope.root,
         source: 'panel-scope',
-        detail: '由面板显式声明的工作区路径（看板作用域）',
+        detail: '由面板显式声明的工作区路径（看板作用域，仅读路径）',
       };
     }
     /**
@@ -1255,10 +1300,39 @@ export class ProjectService {
   /**
    * 面板最后一次显式声明的工作区（`GET /pm/board?root=…`）。
    *
-   * 只服务**读**路径的"当前意图"判定（见 `resolveRoot` 的第 ① 条判据），
-   * 不参与写路径的项目选择 —— 写路径必须跟着"调用会话的 cwd"。
+   * **持久**保存是因为面板每轮轮询都可能不带 `root`（只带 `sessionId`），需要记住上次声明；
+   * 但它只在 `board()` 读取期间被 `withPanelScope()` 提升为"生效作用域"（`activePanelScope`），
+   * 其它任何路径（工具调用、写路径、后台任务）都看不到它 —— 见 `resolveRoot` 的长注释。
    */
   private panelScopeRoot: { root: string; sessionId?: string; at: number } | undefined;
+  /**
+   * **当前正在生效**的面板作用域（只在 `withPanelScope()` 的作用域内非空）。
+   *
+   * 为什么要这个中间层：`board()` 内部会经 `derive` → `bindForCall` → `resolveRoot`
+   * 转好几道，"面板在看 B"这个上下文必须**活着穿过这些调用**，否则刚绑好的项目会被
+   * 会话自己的 cwd 拨回去（"切了工作区还是同一棵树"就是它）。
+   * 但同一个字段若长期非空，就会污染写路径（0.3.13 审查抓到的那个缺陷）。
+   */
+  private activePanelScope: { root: string; sessionId?: string; at: number } | undefined;
+
+  /**
+   * 在"面板作用域生效"的上下文里执行一段代码（只有 `board()` 用）。
+   *
+   * 语义刻意做成**瞬时**：进入时提升、退出时恢复（用 `try/finally`，抛错也要恢复 ——
+   * 否则一次失败的面板读取会把这个会话的写路径永久带偏）。
+   */
+  private async withPanelScope<T>(
+    scope: { root: string; sessionId?: string; at: number } | undefined,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.activePanelScope;
+    this.activePanelScope = scope;
+    try {
+      return await run();
+    } finally {
+      this.activePanelScope = previous;
+    }
+  }
   /**
    * 由工具层在每次执行时写入当前会话的工作区根。
    *
@@ -1924,7 +1998,19 @@ export class ProjectService {
       );
       const applied = await this.persist(result);
       if (applied.status === 'ok' && result.kind === 'ok') {
-        const newId = diffNodeIds(graph, result.graph)[0];
+        const created = diffNodeIds(graph, result.graph);
+        const newId = created[0];
+        /**
+         * **新建的节点也要记账**（0.3.13 独立审查的 M3）。
+         *
+         * `addNode` 是**绕过 `patchNode` 的 10 条写路径之一**（它自己调 `persist`），
+         * 所以"写路径收口在 patchNode"这个假设不成立 —— 后果正是用户抱怨的"该转的没转"：
+         * `pm_add` 建的节点（含 AI 建树）不进 `activeNodeIds`，**在会话主动 `pm_progress`
+         * 之前不会转圈**。这里补上这个收口。
+         */
+        if (input.sessionId !== undefined) {
+          for (const id of created) this.noteNodeTouched(input.sessionId, id);
+        }
         return { ...applied, ...(newId !== undefined ? { nodeId: newId } : {}) };
       }
       return applied;
@@ -1972,7 +2058,18 @@ export class ProjectService {
         },
         this.mutationContext(),
       );
-      return await this.persist(result);
+      const persisted = await this.persist(result);
+      /**
+       * **落盘成功才记账**"这个会话这轮动过这个节点"（0.3.11）。
+       *
+       * 放在 `patchNode` 这一层（而不是各个调用点）是因为它是**所有写路径的唯一收口**：
+       * `pm_progress` / `pm_report` / `pm_finish` / 面板操作 / AI 建树都会经过这里，
+       * 于是"哪些节点正在被这个会话动"是**事实**，不是靠 `updatedAt` 猜出来的。
+       */
+      if (persisted.status === 'ok' && input.sessionId !== undefined) {
+        this.noteNodeTouched(input.sessionId, input.nodeId);
+      }
+      return persisted;
     } finally {
       endOperation();
     }
@@ -4978,29 +5075,68 @@ export class ProjectService {
        */
       this.panelScopeRoot = undefined;
     }
-    const resolution = scoped
-      ? {
-          root: demanded,
-          source: 'panel-scope' as const,
-          detail: '由面板显式声明的工作区路径（看板作用域）',
+    /**
+     * **把"面板在看这个工作区"作为瞬时上下文包住整个读取**（0.3.13）。
+     *
+     * 为什么要包住整段而不只是解析那一行：`derive()` 内部还会经
+     * `bindForCall → resolveRoot` 再解析一次根，上下文必须活着穿过去，
+     * 否则刚绑好的面板工作区会被**会话自己的 cwd** 拨回去
+     * （"切了工作区还是同一棵树"就是这个成因）。
+     * 而出了这个作用域，`resolveRoot` 看不到面板声明 ⇒ 写路径不受影响。
+     */
+    return await this.withPanelScope(
+      scoped
+        ? { root: demanded, ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}), at: Date.now() }
+        : this.panelScopeRoot,
+      async () => {
+        const resolution = scoped
+          ? {
+              root: demanded,
+              source: 'panel-scope' as const,
+              detail: '由面板显式声明的工作区路径（看板作用域）',
+            }
+          : this.resolveRoot(sessionId);
+        if (resolution.root !== undefined) {
+          // 面板正在看这个会话/这个工作区 → 它就是"当前意图"，与工具调用报告同级（后写者赢）
+          this.notePendingRoot(resolution, sessionId);
+          await this.bindProjectToRoot(resolution.root, sessionId);
         }
-      : this.resolveRoot(sessionId);
-    if (resolution.root !== undefined) {
-      // 面板正在看这个会话/这个工作区 → 它就是"当前意图"，与工具调用报告同级（后写者赢）
-      this.notePendingRoot(resolution, sessionId);
-      await this.bindProjectToRoot(resolution.root, sessionId);
-    }
-    // 会话 id 必须**传下去**：`derive()` 内部也会做绑定，不带会话时它按匿名兜底，
-    // 会把刚绑好的项目拨到别的会话最后用过的那个（实测：面板带 id 读回来的还是别人的树）。
-    const { graph, derived } = await this.derive(sessionId);
-    const focusRoots = focusedRoots(derived.index);
-    // 墓碑（已删除节点）不进看板：删除是 tombstone 记录（留作回滚/审计），
-    // 但画布上再显示出来会让用户以为删除没生效（§9.1 墓碑不变量 T-c）
-    const liveNodes = [...derived.nodes.values()].filter((d) => d.derivedState !== 'removed');
-    const views = liveNodes
-      .map((d) => this.toView(derived, d.node.id))
-      .filter((v): v is NodeView => v !== undefined);
+        // 会话 id 必须**传下去**：`derive()` 内部也会做绑定，不带会话时它按匿名兜底，
+        // 会把刚绑好的项目拨到别的会话最后用过的那个（实测：面板带 id 读回来的还是别人的树）。
+        const { graph, derived } = await this.derive(sessionId);
+        const focusRoots = focusedRoots(derived.index);
+        // 墓碑（已删除节点）不进看板：删除是 tombstone 记录（留作回滚/审计），
+        // 但画布上再显示出来会让用户以为删除没生效（§9.1 墓碑不变量 T-c）
+        const liveNodes = [...derived.nodes.values()].filter((d) => d.derivedState !== 'removed');
+        const views = liveNodes
+          .map((d) => this.toView(derived, d.node.id))
+          .filter((v): v is NodeView => v !== undefined);
 
+        return await this.assembleBoard({
+          sessionId,
+          graph,
+          derived,
+          views,
+          liveNodes,
+          focusRoots,
+          resolution,
+        });
+      },
+    );
+  }
+
+  /** 看板快照的组装（拆出来是为了让 `board()` 的主体只剩"作用域 + 绑定 + 组装"三段）。 */
+  private async assembleBoard(input: {
+    sessionId?: string;
+    graph: GraphSnapshot;
+    derived: DerivedGraph;
+    views: NodeView[];
+    liveNodes: Array<{ node: { id: string; name: string; focus: boolean }; derivedState: string }>;
+    focusRoots: string[];
+    /** 本次读取所用的工作区根解析（如实回报给面板，用于"宿主解析"那一行）。 */
+    resolution: WorkspaceRootResolution;
+  }): Promise<BoardSnapshot> {
+    const { graph, derived, views, liveNodes, focusRoots, sessionId, resolution } = input;
     const conflicts = await this.port.listConflicts(this.projectId, 'pending');
     const snapshotDecision = resolveSnapshotMode(
       this.deps.config.snapshotMode,
@@ -5038,10 +5174,10 @@ export class ProjectService {
       alerts: alertsOf(debugBus),
       snapshot: snapshotDecision,
       /**
-       * 正在真干活的会话 id（客户端拿它跟自己的会话对一下，就知道该不该转圈）。
-       * 判据见 `client/liveness.ts`：`updatedAt` 窗口 **或** 会话正在忙 —— 任一成立即"在跑"。
+       * 正在真干活的会话 + **它们这轮真的动过的节点**（两者同源，见
+       * `busySessionAndActiveNodes`）。客户端据此决定谁转圈。
        */
-      busySessionIds: await this.busySessionIdList(),
+      ...(await this.busySessionAndActiveNodes()),
       // 每个节点有几个可用回滚点：菜单要**同步**决定「回滚 / 整枝回滚」显不显示
       // （FR：没有回滚点时不显示，而不是画一个点了没反应的项）
       rollbackPoints: await this.rollbackPointCounts(liveNodes.map((d) => d.node.id)),
@@ -7538,7 +7674,16 @@ export class ProjectService {
       return;
     }
     if (status === 'running') {
-      this.busySessions.set(sessionId, this.deps.clock.now());
+      const at = this.deps.clock.now();
+      const existing = this.busySessions.get(sessionId);
+      /**
+       * `nodeIds` 只在"这一段忙开始"时清空：`running` 对一个已经忙着的会话重复到达时
+       * （每一步都可能来一条）保留本轮已记的节点，否则刚点亮一会儿又灭。
+       */
+      this.busySessions.set(sessionId, {
+        at,
+        nodeIds: existing?.nodeIds ?? new Map<string, number>(),
+      });
       return;
     }
     if (status === 'idle') {
@@ -7547,13 +7692,45 @@ export class ProjectService {
     }
   }
 
-  /** 当前正在真干活的会话 id（看板用；超过 5 分钟没有新信号视为失联、不再算忙）。 */
-  private async busySessionIdList(): Promise<string[]> {
+  /**
+   * 记账：**这个会话这一轮动过这个节点**（由写路径在真正落盘后调用）。
+   *
+   * **只认已经在记的会话**（`agent/status: running` 报过的那种）：
+   * 没在忙的会话动过节点是**常态**（面板操作、收尾补记、AI 建树都可能来自已经歇下的会话），
+   * 那些节点**不该**被报成"正在跑"。所以这里不新建条目 ——
+   * 否则"会话忙闲"这道闸门就被绕过去了（e2e 实测：一个从未 running 过的会话写一个节点，
+   * 就能让它进 `activeNodeIds`）。
+   */
+  noteNodeTouched(sessionId: string | undefined, nodeId: string): void {
+    if (sessionId === undefined || sessionId === '' || nodeId === '') return;
+    const entry = this.busySessions.get(sessionId);
+    if (entry === undefined) return;
+    /**
+     * ⚠️ **刻意不刷新 `entry.at`**（0.3.13 审查的 M2）：`at` 是"会话在忙"的信号新鲜度，
+     * 只有 `agent/status: running` 该刷新它。若写入路径也刷，一个"agent 已经不在跑、
+     * 但仍在写节点"的会话就永远不会因 TTL 过期 —— TTL 本来是为"漏收 idle 事件"兜底的。
+     */
+    entry.nodeIds.set(nodeId, Date.now());
+  }
+
+  /**
+   * 当前正在真干活的会话，以及**它们这一轮真的动过的节点**。
+   *
+   * 超过 5 分钟没有新信号视为失联、不再算忙（`BUSY_SESSION_TTL_MS`）。
+   * 返回两个东西一起算，是因为它们必须**同源** —— 客户端拿 `activeNodeIds` 直接点亮，
+   * 就不会出现"会话列表说在忙、节点列表却对不上"的自相矛盾。
+   */
+  private async busySessionAndActiveNodes(): Promise<{
+    busySessionIds: string[];
+    activeNodeIds: string[];
+  }> {
     const now = Date.parse(this.deps.clock.now());
     const busy: string[] = [];
-    for (const [id, at] of this.busySessions) {
-      const stamp = Date.parse(at);
-      if (Number.isFinite(stamp) && Number.isFinite(now) && now - stamp <= BUSY_SESSION_TTL_MS) busy.push(id);
+    for (const [id, entry] of this.busySessions) {
+      const stamp = Date.parse(entry.at);
+      if (Number.isFinite(stamp) && Number.isFinite(now) && now - stamp <= BUSY_SESSION_TTL_MS) {
+        busy.push(id);
+      }
     }
     /**
      * **兜底：主动问一次 agent 的实时状态**。
@@ -7579,7 +7756,19 @@ export class ProjectService {
       if (busy.includes(id)) continue;
       if (this.sessionStatusOf(id) === 'running') busy.push(id);
     }
-    return busy;
+    // 只报**正在忙的**会话动过的节点（会话停下后它的节点不该再转圈）
+    const active = new Set<string>();
+    /**
+     * 每个节点的"被动过"时刻也要够新 —— 防的是 M4：兜底段会把"agent status 仍报 running"
+     * 的会话算作忙，若那条 status 卡住，几小时前写的一整份节点清单会被**重新报成 active**，
+     * 于是"不相关的节点也在 loading"原样回来。这里用与 `BUSY_SESSION_TTL_MS` 同一把尺子。
+     */
+    for (const id of busy) {
+      for (const [nodeId, touchedAt] of this.busySessions.get(id)?.nodeIds ?? []) {
+        if (Number.isFinite(now) && now - touchedAt <= BUSY_SESSION_TTL_MS) active.add(nodeId);
+      }
+    }
+    return { busySessionIds: busy, activeNodeIds: [...active] };
   }
 
   /** 待确认删除的发起方（取不到会话 id 就如实记 `session:unknown`，不猜）。 */

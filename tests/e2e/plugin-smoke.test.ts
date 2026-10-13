@@ -911,6 +911,49 @@ test('看板作用域：面板声明的工作区路径优先，且只认存在�
   const legacy = await service.board('session-A');
   assert.equal(legacy.projectId, projectA, '不带 root 时按会话解析（旧路径不受影响）');
 
+  /**
+   * ⑥ **面板作用域不许污染写路径**（0.3.13 独立审查抓到的缺陷）。
+   *
+   * ## 现场（用户真实用法）
+   *
+   * 会话在 A 干活（本工作区），用户在面板里把作用域切到 B 看别人的进度。
+   * 0.3.6 把面板作用域无条件塞进了 `resolveRoot` 的第一条判据，而 `resolveRoot` 被
+   * **所有**路径调用 —— 包括 `bindForCall()`（每次工具调用/写入的第一步）。
+   * 于是紧接着的工具调用会被**绑到 B 的项目**。
+   *
+   * 前 ④ 步之所以没盖住它：那些断言在"面板读回 A"之后就收尾了，
+   * 没有做"读完 B 之后**再由会话 A 发起一次工具调用**"这一步 —— 缺的正是写路径那一刀。
+   */
+  await service.board('session-A', wsB); // 面板：会话 A，但要看 B（写路径污染的前提）
+  service.noteWorkspaceRoot(wsA, 'session-A'); // 会话 A 的 cwd 仍是 A（工具层每轮都会报）
+  const writeAfterScope = await service.addNode({
+    parentId: null,
+    name: 'A树之二',
+    sessionId: 'session-A',
+  });
+  assert.equal(
+    writeAfterScope.status,
+    'ok',
+    `面板在看 B 时，会话 A 的写入也必须成功：${JSON.stringify(writeAfterScope)}`,
+  );
+  const treeA = await service.board('session-A');
+  assert.equal(
+    treeA.projectId,
+    projectA,
+    '**面板作用域不许改项目绑定**：会话 A 的工具调用必须落在 A 的项目里（0.3.13 的回归点）',
+  );
+  assert.deepEqual(
+    treeA.nodes.map((n) => n.name).sort(),
+    ['A树', 'A树之二'],
+    '新节点必须落进 A 的树，而不是 B（那会表现为"B 凭空多出节点、A 什么都没变"）',
+  );
+  const treeB = await service.board(undefined, wsB);
+  assert.deepEqual(
+    treeB.nodes.map((n) => n.name),
+    ['B树'],
+    'B 的树不受影响（写路径没被面板作用域带偏）',
+  );
+
   ctx.disposeAll();
   rmSync(wsA, { recursive: true, force: true });
   rmSync(wsB, { recursive: true, force: true });
@@ -985,6 +1028,69 @@ test('优先级写入通道：单条能写、批量能写、来源标成 user（
     'user',
     '批量写入同样标 user',
   );
+
+  ctx.disposeAll();
+  rmSync(ws, { recursive: true, force: true });
+});
+
+/**
+ * **"这轮动过哪些节点"的宿主记账**（0.3.11）。
+ *
+ * ## 为什么要这条测试
+ *
+ * 用户报了两个**方向相反**的问题，两次都是判据的错：
+ * - "不该转的转了"：只看"节点所属会话在忙" ⇒ 一个忙碌会话历史上写过的 65/86 个节点
+ *   （最久的 32 小时前）整片转圈；
+ * - "该转的没转"：加了"90 秒内被写过"的窗口 ⇒ 实测 0 个转圈 —— 因为 `updatedAt`
+ *   只在**插件工具写节点**时刷新，而干活途中节点时间戳本来就是旧的。
+ *
+ * 结论：别再拿时间戳猜，宿主报**事实**。本测试钉这条链路：
+ * 写节点 ⇒ 记账到"这个会话这轮动过它" ⇒ 看板 `activeNodeIds` 里出现它 ⇒ 会话一停就撤掉。
+ */
+test('活跃节点记账：写过的节点进 activeNodeIds，会话停下立刻撤掉', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'pm-e2e-active-'));
+  const ctx = createFakeContext({ workspace: ws });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    noteSessionActivity(sessionId: string, status: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(
+      sessionId?: string,
+      root?: string,
+    ): Promise<{ busySessionIds: string[]; activeNodeIds: string[] }>;
+  };
+
+  const SESSION = 'session-active-1';
+  service.noteWorkspaceRoot(ws, SESSION);
+  const a = await service.addNode({ parentId: null, name: '甲', sessionId: SESSION });
+  const idA = a.nodeId as string;
+
+  // ① 会话还没开工（没有 running 记账）⇒ 它动过的节点不该被报成"在跑"
+  await service.progress({ nodeId: idA, progress: 0.2, sessionId: SESSION });
+  let board = await service.board(SESSION, ws);
+  assert.equal(board.activeNodeIds.includes(idA), false, '会话没在忙时不该报"正在动这个节点"');
+
+  // ② 会话开工 ⇒ 它随后写的节点进 activeNodeIds（不看时间戳新旧）
+  service.noteSessionActivity(SESSION, 'running');
+  await service.progress({ nodeId: idA, progress: 0.5, sessionId: SESSION });
+  board = await service.board(SESSION, ws);
+  assert.equal(board.busySessionIds.includes(SESSION), true, '开工的会话要进 busySessionIds');
+  assert.equal(
+    board.activeNodeIds.includes(idA),
+    true,
+    '这一轮写过的节点必须进 activeNodeIds —— 客户端据此转圈（修"该转的没转"）',
+  );
+
+  // ③ 会话停下 ⇒ 两个清单都撤掉（不许残留"正在跑"，那是无依据地宣称在跑）
+  service.noteSessionActivity(SESSION, 'idle');
+  board = await service.board(SESSION, ws);
+  assert.equal(board.busySessionIds.includes(SESSION), false);
+  assert.equal(board.activeNodeIds.includes(idA), false, '会话停了，它的节点不该再转圈');
 
   ctx.disposeAll();
   rmSync(ws, { recursive: true, force: true });

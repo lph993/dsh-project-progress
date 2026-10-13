@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-progress",
-  "version": "0.3.10",
+  "version": "0.3.15",
   "description": "Project Manager — 侧边栏实时进度看板（DSH 双面插件）：项目进度树 + 百分比与未完成计数、关注/门控/交接、回滚点与审查。",
   "type": "module",
   "main": "lib/index.js",
@@ -40,7 +40,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "typecheck": "pnpm run typecheck:client",
+    "typecheck:client": "node --max-old-space-size=3072 node_modules/typescript/bin/tsc -p tsconfig.client.json --noEmit",
+    "typecheck:host": "node --max-old-space-size=4096 node_modules/typescript/bin/tsc -p tsconfig.host.json --noEmit",
     "syntax": "node scripts/verify-source-syntax.mjs",
     "bundle": "tsdown && node scripts/wrap-client-bundle.mjs && node scripts/verify-artifacts.mjs",
     "build": "pnpm run syntax && pnpm run bundle && pnpm run typecheck",

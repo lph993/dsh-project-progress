@@ -82,6 +82,21 @@ export function pmUserMessage(text: string): ReturnType<typeof createUserMessage
   }
   return createUserMessage({
     content: [{ type: 'text', text }],
-    source: { kind: PM_PRODUCER_KIND },
+    /**
+     * ⚠️ **这里必须断言**（0.3.13 由类型检查抓出：TS2322）。
+     *
+     * `@deepseek-ai/dsh-llm` 的 `MessageSource` 取自 `MessageSourceMap`
+     * （只有 `user` / `model` / `tool` / `system-prompt` 四个内置条目），
+     * 而它自己的文档写着这张表是 **merge-extensible**（"switch on `kind` and fall through unknowns"）——
+     * 运行期**确实**接受生产者自有的非空 kind（v4 准入只拒绝已退役的 `"plugin"`），
+     * 我们这条链路的正确性也由上面的 `isAdmissibleSourceKind` 自证 + `tests/shared/message.test.ts` 钉住。
+     * 缺的只是**类型表没登记我们的 kind**，所以断言收在这一处（不散到四个调用点）。
+     *
+     * 为什么不用 declaration merging 去扩 `MessageSourceMap`：那会全局影响宿主与其它插件
+     * 对这张表的理解（它们可能按"只有四种"穷举分支），代价远大于这里一次收口断言。
+     */
+    source: { kind: PM_PRODUCER_KIND } as unknown as ReturnType<
+      typeof createUserMessage
+    >['source'],
   });
 }

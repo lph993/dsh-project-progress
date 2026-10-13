@@ -49,6 +49,7 @@ import {
   type WorkspacePick,
 } from './workspace-select.ts';
 import { WorkspaceSwitcher } from './workspace-switcher.tsx';
+import { livenessArgsOf } from './board-liveness.ts';
 import {
   browserScopeStore,
   readRememberedScope,
@@ -164,14 +165,29 @@ class CanvasBoundary extends React.Component<
  * 这里仍然调用一个 Hook（`useState`），是为了让 Hook 调用**次数**在
  * "标准源出现/消失"时保持一致——渲染器缓存了 standard kit，
  * 正常不会变，但保持次数稳定能避免潜在的 Hook 顺序问题。
+ *
+ * ## ⚠️ 参数形状必须与真 Hook 的 selector 一致（0.3.13 由类型检查抓出）
+ *
+ * 原先这里写的是 `(state: { current?: string }) => T` —— 那是**更早一版**的猜测形状
+ * （当时以为快照里有 `current`，而实际上 `SessionListState` 根本没有它）。
+ * 于是 `props.useSessions ?? useAbsentSessions` 求值出的联合类型与真 selector 不兼容，
+ * 调用点访问 `state.ids` 直接报 TS2339。**类型检查红了很久没人发现，因为
+ * `node --test` 只 strip 类型、不做类型检查。**
  */
-export function useAbsentSessions<T>(_selector: (state: { current?: string }) => T): T | undefined {
+export function useAbsentSessions<T>(
+  _selector: (state: {
+    ids?: readonly string[];
+    byId?: Readonly<Record<string, SessionRowLike | undefined>>;
+  }) => T,
+): T | undefined {
   useState(undefined);
   return undefined;
 }
 
-/** `useWorkspaces` 缺失时的替身（同上：保持 Hook 次数稳定）。 */
-export function useAbsentWorkspaces<T>(_selector: (state: { items?: readonly unknown[] }) => T): T | undefined {
+/** `useWorkspaces` 缺失时的替身（同上：保持 Hook 次数稳定、形状与真 Hook 一致）。 */
+export function useAbsentWorkspaces<T>(
+  _selector: (state: { items?: readonly unknown[] }) => T,
+): T | undefined {
   useState(undefined);
   return undefined;
 }
@@ -554,12 +570,18 @@ export function BoardPanel(props: BoardPanelProps): React.ReactElement {
   );
 
   /**
-   * `useSessions` 只用来取"当前会话 id"的**补充**信息：这个钩子真正给的是会话列表
-   * （`ids` / `byId` / `phase`），并不带当前选中项。真选中的那个由保留计数决定
-   * （`activeSessionId`），拿不到时就交给 `sessionId` 兜底。
+   * 这里**刻意不再调 `useSessions` 取"当前会话"**（0.3.13 清掉一处死代码 + 一处类型错误）。
+   *
+   * 原先写的是 `useSessions((state: { current?: string }) => state.current)` —— 但
+   * `SessionListState` 快照里**根本没有 `current` 字段**（0.3.5 那次"看板看错工作区"的
+   * 根因就是它恒为 `undefined`）。于是这行：
+   * - 运行期永远拿不到值，纯属噪声；
+   * - 类型上还报 TS2345（参数形状与真 selector 不兼容）——**类型检查红了很久没人发现**，
+   *   因为 `node --test` 只 strip 类型、不做类型检查。
+   *
+   * 当前会话 id 由 `activeSessionId`（保留计数那条链）给出，就够了。
    */
-  const sessionId = useSessions((state: { current?: string }) => state.current);
-  const scopeSessionId = activeSessionId ?? sessionId;
+  const scopeSessionId = activeSessionId;
   /**
    * **把"作用域是怎么定的"报给宿主**（0.3.2）。
    *
@@ -2043,13 +2065,19 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                     onSelect: selectNode,
                     hideDone,
                     /**
-                     * **逐节点**判"在跑"：节点归哪个会话（`node.lastSessionId`）在忙列表里 ⇒ 转圈、入边流动。
+                     * **逐节点**判"在跑"，两个信号都来自宿主（同源）：
+                     * - `activeNodeIds`：这一轮真的被忙碌会话动过的节点（**首选**，事实）；
+                     * - `busySessionIds`：哪些会话在忙（兜底判据要用它）。
                      *
                      * 早先传的是一个布尔 `sessionBusy = 本会话在忙`，等于"**整棵树**在跑" ——
                      * 用户实测："全在转，但是没有会话在跑吧""线路全部都有了动画，而不是正在跑的"。
-                     * 现在把**忙会话列表**给下去，由 `isLiveNode` 逐节点求交。
                      */
-                    busySessionIds: board.busySessionIds ?? [],
+                    /**
+                     * ⚠️ **不要在这里自己拆字段**：`undefined`（旧宿主，走窗口兜底）与 `[]`
+                     * （宿主报了"这轮没动过节点"）语义相反，随手 `?? []` 会让**旧宿主永远不转圈**。
+                     * 统一走 `livenessArgsOf`（有测试钉住这个区分）。
+                     */
+                    ...livenessArgsOf(board),
                     /**
                      * **拖拽改父**（用户诉求："移到…/拖拽改父"）：落点确定后调 `set-parent`。
                      *

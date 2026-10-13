@@ -645,7 +645,13 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           '每一项等价于一次 pm_progress，finish=true 则等价于 pm_finish（done 且 progress=1）；' +
           '**每一项也可以带 `refs`（批量补归属）与 `note`（还差什么）**——' +
           '建树时忘了带 refs 就靠它补，不必再逐节点调 pm_progress；' +
-          '逐项独立判定，某一项失败不影响其它项，结果逐项返回。最多 50 项。',
+          '逐项独立判定，某一项失败不影响其它项，结果逐项返回。最多 50 项。' +
+          '\n\n' +
+          '⚠️ **控制单次调用的体量：整个参数建议 2000 字符以内，别超过 4000**。' +
+          '大段文本（`note` / `evidence` / `reason`）会把整串 JSON 拉得很长，而长 JSON 在流式传输里' +
+          '**更容易拼坏** —— 真机事故：一次 `pm_report` 的参数被拆成 366 个片段，宿主拼出的 JSON 非法，' +
+          '以 `MALFORMED_RESPONSE` **中断整个回合**（那一轮工作全丢，且插件什么都没收到）。' +
+          '所以节点多、说明长时**分几次调**（每次几项、说明写短），不要一次把所有话说完。',
         parameters: {
           updates: {
             type: 'array',
@@ -694,6 +700,29 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
         async execute(args, exec) {
           const sessionId = withRoot(exec);
           const caller = callerOf(exec);
+          /**
+           * **体量闸门**（0.3.15）：把一个"宿主会直接中断整轮"的故障，降级成一条可执行的提示。
+           *
+           * 真机事故：一次 `pm_report` 的参数被拆成 **366 个流式片段**，宿主拼出来的 JSON 非法，
+           * 以 `MALFORMED_RESPONSE` **中断整个回合** —— 那一轮的工作全丢，而插件**什么都没收到**
+           * （所以这道校验在真机上其实没机会跑；它挡的是"参数勉强拼对了、但已经贴着危险线"的情况，
+           * 同时把"为什么该分几次调"直接说给模型听）。
+           *
+           * 阈值取 4000：真机那次拼出来是 669 字符就已经坏了，说明"坏"取决于分片方式而不只是长度，
+           * 所以这个数是**保守的护栏，不是安全线** —— 描述里给的 2000 才是建议值。
+           */
+          const size = JSON.stringify(args).length;
+          if (size > 4000) {
+            return {
+              status: 'denied',
+              reason: 'validation',
+              code: 'E_REPORT_TOO_LARGE',
+              message:
+                `这次 pm_report 的参数有 ${size} 字符，超过 4000 的安全线，已拒绝执行。` +
+                '长 JSON 在流式传输里容易拼坏，一旦拼坏宿主会以 MALFORMED_RESPONSE 中断整个回合' +
+                '（那一轮的工作全丢）。请**拆成几次调用**：每次几项、note/evidence 写短。',
+            } as unknown as JsonValue;
+          }
           const result = await service.reportBatch({
             updates: args.updates,
             ...(args.reason !== undefined ? { reason: args.reason } : {}),

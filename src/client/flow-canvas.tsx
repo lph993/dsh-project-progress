@@ -22,6 +22,7 @@ import type { NodeView } from './contract.ts';
 import { DERIVED_STATE_COLOR, nodeRowLabel, nodeRowTitle, type PanelNodeAction } from './api.ts';
 import { nodeCountLabel } from './labels.ts';
 import { isLiveNode } from './liveness.ts';
+import { liveNodeIdsOf } from './board-liveness.ts';
 import {
   FLOW_NODE_HEIGHT,
   FLOW_NODE_WIDTH,
@@ -204,11 +205,19 @@ export interface FlowCanvasProps {
    * 判据是**逐节点**的：节点归哪个会话（`node.lastSessionId`）就去这个列表里找它 ——
    * 命中才画 ◌ 转圈、它的入边才流动；否则一律 ▶ 静态播放三角。
    *
-   * 用户三次口径的最终结论（详见 `client/liveness.ts` 的注释）：
-   * ①"没会话在跑就别 loading" → ②"正在会话的要切到 loading" → ③"**全在转，但没有会话在跑吧**"。
-   * 第 ③ 条针对的正是"拿'某个会话在忙'当全树在忙"。
+   * 用户四次口径的最终结论（详见 `client/liveness.ts` 的注释）：
+   * ①"没会话在跑就别 loading" → ②"正在会话的要切到 loading" → ③"**全在转，但没有会话在跑吧**"
+   * → ④"**该转的没转**"。所以现在**首选 `activeNodeIds`**（宿主报的"这轮真动过的节点"），
+   * 本字段退成兜底判据的一部分。
    */
   busySessionIds?: readonly string[] | undefined;
+  /**
+   * **这轮真的被忙碌会话动过的节点**（宿主报的事实，见 `board.activeNodeIds`）。
+   *
+   * 有它就不再看时间戳：`updatedAt` 只在插件工具写节点时刷新，而干活途中节点时间戳
+   * 本来就是旧的 —— 用"多少秒算刚动过"去猜，宽了误报、紧了漏报，两头都踩过。
+   */
+  activeNodeIds?: readonly string[] | undefined;
   /**
    * **拖拽改父**（用户诉求："移到…/拖拽改父"）：把 `nodeId` 挂到 `newParentId` 下。
    *
@@ -589,7 +598,7 @@ function subtreeIdsOf(nodes: readonly NodeView[], rootId: string): Set<string> {
 }
 
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
-  const { nodes, selectedId, onSelect, busySessionIds } = props;
+  const { nodes, selectedId, onSelect, busySessionIds, activeNodeIds } = props;
   // 折叠状态按项目持久化：键变了（切换工作区）就换成那一棵树的折叠集合
   const [collapseKey, setCollapseKey] = useState(() => collapseStorageKey(props.projectId));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => readCollapsed(collapseKey));
@@ -909,9 +918,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
    * 而 `derivedState` 不会因会话停下而回落 ⇒ "已启动但没人跑"的节点画着 ▶、线却在流动，
    * 两边自相矛盾（用户口径："播放三角的连线不应该流动"）。
    */
-  const liveNodeIds = new Set(
-    nodes.filter((node) => isLiveNode(node, busySessionIds ?? [])).map((node) => node.id),
-  );
+  const liveNodeIds = liveNodeIdsOf(nodes, { busySessionIds, activeNodeIds }, isLiveNode);
 
   const onPointerDown = (event: React.PointerEvent<SVGSVGElement>): void => {
     if (event.button !== 0) return;
@@ -1533,6 +1540,8 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               onPick={selectUnlessDragged}
               /* 会话正在忙 ⇒ 进行中的节点一律画转圈（不再因"这一会儿没写节点"退化成播放三角） */
               busySessionIds={busySessionIds ?? []}
+              /* 宿主报的"这轮动过哪些节点"（undefined = 旧宿主 ⇒ 走窗口兜底，不能压成 []） */
+              activeNodeIds={activeNodeIds}
               onOpenMenu={openMenu}
               onToggleFold={(shiftKey: boolean) => toggleFold(placed.node.id, shiftKey)}
               onHover={showHover}
@@ -2146,6 +2155,8 @@ interface FlowNodeProps {
    */
   /** 正在忙的会话 id 列表（逐节点判定：命中才转圈）。见 `client/liveness.ts`。 */
   busySessionIds?: readonly string[] | undefined;
+  /** 宿主报的"这轮真被忙碌会话动过的节点"（首选判据）。 */
+  activeNodeIds?: readonly string[] | undefined;
   /** 右键 → 面板菜单（未提供时不响应右键）。 */
   onOpenMenu: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
   /** 折叠/展开（`shiftKey` = 逐层折 / 全展开）。 */
@@ -2239,7 +2250,7 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
    * （用户当场反馈："你现在在跑，项目进度流程图里我没看到一个 loading"）。
    * 现在改成"**有人在动它**就转圈"：`live && 未完成`，与它自己的 `derivedState` 无关。
    */
-  const live = isLiveNode(node, props.busySessionIds ?? []);
+  const live = isLiveNode(node, props.busySessionIds ?? [], props.activeNodeIds);
   const running = node.derivedState === 'running';
   const finished = node.derivedState === 'done' || node.derivedState === 'removed';
   const showSpinner = live && !finished;

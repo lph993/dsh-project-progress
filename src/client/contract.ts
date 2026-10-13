@@ -143,10 +143,20 @@ export interface BoardSnapshot {
   /**
    * 正在真干活的会话 id（宿主 `agent/status: running` 记账，见 `service.noteSessionActivity`）。
    *
-   * 客户端拿它跟自己的会话 id 对一下，就知道"这个面板对应的会话是不是正在跑"——
-   * 进行中的图标据此在**会话真的在跑**时转圈，而不是只靠节点 `updatedAt` 的 90s 窗口去猜。
+   * 客户端拿它跟自己的会话 id 对一下，就知道"这个面板对应的会话是不是正在跑"。
    */
   busySessionIds?: string[];
+  /**
+   * **这轮真的被忙碌会话动过的节点**（0.3.11）。
+   *
+   * 这是"该不该转圈"的首选依据：`busySessionIds` 只说明"有会话在忙"，
+   * 说明不了"它在动哪个节点"；而"节点最近多少秒被写过"这种窗口两头都错过
+   * （宽了把 32 小时前的旧节点转起来、紧了把干活途中的节点掐掉）。
+   * 宿主在写路径（`patchNode`）收口记账，报的是事实。
+   *
+   * 旧宿主不报这个字段 ⇒ 客户端退化成"会话在忙 + `updatedAt` 窗口"的兜底判据。
+   */
+  activeNodeIds?: string[];
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
   /** 最近一次外部改动（R4/R6）；无则为 null。 */
