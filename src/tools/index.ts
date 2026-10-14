@@ -76,6 +76,32 @@ function renderResult(result: ApplyResult): string {
 }
 
 /**
+ * **宽容地把模型给的值读成数字**（0.3.18）。
+ *
+ * ## 为什么要它（有实测证据，不是防御性编程）
+ *
+ * 真机事故取证：一次工具调用的参数被拆成 531 个流式片断，拼出来的 JSON 里
+ * `"progress": "0.3"` —— **数字被写成了带引号的字符串**，于是整串 JSON 非法，
+ * 宿主以 `MALFORMED_RESPONSE` **中断整个回合**（那一轮工作全丢，插件连调用都收不到）。
+ *
+ * 这一类的形态在插件侧**是可以兜住的**：schema 里 `progress` 声明为 number，
+ * 而 `"0.3"` 语义上就是 0.3。宽容一次，比让用户丢掉一整轮强得多。
+ *
+ * ## 边界（不许变成"什么都收"）
+ *
+ * 只接受**能读成有限数**的字符串/数字；`''`、`'跑了一半'`、`NaN`、`Infinity` 一律
+ * 返回 `undefined`（调用方据此当作"没给"），**绝不猜**。
+ */
+function numberOf(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed === '') return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
  * 注册全部 `pm_*` 工具。
  *
  * @returns 卸载函数（逐个工具的 disposer 组合）
@@ -533,21 +559,21 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
             if (refsResult.status !== 'ok') return refsResult as unknown as JsonValue;
           }
           if (
-            args.progress === undefined &&
+            numberOf(args.progress) === undefined &&
             args.selfState === undefined &&
             args.note === undefined &&
-            args.priority === undefined
+            numberOf(args.priority) === undefined
           ) {
             // 只改 refs：把那次写入的结果原样返回
             return (refsResult ?? { status: 'denied', reason: 'validation', code: 'E_NOTHING_TO_DO', message: '既没有 progress/selfState/note/priority，也没有 refs' }) as unknown as JsonValue;
           }
           const result = await service.progress({
             nodeId: args.nodeId,
-            ...(args.progress !== undefined ? { progress: args.progress } : {}),
+            ...(numberOf(args.progress) !== undefined ? { progress: numberOf(args.progress) } : {}),
             ...(args.selfState !== undefined ? { selfState: args.selfState as SelfState } : {}),
             ...(args.note !== undefined ? { note: args.note } : {}),
-            ...(args.priority !== undefined ? { priority: args.priority } : {}),
-            ...(args.rev !== undefined ? { rev: args.rev } : {}),
+            ...(numberOf(args.priority) !== undefined ? { priority: numberOf(args.priority) } : {}),
+            ...(numberOf(args.rev) !== undefined ? { rev: numberOf(args.rev) } : {}),
             ...(args.force !== undefined ? { force: args.force } : {}),
             ...(args.reason !== undefined ? { reason: args.reason } : {}),
             ...(caller.by !== 'user' ? { by: caller.by } : {}),
@@ -624,7 +650,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           }
           const result = await service.finish({
             nodeId: args.nodeId,
-            ...(args.rev !== undefined ? { rev: args.rev } : {}),
+            ...(numberOf(args.rev) !== undefined ? { rev: numberOf(args.rev) } : {}),
             ...(args.evidence !== undefined ? { evidence: args.evidence } : {}),
             ...(caller.by !== 'user' ? { by: caller.by } : {}),
             ...(caller.actorId !== undefined ? { actorId: caller.actorId } : {}),
@@ -647,11 +673,10 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           '建树时忘了带 refs 就靠它补，不必再逐节点调 pm_progress；' +
           '逐项独立判定，某一项失败不影响其它项，结果逐项返回。最多 50 项。' +
           '\n\n' +
-          '⚠️ **控制单次调用的体量：整个参数建议 2000 字符以内，别超过 4000**。' +
-          '大段文本（`note` / `evidence` / `reason`）会把整串 JSON 拉得很长，而长 JSON 在流式传输里' +
-          '**更容易拼坏** —— 真机事故：一次 `pm_report` 的参数被拆成 366 个片段，宿主拼出的 JSON 非法，' +
-          '以 `MALFORMED_RESPONSE` **中断整个回合**（那一轮工作全丢，且插件什么都没收到）。' +
-          '所以节点多、说明长时**分几次调**（每次几项、说明写短），不要一次把所有话说完。',
+          '（注：宿主侧有个**偶发**故障 —— 工具参数的流式片断偶尔拼不成合法 JSON，' +
+          '宿主会以 `MALFORMED_RESPONSE` 中断整个回合。**实测与参数长短无关**：' +
+          '419 次成功调用的长度跨度到 4097 字符，而出问题的三次只有 669/808/980 字符，' +
+          '正处在成功区间的中段。所以**不必为了躲它而写短**；该故障属宿主/上游，插件无法预防。）',
         parameters: {
           updates: {
             type: 'array',
@@ -701,15 +726,18 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           const sessionId = withRoot(exec);
           const caller = callerOf(exec);
           /**
-           * **体量闸门**（0.3.15）：把一个"宿主会直接中断整轮"的故障，降级成一条可执行的提示。
+           * **体量护栏**（0.3.15 加，0.3.18 更正了它的说法）。
            *
-           * 真机事故：一次 `pm_report` 的参数被拆成 **366 个流式片段**，宿主拼出来的 JSON 非法，
-           * 以 `MALFORMED_RESPONSE` **中断整个回合** —— 那一轮的工作全丢，而插件**什么都没收到**
-           * （所以这道校验在真机上其实没机会跑；它挡的是"参数勉强拼对了、但已经贴着危险线"的情况，
-           * 同时把"为什么该分几次调"直接说给模型听）。
+           * ## 它挡的不是真机那个故障（别把它当成"已缓解"）
            *
-           * 阈值取 4000：真机那次拼出来是 669 字符就已经坏了，说明"坏"取决于分片方式而不只是长度，
-           * 所以这个数是**保守的护栏，不是安全线** —— 描述里给的 2000 才是建议值。
+           * 三次真机事故实测的参数规模：**669 / 808 / 980 字符** —— 全部远低于这道 4000 的线，
+           * 全都坏在宿主拼装那一步。也就是说：**长度不是预测因子**，
+           * 这道护栏**没有挡住任何一次真实事故**。
+           *
+           * 它真正的作用只有一个：**在描述里把"别把大段文本塞进参数"说给模型听**，
+           * 并挡住"参数大到荒谬"的极端调用。**不要**把它当成对 `MALFORMED_RESPONSE` 的缓解。
+           *
+           * 真机事故的完整证据与定性见 CHANGELOG 的 0.3.18 一节（属宿主/上游侧，插件无法修）。
            */
           const size = JSON.stringify(args).length;
           if (size > 4000) {
@@ -718,9 +746,8 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
               reason: 'validation',
               code: 'E_REPORT_TOO_LARGE',
               message:
-                `这次 pm_report 的参数有 ${size} 字符，超过 4000 的安全线，已拒绝执行。` +
-                '长 JSON 在流式传输里容易拼坏，一旦拼坏宿主会以 MALFORMED_RESPONSE 中断整个回合' +
-                '（那一轮的工作全丢）。请**拆成几次调用**：每次几项、note/evidence 写短。',
+                `这次 pm_report 的参数有 ${size} 字符，超过 4000 的护栏，已拒绝执行。` +
+                '请拆成几次调用：每次几项、note/evidence 写短。',
             } as unknown as JsonValue;
           }
           const result = await service.reportBatch({
@@ -763,7 +790,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           const result = await service.setFocus({
             nodeId: args.nodeId,
             focus: args.focus,
-            ...(args.structRev !== undefined ? { structRev: args.structRev } : {}),
+            ...(numberOf(args.structRev) !== undefined ? { structRev: numberOf(args.structRev) } : {}),
             ...(sessionId !== undefined ? { sessionId } : {}),
           });
           return result as unknown as JsonValue;
@@ -1036,7 +1063,7 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           const result = await service.removeBranch({
             nodeIds: Array.isArray(args.nodeIds) ? (args.nodeIds as string[]) : [],
             policy: (args.policy as 'record' | 'code' | 'comment' | undefined) ?? 'record',
-            ...(args.rev !== undefined ? { rev: args.rev } : {}),
+            ...(numberOf(args.rev) !== undefined ? { rev: numberOf(args.rev) } : {}),
             ...(args.confirmToken !== undefined ? { confirmToken: args.confirmToken } : {}),
             ...(sessionId !== undefined ? { sessionId } : {}),
             toolName: 'pm_remove',

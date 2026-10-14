@@ -440,6 +440,15 @@ export interface NodeView {
  * 超过这个时长没有新信号就视为失联，退回按节点 `updatedAt` 判断。
  */
 const BUSY_SESSION_TTL_MS = 5 * 60_000;
+
+/**
+ * "上一轮动过的节点"每个会话最多记多少个（0.3.17）。
+ *
+ * 只用来在图上点几处（"它上次在弄的"），**不需要**装下一整轮的全部节点 ——
+ * 一个建树回合可能写几十上百个节点，全留着既占内存、也会把整张图点亮，
+ * 反而看不出"它在弄哪块"。
+ */
+const MAX_LAST_TURN_NODES = 40;
 interface PendingRemoval {
   confirmToken: string;
   policy: 'record' | 'code' | 'comment';
@@ -487,6 +496,15 @@ export interface BoardSnapshot {
    * 紧了把干活途中还没补记的节点掐掉）。宿主手上有**事实**，就报事实。
    */
   activeNodeIds: string[];
+  /**
+   * **忙会话"上一轮"动过的节点**（0.3.17，用户口径："标出有会话在跑 + 上一轮的节点"）。
+   *
+   * 与 `activeNodeIds` 的区别正是这次要表达的东西：一个会话正在读代码/跑命令时，
+   * **这一轮**还没写过任何节点（`pm_*` 是收尾时才调的），但**上一轮**弄过哪些节点是已知的。
+   * 客户端用**另一种视觉**标它们（"它在跑，上次弄的是这几个"），
+   * 而不是把它们混进"正在动" —— 那是谎称。
+   */
+  lastTurnNodeIds: string[];
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
   /** 最近一次外部改动（R4/R6）；无则为 null。 */
@@ -766,6 +784,17 @@ export class ProjectService {
       nodeIds: Map<string, number>;
     }
   >();
+
+  /**
+   * **每个会话"上一轮"动过的节点**（0.3.17）。
+   *
+   * 回答的是"这个会话在弄哪块"，用于图上的第二种标记（虚线/浅色"它上次在弄的"）——
+   * 与 `activeNodeIds`（"**这轮**真的在动的"）刻意分开：一个会话正在跑、这一轮还没写节点时，
+   * 前者有内容而后者为空，图上就能说"它在跑，上次弄的是这几个"，**不必**谎称正在动它们。
+   *
+   * 上限 `MAX_LAST_TURN_NODES`：只用来点几处，不需要装下一整轮的全部节点。
+   */
+  private readonly lastTurnNodeIds = new Map<string, string[]>();
 
   /** 边界修正的累计统计（诊断页/设置页显示"这一层到底有没有在干活"）。 */
   private readonly boundaryStats = {
@@ -7687,6 +7716,19 @@ export class ProjectService {
       return;
     }
     if (status === 'idle') {
+      /**
+       * **回合结束：把这一轮动过的节点留成"上一轮"**（0.3.17，用户口径：
+       * "标出有会话在跑 + 上一轮的节点"）。
+       *
+       * 为什么不能直接删：图表要能回答"这个会话**在弄哪块**"。而 `pm_*` 只在**收尾**时
+       * 才写节点 —— 一个正在读代码/跑命令的长回合里，"本轮动过的节点"必然是空的，
+       * 图上就一片静止（用户："COP 正在跑，流程图没有正确反馈"）。
+       * 留住上一轮的清单，图就能说"它上一轮弄的是这几个"，而**不必**谎称"正在动它们"。
+       */
+      const entry = this.busySessions.get(sessionId);
+      if (entry !== undefined && entry.nodeIds.size > 0) {
+        this.lastTurnNodeIds.set(sessionId, [...entry.nodeIds.keys()].slice(0, MAX_LAST_TURN_NODES));
+      }
       // 回合结束 = 这一刻没在跑；不进 `busySessions` 即可（保留旧值会让它一直"忙"）
       this.busySessions.delete(sessionId);
     }
@@ -7695,22 +7737,74 @@ export class ProjectService {
   /**
    * 记账：**这个会话这一轮动过这个节点**（由写路径在真正落盘后调用）。
    *
-   * **只认已经在记的会话**（`agent/status: running` 报过的那种）：
+   * ## 闸门：只认"确实在忙"的会话
+   *
    * 没在忙的会话动过节点是**常态**（面板操作、收尾补记、AI 建树都可能来自已经歇下的会话），
-   * 那些节点**不该**被报成"正在跑"。所以这里不新建条目 ——
-   * 否则"会话忙闲"这道闸门就被绕过去了（e2e 实测：一个从未 running 过的会话写一个节点，
-   * 就能让它进 `activeNodeIds`）。
+   * 那些节点**不该**被报成"正在跑"（0.3.13 的 e2e 钉过：一个从未 running 的会话写一个节点，
+   * 不能因此进 `activeNodeIds`）。
+   *
+   * ## ⚠️ 但"查不到记账"不等于"不在忙"（0.3.16 真机事故）
+   *
+   * 真机现场：宿主**重启把内存记账清零**，而正在跑的会话是在重启**之前**开始跑的 ——
+   * 它不会再收到一次 `agent/status: running`，于是这里 `entry === undefined` 直接 return，
+   * **它的每一次写入都被静默丢弃** ⇒ `activeNodeIds` 恒为空 ⇒ 面板一个 loading 都没有
+   * （用户："COP 正在跑，流程图没有正确反馈"）。
+   *
+   * 所以补一步**惰性认领**：查不到记账时，向 agent 的实时状态问一次
+   * （`sessionStatusOf` 是 pull 语义、不依赖事件送达）；确实在 running 就当场建账并记上。
+   * 事件路径仍是首选（它不需要额外查表）。
    */
   noteNodeTouched(sessionId: string | undefined, nodeId: string): void {
     if (sessionId === undefined || sessionId === '' || nodeId === '') return;
-    const entry = this.busySessions.get(sessionId);
-    if (entry === undefined) return;
+    let entry = this.busySessions.get(sessionId);
+    if (entry === undefined) {
+      if (this.sessionStatusOf(sessionId) !== 'running') return;
+      entry = { at: this.deps.clock.now(), nodeIds: new Map<string, number>() };
+      this.busySessions.set(sessionId, entry);
+    }
     /**
      * ⚠️ **刻意不刷新 `entry.at`**（0.3.13 审查的 M2）：`at` 是"会话在忙"的信号新鲜度，
      * 只有 `agent/status: running` 该刷新它。若写入路径也刷，一个"agent 已经不在跑、
      * 但仍在写节点"的会话就永远不会因 TTL 过期 —— TTL 本来是为"漏收 idle 事件"兜底的。
      */
     entry.nodeIds.set(nodeId, Date.now());
+  }
+
+  /**
+   * **活跃记账的内部状态**（诊断用，只读；0.3.16 新增）。
+   *
+   * 排查"流程图没有正确反馈"时必须能一眼区分：
+   * - 会话确实没写过节点（`nodeCount: 0` 且有账）；
+   * - 写了但记账被丢弃（**根本没有账**）—— 0.3.16 修的就是这条路径。
+   */
+  livenessDebugState(): {
+    sessions: Array<{ sessionId: string; at: string; ageMs: number; nodeCount: number; newestNodeAgeMs: number | null }>;
+    busyFromEvents: string[];
+  } {
+    const now = Date.now();
+    const sessions: Array<{
+      sessionId: string;
+      at: string;
+      ageMs: number;
+      nodeCount: number;
+      newestNodeAgeMs: number | null;
+    }> = [];
+    for (const [sessionId, entry] of this.busySessions) {
+      const stamps = [...entry.nodeIds.values()];
+      const newest = stamps.length === 0 ? null : Math.max(...stamps);
+      sessions.push({
+        sessionId,
+        at: entry.at,
+        ageMs: Number.isFinite(Date.parse(entry.at)) ? now - Date.parse(entry.at) : -1,
+        nodeCount: entry.nodeIds.size,
+        newestNodeAgeMs: newest === null ? null : now - newest,
+      });
+    }
+    return {
+      sessions,
+      /** 事件路径记下的会话 id（有账的那些）；**缺账的忙会话**就是本轮要查的对象。 */
+      busyFromEvents: [...this.busySessions.keys()],
+    };
   }
 
   /**
@@ -7758,6 +7852,7 @@ export class ProjectService {
     }
     // 只报**正在忙的**会话动过的节点（会话停下后它的节点不该再转圈）
     const active = new Set<string>();
+    const lastTurn = new Set<string>();
     /**
      * 每个节点的"被动过"时刻也要够新 —— 防的是 M4：兜底段会把"agent status 仍报 running"
      * 的会话算作忙，若那条 status 卡住，几小时前写的一整份节点清单会被**重新报成 active**，
@@ -7767,8 +7862,12 @@ export class ProjectService {
       for (const [nodeId, touchedAt] of this.busySessions.get(id)?.nodeIds ?? []) {
         if (Number.isFinite(now) && now - touchedAt <= BUSY_SESSION_TTL_MS) active.add(nodeId);
       }
+      // "上一轮"清单：只对这些**当前正在跑**的会话有意义（它停下了就不该再标）
+      for (const nodeId of this.lastTurnNodeIds.get(id) ?? []) {
+        if (!active.has(nodeId)) lastTurn.add(nodeId);
+      }
     }
-    return { busySessionIds: busy, activeNodeIds: [...active] };
+    return { busySessionIds: busy, activeNodeIds: [...active], lastTurnNodeIds: [...lastTurn] };
   }
 
   /** 待确认删除的发起方（取不到会话 id 就如实记 `session:unknown`，不猜）。 */

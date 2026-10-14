@@ -22,7 +22,7 @@ import type { NodeView } from './contract.ts';
 import { DERIVED_STATE_COLOR, nodeRowLabel, nodeRowTitle, type PanelNodeAction } from './api.ts';
 import { nodeCountLabel } from './labels.ts';
 import { isLiveNode } from './liveness.ts';
-import { liveNodeIdsOf } from './board-liveness.ts';
+import { isLastTurnNode, liveNodeIdsOf } from './board-liveness.ts';
 import {
   FLOW_NODE_HEIGHT,
   FLOW_NODE_WIDTH,
@@ -219,6 +219,12 @@ export interface FlowCanvasProps {
    */
   activeNodeIds?: readonly string[] | undefined;
   /**
+   * **忙会话上一轮动过的节点**（0.3.17；见 board.lastTurnNodeIds）。
+   *
+   * 与 activeNodeIds 刻意分开：那是'这轮真在动'，这是'它在跑、上次弄的'。
+   */
+  lastTurnNodeIds?: readonly string[] | undefined;
+  /**
    * **拖拽改父**（用户诉求："移到…/拖拽改父"）：把 `nodeId` 挂到 `newParentId` 下。
    *
    * 不提供时画布不做任何节点拖拽（退回"按在节点上也能平移"的老行为）。
@@ -374,6 +380,32 @@ function StatePlayIcon(props: { x: number; y: number; color: string }): React.Re
     <g transform={`translate(${props.x} ${props.y})`}>
       <rect x={-4.6} y={-5} width={1.6} height={10} rx={0.8} fill={props.color} />
       <path d="M -1.4 -5 L 4.6 0 L -1.4 5 Z" fill={props.color} />
+    </g>
+  );
+}
+
+/**
+ * **"上一轮动过它"的图标**（0.3.17）—— 虚线圈，刻意与转圈 ◌ 和静态 ▶ 都不同。
+ *
+ * 它要表达的第三件事："这个会话**正在跑**，而它的手**上次**落在这个节点上。"
+ *
+ * 为什么不复用 ▶ 或 ◌：
+ * - 用 ◌（转圈）＝宣称"正在动这个节点"，那是**谎称**（会话这轮可能一个 `pm_*` 都没调）；
+ * - 用 ▶ ＝和"没有人碰过它"混在一起，等于白加。
+ * 虚线是 SVG 自带的表达"临时的/参考的"，不需要动效、也不会被误读成"在跑"。
+ */
+function StateLastTurnIcon(props: { x: number; y: number; color: string }): React.ReactElement {
+  return (
+    <g transform={`translate(${props.x} ${props.y})`} data-pm-lastturn="1">
+      <circle
+        r={5}
+        fill="none"
+        stroke={props.color}
+        strokeWidth={1.4}
+        strokeDasharray="2.4 2"
+        opacity={0.7}
+      />
+      <path d="M -1.6 -2.6 L 1.8 0 L -1.6 2.6 Z" fill={props.color} opacity={0.75} />
     </g>
   );
 }
@@ -598,7 +630,7 @@ function subtreeIdsOf(nodes: readonly NodeView[], rootId: string): Set<string> {
 }
 
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
-  const { nodes, selectedId, onSelect, busySessionIds, activeNodeIds } = props;
+  const { nodes, selectedId, onSelect, busySessionIds, activeNodeIds, lastTurnNodeIds } = props;
   // 折叠状态按项目持久化：键变了（切换工作区）就换成那一棵树的折叠集合
   const [collapseKey, setCollapseKey] = useState(() => collapseStorageKey(props.projectId));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => readCollapsed(collapseKey));
@@ -1542,6 +1574,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               busySessionIds={busySessionIds ?? []}
               /* 宿主报的"这轮动过哪些节点"（undefined = 旧宿主 ⇒ 走窗口兜底，不能压成 []） */
               activeNodeIds={activeNodeIds}
+              lastTurnNodeIds={lastTurnNodeIds}
               onOpenMenu={openMenu}
               onToggleFold={(shiftKey: boolean) => toggleFold(placed.node.id, shiftKey)}
               onHover={showHover}
@@ -2157,6 +2190,8 @@ interface FlowNodeProps {
   busySessionIds?: readonly string[] | undefined;
   /** 宿主报的"这轮真被忙碌会话动过的节点"（首选判据）。 */
   activeNodeIds?: readonly string[] | undefined;
+  /** 宿主报的"上一轮动过的节点"（0.3.17；虚线圈标记，不转圈、不参与连线流动）。 */
+  lastTurnNodeIds?: readonly string[] | undefined;
   /** 右键 → 面板菜单（未提供时不响应右键）。 */
   onOpenMenu: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
   /** 折叠/展开（`shiftKey` = 逐层折 / 全展开）。 */
@@ -2254,7 +2289,19 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
   const running = node.derivedState === 'running';
   const finished = node.derivedState === 'done' || node.derivedState === 'removed';
   const showSpinner = live && !finished;
-  const showPlayIcon = running && !live;
+  /**
+   * **"上一轮动过它"**（0.3.17，用户口径："标出有会话在跑 + 上一轮的节点"）。
+   *
+   * 为什么要有这第二种标记：`pm_*` 只在**收尾**时才写节点，所以一个正在读代码/跑命令的
+   * 长回合里 `activeNodeIds` 必然是空的 —— 图上就一片静止
+   * （用户："COP 正在跑，流程图没有正确反馈"）。而"它在跑、上一轮弄的是这几个"是**已知事实**。
+   *
+   * 表达的差别必须守住：它**不是**"正在动这个节点"，所以**不转圈**、也**不参与连线流动**
+   * （`liveNodeIds` 不含它）—— 只把图标描边换成虚线，意思是"这个会话的手上次落在这儿"。
+   */
+  const lastTurnTouched =
+    !live && !finished && isLastTurnNode(node, props.lastTurnNodeIds ?? []);
+  const showPlayIcon = running && !live && !lastTurnTouched;
   const allowMotion = motionAllowed();
   /** 收起态要报"藏起来了几个节点"（说实话：报的是整枝隐藏数，不是直接子节点数）。 */
   const hiddenCount = props.hiddenBelow;
@@ -2483,7 +2530,7 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         ② "A 是什么意思" —— `A` 改成 `自`（自动生成），并且每个角标的含义都进悬停提示与看板图例。
       */}
       <text
-        x={showSpinner || showPlayIcon ? nodeWidth - 24 : nodeWidth - 8}
+        x={showSpinner || showPlayIcon || lastTurnTouched ? nodeWidth - 24 : nodeWidth - 8}
         y={14}
         fontSize={10}
         textAnchor="end"
@@ -2511,6 +2558,9 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
         : null}
       {showPlayIcon
         ? React.createElement(StatePlayIcon, { x: nodeWidth - 12, y: 10, color: stateColor })
+        : null}
+      {lastTurnTouched
+        ? React.createElement(StateLastTurnIcon, { x: nodeWidth - 12, y: 10, color: stateColor })
         : null}
       {/**
        * **待审查角标**（FR-164）：画在**左下角**（右上角已经被 ◌/▶ 与状态角标占了），

@@ -19,7 +19,7 @@
  */
 import type { NodeView } from './contract.ts';
 
-/** 活跃判据需要的、与"谁在跑"相关的两个字段（BoardSnapshot 的子集）。 */
+/** 活跃判据需要的、与"谁在跑"相关的三个字段（BoardSnapshot 的子集）。 */
 export interface LivenessBoardFields {
   /** 正在忙的会话（宿主 `agent/status` 记账）。缺省视为"没有会话在忙"。 */
   busySessionIds?: readonly string[] | undefined;
@@ -29,6 +29,27 @@ export interface LivenessBoardFields {
    * ⚠️ **`undefined` 与 `[]` 语义不同**，见本文件顶部说明。
    */
   activeNodeIds?: readonly string[] | undefined;
+  /**
+   * 忙会话**上一轮**动过的节点（0.3.17）。
+   *
+   * 与 `activeNodeIds` 分开是刻意的：会话正在读代码/跑命令时这一轮还没写过节点，
+   * 这个清单是"**它在跑，上次弄的是这几个**"，用另一种视觉标，**不混进"正在动"**。
+   */
+  lastTurnNodeIds?: readonly string[] | undefined;
+}
+
+/**
+ * "上一轮动过"的判定（0.3.17）。
+ *
+ * 纯粹是集合查找 —— 来源是宿主的事实，客户端**不猜**。缺字段/形状不对一律判"不是"：
+ * 这条标记比转圈弱，但也不该在拿不到依据时乱标。
+ */
+export function isLastTurnNode(
+  node: { id?: string | undefined },
+  lastTurnNodeIds: readonly string[] | undefined,
+): boolean {
+  if (node.id === undefined || node.id === '') return false;
+  return (lastTurnNodeIds ?? []).includes(node.id);
 }
 
 /**
@@ -67,24 +88,27 @@ function idsOf(value: unknown): string[] | undefined {
   return Array.isArray(value) ? (value as string[]) : undefined;
 }
 
-/** 喂给 `isLiveNode` 的两个入参。 */
+/** 喂给 `isLiveNode` 的两个入参 + "上一轮"清单。 */
 export interface LivenessArgs {
   /** 只读即可：判据不会改它（写成 `string[]` 会与只读入参不兼容，0.3.13 由类型检查抓出）。 */
   busySessionIds: readonly string[];
   /** `undefined` = 宿主不报（走兜底）；`[]` = 宿主报了但没有。**消费方不得改写它。** */
   activeNodeIds: readonly string[] | undefined;
+  /** 忙会话上一轮动过的节点（0.3.17）。缺省即"没有"：这条标记弱于转圈，少标几个也不会撒谎。 */
+  lastTurnNodeIds: readonly string[];
 }
 
 /**
- * 把看板快照的两个字段翻成判据入参。
+ * 把看板快照的字段翻成判据入参。
  *
- * `busySessionIds` 缺省可以安全地当成 `[]`（"没有会话在忙"和"字段缺失"后果一致 —— 都不转）；
+ * `busySessionIds` / `lastTurnNodeIds` 缺省可以安全地当成 `[]`（"没有"与"字段缺失"后果一致）；
  * `activeNodeIds` **不行**（缺失要走兜底、空数组要一律不转）。
  */
 export function livenessArgsOf(board: LivenessBoardFields | undefined): LivenessArgs {
   return {
     busySessionIds: idsOf(board?.busySessionIds) ?? [],
     activeNodeIds: idsOf(board?.activeNodeIds),
+    lastTurnNodeIds: idsOf(board?.lastTurnNodeIds) ?? [],
   };
 }
 

@@ -798,6 +798,16 @@ async function buildDebugSnapshot(
     },
     client: state.client ?? null,
     capabilities,
+    /**
+     * **活跃记账的内部状态**（0.3.16 新增，为"流程图没有正确反馈"这类问题提供一眼可见的证据）。
+     *
+     * 为什么需要它：这次真机排查里，`busySessionIds` 非空而 `activeNodeIds` 为空，
+     * 但**光看这两个字段无法区分**两种完全不同的原因：
+     * ① 那个会话这一轮确实没写过节点；② 它写了、但记账被丢弃（重启后内存清零那条路径）。
+     * 两者要改的地方完全不同，我却为此翻了两轮会话日志。
+     * 现在把"每个忙会话有账没账、账里几个节点、`at` 多新"直接摆出来，一眼可判。
+     */
+    liveness: service.livenessDebugState(),
     storage: {
       route: service.route,
       projectId: service.currentProjectId,

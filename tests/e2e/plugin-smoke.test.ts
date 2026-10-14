@@ -1086,11 +1086,131 @@ test('活跃节点记账：写过的节点进 activeNodeIds，会话停下立刻
     '这一轮写过的节点必须进 activeNodeIds —— 客户端据此转圈（修"该转的没转"）',
   );
 
-  // ③ 会话停下 ⇒ 两个清单都撤掉（不许残留"正在跑"，那是无依据地宣称在跑）
+  // ③ 会话停下 ⇒ **两个标记都撤掉**（不许残留"正在跑"，也不该再说"它在弄哪块"：
+  //    它已经不跑了。图上"上一轮"标记的前提是**会话正在跑**）
   service.noteSessionActivity(SESSION, 'idle');
   board = await service.board(SESSION, ws);
   assert.equal(board.busySessionIds.includes(SESSION), false);
   assert.equal(board.activeNodeIds.includes(idA), false, '会话停了，它的节点不该再转圈');
+  assert.equal(
+    board.lastTurnNodeIds.includes(idA),
+    false,
+    '会话已经停下了 ⇒ 不该再标"它正在弄的上一轮"（那会变成另一种谎报）',
+  );
+
+  // ④ 会话**再次开工**、但这一轮还没写节点 ⇒ activeNodeIds 空、lastTurnNodeIds 有上一轮那些
+  //    这正是真机现场："COP 正在跑（读代码/跑命令），pm_* 一次都没调"
+  service.noteSessionActivity(SESSION, 'running');
+  board = await service.board(SESSION, ws);
+  assert.equal(board.busySessionIds.includes(SESSION), true, '它确实在跑');
+  assert.equal(board.activeNodeIds.length, 0, '这一轮还没写过 ⇒ 不该有任何节点转圈');
+  assert.equal(
+    board.lastTurnNodeIds.includes(idA),
+    true,
+    '但"它在跑、上一轮弄过它"成立 ⇒ 图上用另一种视觉标出来，不必谎称正在动（0.3.17 的核心）',
+  );
+
+  // ⑤ 一旦这一轮真的写了节点 ⇒ 它以"正在动"的身份出现，并从"上一轮"里去掉（不许同时挂两个身份）
+  await service.progress({ nodeId: idA, progress: 0.9, sessionId: SESSION });
+  board = await service.board(SESSION, ws);
+  assert.equal(board.activeNodeIds.includes(idA), true, '这一轮写过 ⇒ 回到"正在动"');
+  assert.equal(
+    board.lastTurnNodeIds.includes(idA),
+    false,
+    '同一个节点不该同时是"正在动"和"上一轮动过"（两者互斥）',
+  );
+
+  // ⑥ 会话销毁 ⇒ 两个清单都不该再提它
+  service.noteSessionActivity(SESSION, 'disposed');
+  board = await service.board(SESSION, ws);
+  assert.equal(board.busySessionIds.includes(SESSION), false);
+  assert.equal(board.lastTurnNodeIds.includes(idA), false, '会话销毁后不该再标"上一轮"');
+
+  ctx.disposeAll();
+  rmSync(ws, { recursive: true, force: true });
+
+  ctx.disposeAll();
+  rmSync(ws, { recursive: true, force: true });
+});
+
+/**
+ * **惰性认领**：宿主重启后"已经在跑"的会话，写入必须照样记账（0.3.16 真机事故）。
+ *
+ * ## 现场
+ *
+ * 更新插件会让宿主重启，而**内存记账（`busySessions`）是空的**；正在跑的会话是在重启
+ * **之前**开始跑的，不会再收到一次 `agent/status: running`。于是旧代码里
+ * `noteNodeTouched` 的 `entry === undefined ⇒ return` 把它的**每一次写入都静默丢弃**：
+ * `busySessionIds` 非空（靠 agent status 兜底问出来的）、`activeNodeIds` 恒为空
+ * ⇒ 面板一个 loading 都没有（用户："COP 正在跑，流程图没有正确反馈"）。
+ *
+ * 本测试钉住修法：查不到记账时向 agent 的**实时状态**问一次，确实 running 就当场建账。
+ * 同时钉住闸门没被放开：agent 状态是 `idle` 的会话，写了也不许进清单。
+ */
+test('惰性认领：重启后在跑的会话写入仍要记账；idle 的会话不许混进来', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'pm-e2e-lazy-'));
+  const ctx = createFakeContext({
+    workspace: ws,
+    agents: {
+      get: (id: string) =>
+        id === 'session-restarted'
+          ? { status: 'running', session: { header: { cwd: ws } } }
+          : id === 'session-idle-one'
+            ? { status: 'idle', session: { header: { cwd: ws } } }
+            : undefined,
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string }>;
+    board(
+      sessionId?: string,
+      root?: string,
+    ): Promise<{ busySessionIds: string[]; activeNodeIds: string[] }>;
+    livenessDebugState(): { sessions: Array<{ sessionId: string; nodeCount: number }> };
+  };
+
+  service.noteWorkspaceRoot(ws, 'session-restarted');
+  const a = await service.addNode({ parentId: null, name: '甲', sessionId: 'session-restarted' });
+  const idA = a.nodeId as string;
+  service.noteWorkspaceRoot(ws, 'session-idle-one');
+  const b = await service.addNode({ parentId: null, name: '乙', sessionId: 'session-idle-one' });
+  const idB = b.nodeId as string;
+
+  /**
+   * ⚠️ **刻意不发任何 `noteSessionActivity(['session-restarted'], 'running')`** ——
+   * 那正是"重启后没有 running 事件"的现场。写一次就该进清单。
+   */
+  await service.progress({ nodeId: idA, progress: 0.4, sessionId: 'session-restarted' });
+  const board = await service.board('session-restarted', ws);
+
+  assert.equal(
+    board.activeNodeIds.includes(idA),
+    true,
+    'agent 状态是 running 的会话，即使没有 running 事件，写入也必须记进 activeNodeIds',
+  );
+  assert.equal(
+    board.activeNodeIds.includes(idB),
+    false,
+    'agent 状态是 idle 的会话写过的节点**不许**进清单（闸门不能被这次修复放开）',
+  );
+  assert.equal(
+    board.busySessionIds.includes('session-restarted'),
+    true,
+    '惰性认领后它也该出现在忙会话列表里',
+  );
+  // 诊断面能看出"到底有没有账"
+  const debug = service.livenessDebugState().sessions;
+  assert.equal(
+    debug.some((s) => s.sessionId === 'session-restarted' && s.nodeCount >= 1),
+    true,
+    '诊断状态里要能看到这个会话有账',
+  );
 
   ctx.disposeAll();
   rmSync(ws, { recursive: true, force: true });

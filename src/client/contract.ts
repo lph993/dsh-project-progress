@@ -157,6 +157,16 @@ export interface BoardSnapshot {
    * 旧宿主不报这个字段 ⇒ 客户端退化成"会话在忙 + `updatedAt` 窗口"的兜底判据。
    */
   activeNodeIds?: string[];
+  /**
+   * **忙会话"上一轮"动过的节点**（0.3.17，用户口径："标出有会话在跑 + 上一轮的节点"）。
+   *
+   * 与 `activeNodeIds` 的区别是刻意的：一个会话正在读代码/跑命令时，这一轮还没写过任何节点
+   * （`pm_*` 只在收尾时调），于是 `activeNodeIds` 为空、图上静止 ——
+   * 用户口径："COP 正在跑，流程图没有正确反馈"。
+   * 这个清单让图能说"**它在跑，上次弄的是这几个**"，用**另一种视觉**标出来，
+   * 而不是混进"正在动"（那是谎称）。
+   */
+  lastTurnNodeIds?: string[];
   document: { path: string; exists: boolean; legal: boolean; violations: string[] };
   dataFormat: number;
   /** 最近一次外部改动（R4/R6）；无则为 null。 */
