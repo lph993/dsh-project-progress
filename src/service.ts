@@ -151,7 +151,10 @@ import {
   type AiEstimate,
   type SkeletonEntry,
 } from './ai/prompt.ts';
-import { callTreeBuilder, llmStreamOf, type BuildTreeCallInput, type BuildTreeCallResult, type LlmStreamLike } from './ai/tree-builder.ts';
+import { callTreeBuilder, llmStreamOf, readTextDelta, type BuildTreeCallInput, type BuildTreeCallResult, type LlmStreamLike } from './ai/tree-builder.ts';
+import { AI_REPAIR_SYSTEM_PROMPT, buildRepairPrompt, type RepairNodeView } from './ai/repair.ts';
+import { parseRepairPlan, type RepairParseResult } from './ai/repair-parse.ts';
+import { planConsolidation, type ConsolidateNode, type ConsolidatePlan } from './domain/consolidate.ts';
 import { aiRunProgressOf, type AiRunProgress } from './ai/progress.ts';
 import { shouldShard, shardSkeleton, type Shard } from './ai/shard.ts';
 import {
@@ -5907,7 +5910,15 @@ export class ProjectService {
    * 且本方法不经过 `ctx.approval` —— 因此**不注册成工具**，只挂 HTTP 路由。
    */
   async aiBuildTree(input: {
+    /**
+     * **兼容旧面板的两段式调用**（0.3.21 起语义变了，见下方"取消 token 预算前置"）。
+     *
+     * - 不给 / `true` ⇒ **直接建**（不再要求先估价）；
+     * - `false` ⇒ 等同于 `estimateOnly: true`（只看估价、不调模型）。
+     */
     confirm?: boolean;
+    /** **只看估价、不调模型**（0.3.21 新增的显式开关；等价于 `confirm: false`）。 */
+    estimateOnly?: boolean;
     sessionId?: string;
     /**
      * 发起方（会话/子代理）。**只有它存在时，"覆盖人改过的优先级"才可能拿到 ask 授权**。
@@ -5966,14 +5977,28 @@ export class ProjectService {
       };
     }
     // 新一轮建树开始：清掉上一轮的取消标记（否则这一轮会被上一轮的取消"继承"掉）
-    if (input.confirm === true) this.aiCancelRequested = false;
-    if (input.confirm !== true) {
+    if (input.confirm !== false) this.aiCancelRequested = false;
+    /**
+     * **取消 token 预算前置**（0.3.21，用户口径："不再做 token 预算，直接 AI 生成树和修复维护树"）。
+     *
+     * 原先这里是 `if (input.confirm !== true) return { status: 'needs-confirm', … }` ——
+     * 也就是说**不先估一次价就不许建树**。现在反过来：
+     *
+     * - **默认直接建**（`confirm` 不给也建）；
+     * - 想要"只看估价、先别调模型"的调用方显式传 `estimateOnly: true`；
+     * - `confirm: false` 仍表示"只看估价"（兼容旧面板的两段式调用，不必同时改两侧）。
+     *
+     * **注意这里动的是"花钱闸门"，不是"破坏性操作审批"**：删除/改性质那类仍然走
+     * `pm_remove` / 面板确认通道 —— 那一条是用户明确要求保留的，与本闸门无关。
+     */
+    const estimateOnly = input.estimateOnly === true || input.confirm === false;
+    if (estimateOnly) {
       return {
         status: 'needs-confirm',
         estimate: preflight.estimate,
         description: preflight.description,
         route: preflight.route,
-        // T6/T9：把缓存判定**在确认前**就交给面板 —— 用户要先知道这次花不花钱
+        // T6/T9：把缓存判定也交给调用方 —— 只是想看数字时仍然能看到
         cache: preflight.cache,
       };
     }
@@ -7804,6 +7829,147 @@ export class ProjectService {
       sessions,
       /** 事件路径记下的会话 id（有账的那些）；**缺账的忙会话**就是本轮要查的对象。 */
       busyFromEvents: [...this.busySessions.keys()],
+    };
+  }
+
+  /**
+   * **AI 树修复：只提议、不执行**（0.3.21，用户口径："算法不行让 AI 上…直接 AI 生成树和修复维护树"）。
+   *
+   * ## 为什么规则不够，而这里补的是哪一块
+   *
+   * `domain/consolidate.ts` 的机械判据只做**可核对**的三件事（move / fold / delete，
+   * 且删除要求 refs 逐条被覆盖）。它看不见的正是需要理解业务的那类问题：
+   * 同名不同 refs 的语义重复、层级错位、名字/描述过时、该拆的功能点。
+   *
+   * ## 纪律（本方法刻意只读）
+   *
+   * - **不改任何东西**：不落库、不建节点、不删枝。它只产出一份**方案**；
+   * - **动作集封闭 + id 白名单**：由 `parseRepairPlan` 校验，模型编的 id 一律作废并留痕；
+   * - **破坏性动作仍走审批**：方案回到调用方/面板后，执行照旧要过确认通道
+   *   （用户明确要求保留"动功能点要审批"）—— 与本方法无关；
+   * - **不作 token 预算前置**：用户口径已取消（"不再做 token 预算"）。
+   *
+   * @param input.stream - 测试注入点（生产不传，走 `ctx.llm`）。
+   */
+  async aiPlanRepair(input?: {
+    sessionId?: string;
+    signal?: AbortSignal;
+    stream?: LlmStreamLike;
+    onProgress?: (info: { outputChars: number }) => void;
+  }): Promise<
+    | {
+        status: 'ok';
+        summary: string;
+        actions: RepairParseResult['actions'];
+        uncertain: RepairParseResult['uncertain'];
+        rejected: RepairParseResult['rejected'];
+        /** 机械判据已经算出的动作（回给调用方，便于"AI 提案 + 规则提案"一起看）。 */
+        mechanical: ConsolidatePlan;
+        route: string;
+        nodeCount: number;
+      }
+    | { status: 'denied'; reason: string; hint: string }
+    | { status: 'error'; reason: string; message: string }
+  > {
+    const route = resolveAiRoute({
+      ctx: this.ctx,
+      configProvider: this.deps.config.aiProvider,
+      configModel: this.deps.config.aiModel,
+    });
+    if (!route.ok) return { status: 'denied', reason: route.reason, hint: route.hint };
+    const stream = input?.stream ?? llmStreamOf(this.ctx);
+    if (stream === undefined) {
+      return {
+        status: 'denied',
+        reason: 'llm-unavailable',
+        hint: '宿主没有可用的 llm 服务（ctx.llm 缺失）：无法发起 AI 修复。',
+      };
+    }
+
+    const { graph, derived } = await this.derive(input?.sessionId);
+
+    /** 机械判据（同一份输入，供模型"不要重复提议"）。 */
+    const mechanicalNodes: ConsolidateNode[] = [];
+    const viewById = new Map<string, RepairNodeView>();
+    const childCountOf = (id: string): number => (derived.index.childrenOf.get(id) ?? []).length;
+    for (const node of Object.values(graph.nodes)) {
+      const state = derived.nodes.get(node.id);
+      if (state === undefined || state.derivedState === 'removed') continue;
+      const refs = (node.refs ?? []).map((r) => r.target);
+      mechanicalNodes.push({
+        id: node.id,
+        name: node.name,
+        parentId: node.parentId,
+        kind: node.kind,
+        ...(node.description !== undefined ? { description: node.description } : {}),
+        progress: state.progress,
+        refs: [...refs],
+      });
+      viewById.set(node.id, {
+        id: node.id,
+        name: node.name,
+        parentId: node.parentId,
+        kind: node.kind,
+        depth: ancestorIds(derived.index, node.id).length,
+        progress: state.progress,
+        state: state.derivedState,
+        ...(node.description !== undefined ? { description: node.description } : {}),
+        refs: [...refs],
+        childCount: childCountOf(node.id),
+      });
+    }
+    const mechanical = planConsolidation(mechanicalNodes);
+
+    const prompt = buildRepairPrompt({
+      projectName: graph.projectName,
+      nodes: [...viewById.values()],
+      mechanicalActions: mechanical.actions.map((a) => ({
+        kind: a.kind,
+        nodeId: a.nodeId,
+        name: a.name,
+        reason: a.reason,
+      })),
+      notes: mechanical.notes,
+    });
+
+    let text = '';
+    try {
+      for await (const chunk of stream.stream({
+        provider: route.route.provider,
+        model: route.route.model,
+        messages: [pmUserMessage(prompt)],
+        system: AI_REPAIR_SYSTEM_PROMPT,
+        ...(input?.signal !== undefined ? { signal: input.signal } : {}),
+      })) {
+        const delta = readTextDelta(chunk);
+        if (delta !== '') {
+          text += delta;
+          try {
+            input?.onProgress?.({ outputChars: text.length });
+          } catch {
+            // 进度回调只是展示，出错不该把这次调用搞挂
+          }
+        }
+      }
+    } catch (error) {
+      return {
+        status: 'error',
+        reason: 'call-failed',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (text.trim() === '') return { status: 'error', reason: 'empty-output', message: '模型没有输出任何内容。' };
+
+    const parsed = parseRepairPlan(text, [...viewById.keys()]);
+    return {
+      status: 'ok',
+      summary: parsed.summary,
+      actions: parsed.actions,
+      uncertain: parsed.uncertain,
+      rejected: parsed.rejected,
+      mechanical,
+      route: `${route.route.provider} / ${route.route.model}`,
+      nodeCount: viewById.size,
     };
   }
 

@@ -259,7 +259,7 @@ function assemblerText(blocks: Array<{ type: string; text?: string }>): string {
  * 只认 `text-delta`：`block-end` 里带的是**整块**文本（再算一遍就会重复计数），
  * `reasoning-delta` 之类不是最终输出，也不该计入"已生成"。
  */
-function readTextDelta(chunk: unknown): string {
+export function readTextDelta(chunk: unknown): string {
   if (chunk === null || typeof chunk !== 'object') return '';
   const record = chunk as { type?: unknown; text?: unknown };
   if (record.type !== 'text-delta') return '';

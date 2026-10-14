@@ -1020,11 +1020,23 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
 
 
   /** 第一步：要成本预估（不花 token）。 */
+  /**
+   * 第一步：**直接建树**（0.3.21，用户口径："不再做 token 预算，直接 AI 生成树和修复维护树"）。
+   *
+   * 原先这里先发一次 `confirm: false` 只取估价、弹窗让用户确认花费，再发第二次才真建。
+   * 现在**一次调用直接建**，两个开关（清草稿 / 强制重算）改为常显，点击时按当前勾选取值。
+   *
+   * 注意：取消的是**花钱闸门**；`pm_remove` 那类**破坏性操作审批**仍然保留（用户明确要求）。
+   */
   const askAiBuild = useCallback(() => {
     setAiError(undefined);
     setAiResult(undefined);
-    setAiBusy(true);    void postAiBuild({
-      confirm: false,
+    setAiBusy(true);
+    void postAiBuild({
+      // 直接建（服务端 0.3.21 起：不传 confirm 或传 true 都表示"建"）
+      confirm: true,
+      replaceAutoDraft: aiReplaceDraft,
+      ...(aiForceRebuild ? { forceRebuild: true } : {}),
       ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
     })
       .then((outcome) => {
@@ -1033,16 +1045,18 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           return;
         }
         const value = outcome.value;
-        if (value.status === 'needs-confirm') {
-          setAiPrompt({ description: value.description, route: value.route, cache: value.cache });
-          return;
-        }
         if (value.status === 'denied') setAiError(`${value.hint}（${value.reason}）`);
         else if (value.status === 'error') setAiError(value.message);
-        else setAiError('意外状态：预估没有返回可确认的信息');
+        /**
+         * 旧宿主仍可能回 `needs-confirm`（它是两段式实现）⇒ 退回"弹窗让用户确认"的老路，
+         * 而不是把这条回复当成意外错误。这样面板在新旧宿主上都能用。
+         */
+        else if (value.status === 'needs-confirm') {
+          setAiPrompt({ description: value.description, route: value.route, cache: value.cache });
+        }
       })
       .finally(() => setAiBusy(false));
-  }, [sessionId]);
+  }, [aiForceRebuild, aiReplaceDraft, sessionId]);
 
   /** 第二步：用户确认后真的调模型。 */
   const confirmAiBuild = useCallback(() => {
@@ -1763,7 +1777,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             disabled: aiBusy,
             title: '让模型读目录骨架与关键文件签名，生成功能点/任务点，并同批给出相对工作量与完成度初判',
           },
-          aiBusy && aiPrompt === undefined ? '正在估算成本…' : '用 AI 建树（先看成本）',
+          // 0.3.21：不再先估成本（用户口径："不再做 token 预算，直接 AI 生成树"）
+          aiBusy ? '正在生成树…' : '用 AI 建树（直接生成）',
         ),
         React.createElement(
           'span',
@@ -1847,7 +1862,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                         : cacheChangeLine(aiPrompt.cache),
                 )
               : null,
-            aiPrompt !== undefined
+            true
               ? React.createElement(
                   'label',
                   {
@@ -1869,7 +1884,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               : null,
             // T6 的逃生口：增量按"大小 + 修改时间"判定，同一时间刻度内的同尺寸改动可能漏检，
             // 所以永远给用户一个"我就是要重算"的开关（勾了必然花钱，写清楚）
-            aiPrompt !== undefined
+            true
               ? React.createElement(
                   'label',
                   {
@@ -1941,6 +1956,11 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             React.createElement(
               'div',
               { style: { display: 'flex', gap: 8, marginTop: 8 } },
+              /**
+               * 0.3.21：**点一次就直接建树**，所以"跑起来之后"不该再摆一个"确认并开始建树"按钮 ——
+               * 那会让人以为还需要再点一次。只在**旧宿主回了 `needs-confirm`**（它是两段式的）
+               * 且**当前不在跑**时，才给出那个确认按钮，让新旧宿主都能用。
+               */
               aiResult !== undefined
                 ? // 已有结果：这一个按钮就够了（点空白关不掉，只能显式关）
                   React.createElement(
@@ -1949,17 +1969,21 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                     '关闭',
                   )
                 : [
-                    React.createElement(
-                      'button',
-                      {
-                        key: 'confirm',
-                        type: 'button',
-                        style: styles.headerButton,
-                        onClick: confirmAiBuild,
-                        disabled: aiBusy,
-                      },
-                      aiBusy ? '调用中…' : '确认并开始建树',
-                    ),
+                    /**
+                     * 只有"旧宿主两段式、且不在跑"时才显示这个确认按钮（新宿主点一次就建完了）。
+                     */
+                    !aiBusy && aiPrompt !== undefined
+                      ? React.createElement(
+                          'button',
+                          {
+                            key: 'confirm',
+                            type: 'button',
+                            style: styles.headerButton,
+                            onClick: confirmAiBuild,
+                          },
+                          '确认并开始建树',
+                        )
+                      : null,
                     // 执行中：**只有这个显式按钮能停**（点空白不会关，见上面 backdrop 的 onMouseDown）
                     aiBusy
                       ? React.createElement(
@@ -1976,7 +2000,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                       : React.createElement(
                           'button',
                           { key: 'cancel', type: 'button', style: styles.headerButton, onClick: closeAiModal },
-                          '取消',
+                          '关闭',
                         ),
                   ],
             ),

@@ -443,11 +443,12 @@ test('apply() 全链路：建树 → 统计 → 投影 → 工具可调用', asy
     'pm_release',
     'pm_handoff_read',
     'pm_report',
+    'pm_ai_repair',
   ]) {
     assert.ok(ctx.toolRegistry.has(name), `工具 ${name} 未注册`);
   }
-  // 工具总数与源头 `TOOL_NAMES` 对齐（「扫描直接建树」已删除 ⇒ 33 → 32）
-  assert.equal(ctx.toolRegistry.size, 32, '工具总数应与 TOOL_NAMES 一致');
+  // 工具总数与源头 `TOOL_NAMES` 对齐（0.3.21 加了 `pm_ai_repair` ⇒ 32 → 33）
+  assert.equal(ctx.toolRegistry.size, 33, '工具总数应与 TOOL_NAMES 一致');
 
   // 设置命名空间已注册
   assert.deepEqual(ctx.settingsNamespaces, ['project-manager']);
@@ -3271,7 +3272,11 @@ test('诊断路由：/pm/health 与 /pm/debug 可用，客户端上报可被接�
     logs: unknown[];
   };
   assert.equal(snapshot.report.packageId, 'dsh-project-progress');
-  assert.equal(snapshot.report.registeredTools.length, 32);
+  assert.equal(snapshot.report.registeredTools.length, 33);
+  assert.ok(
+    snapshot.report.registeredTools.includes('pm_ai_repair'),
+    'AI 审树/修复方案必须是会话可用的工具（0.3.21：算法不行让 AI 上）',
+  );
   assert.ok(
     snapshot.report.registeredTools.includes('pm_consolidate'),
     '重复枝合并计划（只读）必须是会话可用的工具 —— 否则又只能靠人肉读脚本修剪',

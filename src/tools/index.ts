@@ -450,6 +450,42 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
   disposers.push(
     ctx.tools.register(
       defineTool({
+        name: 'pm_ai_repair',
+        description:
+          '**让 AI 审一遍这棵树并给出修复方案（只提议、不执行）**。' +
+          '用户口径："整理规则算法，算法不行让 AI 上…直接 AI 生成树和修复维护树"。' +
+          '\n\n' +
+          '机械判据（`pm_consolidate`）只做**可核对**的三件事：move / fold / delete，' +
+          '而且删除要求 refs 逐条被覆盖 —— 它**看不见**语义重复（同名不同 refs）、层级错位、' +
+          '名字/描述过时、该拆的功能点。这些正是本工具补的。' +
+          '\n\n' +
+          '它 **不改任何东西**：不落库、不建节点、不删枝，只回一份方案（含模型自述"拿不准"的部分、' +
+          '以及被校验拒掉的动作）。要执行就按方案逐条调用 `pm_move` / `pm_update` / `pm_remove` ——' +
+          '其中**删除/性质修改仍要走审批通道**（用户明确要求保留）。' +
+          '\n\n' +
+          '**不做 token 预算前置**（用户口径已取消："不再做 token 预算"）。',
+        parameters: {
+          reason: { type: 'string', description: '这次审树的目的（进审计）' },
+        },
+        output: {
+          schema: { type: 'json' },
+          render: (_args, value) => [{ type: 'text', text: clip(JSON.stringify(value)) }],
+        },
+        async execute(_args, exec) {
+          const sessionId = withRoot(exec);
+          const result = await service.aiPlanRepair({
+            ...(sessionId !== undefined ? { sessionId } : {}),
+          });
+          return result as unknown as JsonValue;
+        },
+        presentCall: () => ({ card: 'generic', title: 'AI 树修复方案（只提议）', kind: 'other' }),
+      }),
+    ),
+  );
+
+  disposers.push(
+    ctx.tools.register(
+      defineTool({
         name: 'pm_move',
         description:
           '把节点（连同整枝）挂到另一个节点下 —— 用于修正建树留下的层级/重复分支。' +
