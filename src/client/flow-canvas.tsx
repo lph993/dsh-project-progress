@@ -952,6 +952,22 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
    */
   const liveNodeIds = liveNodeIdsOf(nodes, { busySessionIds, activeNodeIds }, isLiveNode);
 
+  /**
+   * **把"判据说该转圈的节点"暴露到 DOM**（0.3.20，为审查/排查服务）。
+   *
+   * 为什么需要它：这条判据我改过八次、做反过两次，而"图上转了几个"与"判据说该转几个"
+   * 是否一致，**只有把两边都数出来才算验证过**。此前只能靠肉眼截图，既不可靠也不可复现。
+   *
+   * 只放 **id 列表**，不放别的（不泄露节点内容）；空的时候也渲染（空列表本身是有效证据：
+   * "判据说 0 个"与"元素没渲染"必须能区分开）。
+   */
+  const livenessProbe = React.createElement('g', {
+    'data-pm-live-ids': [...liveNodeIds].join(','),
+    'data-pm-lastturn-ids': (props.lastTurnNodeIds ?? []).join(','),
+    'data-pm-busy-count': String((busySessionIds ?? []).length),
+    style: { display: 'none' },
+  });
+
   const onPointerDown = (event: React.PointerEvent<SVGSVGElement>): void => {
     if (event.button !== 0) return;
     /**
@@ -1355,6 +1371,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
         onPointerUp={onPointerUp}
         onPointerLeave={onPointerUp}
       >
+        {livenessProbe}
         <g transform={`translate(${view.tx} ${view.ty}) scale(${view.k})`}>
           {/*
             分区视图的**区框 + 标题条**（用户诉求："一个功能点是个区"）。

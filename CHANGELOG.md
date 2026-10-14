@@ -5,6 +5,63 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.3.20] — 审查"实时 loading"：发现并修掉一处**同类不一致**，并给它配了可数的证据
+
+> 用户口径："审查代码，该 loading 的 loading，不该的就不 loading，重点审核**实时**这块。"
+
+### 审查结论（三条判据确实同源）
+
+逐个核对了"实时"的四个消费点：画布的**连线流动**（`liveNodeIds`）、节点**图标**、
+右栏**「实时进度」tab 亮灯** —— 三者都过同一个 `livenessArgsOf(board)` + `isLiveNode`；
+上一轮标记走 `isLastTurnNode`。类型检查（`readonly` 签名统一）与 558 条测试都在钉它们。
+**没有发现口径分叉**。
+
+### 但发现一处**同类不一致**（已修）
+
+`busySessionAndActiveNodes` 的兜底段：
+
+```js
+for (const id of known) {
+  if (this.sessionStatusOf(id) === 'running') busy.push(id);   // ← 补进"忙"列表
+}
+for (const id of busy) {
+  … this.busySessions.get(id)?.nodeIds …                       // ← 但它可能没有记账条目
+}
+```
+
+兜底问出来的会话只进了"忙"列表、**没有记账条目** ⇒ 收 `nodeIds` 时静默得到空集
+⇒ **"在忙"与"在动哪个节点"对不上**，表现就是"会话明明在跑、图上却一个 loading 都没有"。
+这与 0.3.16 修的那个真机问题**是同一个形状**，只是入口不同
+（那次是宿主重启清零，这次是"该会话只被兜底发现过、从未走过事件路径"）。
+已改为兜底命中时**同时补上记账条目**。
+
+### 给它配了可数的证据（本次审查的方法学）
+
+这条判据改过八次、做反过两次，而"图上转了几个"与"判据说该转几个"是否一致，
+**此前只能靠肉眼截图**——不可靠也不可复现。现在画布渲染一个隐藏探测元素：
+
+```
+data-pm-live-ids / data-pm-lastturn-ids / data-pm-busy-count
+```
+
+于是可以用真浏览器逐个对账。实测（Playwright + Edge）：
+
+```
+3099（测试宿主，无会话在跑）: 判据 busy=0 active=0 lastTurn=0
+                              DOM  liveIds="" busyCount="0" spinner=0 lastTurn=0 tabLive=0
+                              ⇒ 完全一致，且 slotErrors=0、无 pageerror
+3080（真机，有会话在跑但本轮没写节点）: busy=3 active=0 lastTurn=6
+                              ⇒ 正是"第三种标记"该亮的场景
+```
+
+### 过程记录：我又踩了一次自己写过的坑
+
+第一次验不通过（`probeExists: false`），我先怀疑代码 —— 实际是
+**`npm pack` 打出的 tgz 文件名没变（0.3.19），pnpm 按内容哈希跳过了安装**，
+于是"已装产物里根本没有探针，而工作区产物里有"。
+**这条我早就写进过 CHANGELOG**（"装完发现 `lib/client.js` 与工作区不一致"），这次没照做。
+纪律重申：**每次重打包必须升版本号**，验证产物要用哈希比对而不是想当然。
+
 ## [0.3.19] — 更正工具描述里的错误引导：**不必为了躲 MALFORMED_RESPONSE 而写短**
 
 0.3.18 我给 `pm_report` 的描述加了一段"怎么调用更稳"，其中建议"`note`/`evidence` 写要点、

@@ -7848,7 +7848,22 @@ export class ProjectService {
     }
     for (const id of known) {
       if (busy.includes(id)) continue;
-      if (this.sessionStatusOf(id) === 'running') busy.push(id);
+      if (this.sessionStatusOf(id) !== 'running') continue;
+      busy.push(id);
+      /**
+       * ⚠️ **兜底问出来的会话必须同时补上记账条目**（0.3.20 审查发现的不一致）。
+       *
+       * 原先这里只 `busy.push(id)` —— 于是这个会话出现在 `busySessionIds` 里，
+       * 而 `busySessions.get(id)` 是 `undefined`，下面收 `nodeIds` 时静默得到空集：
+       * **"在忙"与"在动哪个节点"两套信息对不上**，表现就是"会话明明在跑、图上却一个 loading
+       * 都没有" —— 与 0.3.16 修的那个真机问题**同一个形状**，只是入口不同
+       * （那次是宿主重启清零，这次是"该会话只被兜底发现过、从未走过事件路径"）。
+       *
+       * 建出条目后，它的节点记账走正常路径（`noteNodeTouched` 的惰性认领会命中它）。
+       */
+      if (!this.busySessions.has(id)) {
+        this.busySessions.set(id, { at: this.deps.clock.now(), nodeIds: new Map<string, number>() });
+      }
     }
     // 只报**正在忙的**会话动过的节点（会话停下后它的节点不该再转圈）
     const active = new Set<string>();
