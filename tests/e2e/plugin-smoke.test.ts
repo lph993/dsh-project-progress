@@ -2010,7 +2010,7 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
     },
   });
 
-  // ① 未确认 → 只回成本预估；这里**不给** stream，一旦真调模型就会因缺 llm 服务而失败
+  // ① 显式只看估价 → 只回成本预估；这里**不给** stream，一旦真调模型就会因缺 llm 服务而失败
   const preflight = await service.aiBuildTree({ confirm: false });
   assert.equal(preflight['status'], 'needs-confirm', JSON.stringify(preflight));
   const estimate = preflight['estimate'] as { calls: number; totalTokens: number };
@@ -2038,6 +2038,31 @@ test('AI 建树：先给成本预估，确认后一次调用生成功能/任务�
     'miss',
     '首次没有缓存 → miss',
   );
+
+  /**
+   * ①b **不传 `confirm` 就必须直接建**（0.3.21 取消花钱闸门：用户口径"不再做 token 预算"）。
+   *
+   * 这条是本次改动的回归点：旧实现里 `confirm !== true` 一律只回估价，
+   * 于是"点一次直接建"根本走不到模型 —— 而面板已经把第一次点击改成了不带 confirm 的调用。
+   * 放在这里（而不是上面）是因为它要用 `json` 与 `fakeStream`。
+   */
+  const callsBefore = modelCalls;
+  /**
+   * 必须带 `forceRebuild`：第一次建树已经把"同样的骨架"写进缓存，
+   * 不带它就会走**缓存命中**（status 仍是 ok，但一次模型都不调）——
+   * 那样测到的是缓存，不是"闸门被取消"。要证明的是**闸门不再拦**。
+   */
+  const noConfirm = await service.aiBuildTree({ stream: fakeStream(json), forceRebuild: true });
+  assert.equal(
+    noConfirm['status'],
+    'ok',
+    '不传 confirm 时应当**直接建树**（取消花钱闸门前置），而不是回 needs-confirm：' +
+      JSON.stringify(noConfirm),
+  );
+  assert.equal(modelCalls, callsBefore + 1, '那次调用必须真的走到了模型（证明闸门不再拦）');
+  // `estimateOnly: true` 是新的显式开关，语义与 confirm:false 等价
+  const estimateOnly = await service.aiBuildTree({ estimateOnly: true });
+  assert.equal(estimateOnly['status'], 'needs-confirm', 'estimateOnly:true 才只看估价');
 
   const board = await service.board();
   assert.equal(board.projectName, '演示项目');
