@@ -1407,6 +1407,26 @@ export class ProjectService {
     const scope = this.effectivePanelScope(sessionId, this.panelScopeRoot);
     return await this.withPanelScope(scope, run);
   }
+
+  /**
+   * **适配器用**：在"面板意图"下执行一段面板发起的操作（0.3.26）。
+   *
+   * ## 为什么必须做成"整段包住"而不是逐个方法打补丁
+   *
+   * 面板发起的写操作**不止 AI 建树**：`/pm/roots/merge`（整理为单一根）、
+   * `/pm/node/action`（改父/改名/优先级/快照…）、`/pm/branch/remove`（**删整枝**）、
+   * `/pm/rollback` —— 我在 0.3.23 只修了 AI 建树那一处，其余照旧按"会话 cwd / 当前绑定"落笔。
+   * 而 `branch/remove` 比建树更危险：它直接删枝。
+   *
+   * 判据本来只有一句：**用户在面板里点的那一下，目标是他在看的那个工作区。**
+   * 所以这里把它作为**适配器层的统一声明**，而不是散在每个服务方法里 ——
+   * 散着写就一定会漏下一个（这正是 0.3.23 那次漏掉的原因）。
+   *
+   * 工具路径（`pm_*`）不经这里，它们的意图确实是"调用会话在哪个工作区干活"，不能混。
+   */
+  async runPanelIntent<T>(sessionId: string | undefined, run: () => Promise<T>): Promise<T> {
+    return await this.withPanelIntent(sessionId, run);
+  }
   /**
    * 由工具层在每次执行时写入当前会话的工作区根。
    *

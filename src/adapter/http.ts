@@ -393,7 +393,9 @@ export function registerRoutes(
 
           case 'POST /pm/roots/merge': {
             // 「整理为单一根」：把多余的顶级节点整枝并入任务点最多的那个（只改父子关系，不删节点）
-            const outcome = await service.mergeRoots();
+            // **面板意图**（0.3.26）：`mergeRoots()` 不接 sessionId，它按"当前绑定"落笔 ——
+            // 而面板点它时，目标应当是**用户在看的那棵树**。
+            const outcome = await service.runPanelIntent(undefined, () => service.mergeRoots());
             sendJson(res, 200, { ok: true, ...outcome });
             return;
           }
@@ -444,13 +446,20 @@ export function registerRoutes(
               sendJson(res, 400, { ok: false, error: 'nodeId-required' });
               return;
             }
-            const outcome = await service.panelNodeAction({
-              action: action as PanelAction,
-              nodeId: parsed.nodeId,
-              confirm: parsed.confirm === true,
-              ...(typeof parsed.text === 'string' ? { text: parsed.text } : {}),
-              ...(typeof parsed.reason === 'string' ? { reason: parsed.reason } : {}),
-            });
+            /**
+             * **面板意图**（0.3.26）：用户在面板右键菜单里点的那一下，目标是**他在看的那个工作区**
+             * —— 不是"这个会话碰巧在哪"。原先只给 AI 建树加了这层，于是这些面板写操作
+             * （改父/改名/优先级/快照…，以及**删整枝**）照样按会话 cwd 落笔。
+             */
+            const outcome = await service.runPanelIntent(undefined, () =>
+              service.panelNodeAction({
+                action: action as PanelAction,
+                nodeId: parsed.nodeId,
+                confirm: parsed.confirm === true,
+                ...(typeof parsed.text === 'string' ? { text: parsed.text } : {}),
+                ...(typeof parsed.reason === 'string' ? { reason: parsed.reason } : {}),
+              }),
+            );
             if (outcome.status !== 'ok') {
               debugBus.info('panel', `节点动作 ${action} → ${outcome.status}`, {
                 nodeId: parsed.nodeId,
@@ -482,11 +491,18 @@ export function registerRoutes(
             }
             const policy =
               parsed.policy === 'code' || parsed.policy === 'comment' ? parsed.policy : 'record';
-            const outcome = await service.removeBranchFromPanel({
-              nodeId,
-              policy,
-              confirm: parsed.confirm === true,
-            });
+            /**
+             * **面板意图**（0.3.26）：这是**删整枝**，比建树更危险 —— 目标必须是用户在看的那个工作区。
+             * `removeBranchFromPanel` 内部会 `bindForCall(sessionId)`，而这里不传 sessionId
+             * （面板请求不带），于是它按"当前绑定"落笔；包上面板意图后，落点由面板作用域决定。
+             */
+            const outcome = await service.runPanelIntent(undefined, () =>
+              service.removeBranchFromPanel({
+                nodeId,
+                policy,
+                confirm: parsed.confirm === true,
+              }),
+            );
             sendJson(res, 200, outcome);
             return;
           }
@@ -539,17 +555,19 @@ export function registerRoutes(
               typeof parsed.sessionId === 'string' && parsed.sessionId !== ''
                 ? parsed.sessionId
                 : readSessionId('', params);
-            const outcome = await service.panelRollback({
-              nodeId,
-              branch: parsed.branch === true,
-              scope,
-              confirm: parsed.confirm === true,
-              confirmShared: parsed.confirmShared === true,
-              ...(sessionId !== undefined ? { sessionId } : {}),
-              ...(typeof parsed.snapshotId === 'string' && parsed.snapshotId !== ''
-                ? { snapshotId: parsed.snapshotId }
-                : {}),
-            });
+            const outcome = await service.runPanelIntent(sessionId, () =>
+              service.panelRollback({
+                nodeId,
+                branch: parsed.branch === true,
+                scope,
+                confirm: parsed.confirm === true,
+                confirmShared: parsed.confirmShared === true,
+                ...(sessionId !== undefined ? { sessionId } : {}),
+                ...(typeof parsed.snapshotId === 'string' && parsed.snapshotId !== ''
+                  ? { snapshotId: parsed.snapshotId }
+                  : {}),
+              }),
+            );
             sendJson(res, 200, outcome);
             return;
           }
