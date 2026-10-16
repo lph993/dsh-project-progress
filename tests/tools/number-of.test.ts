@@ -21,7 +21,7 @@ import { describe, it } from 'node:test';
  * 两份当时逐字一致，但**任何一边漂移都不会被发现** —— 那条防线实际上不设防，
  * 测试永远绿。现在 import 真实现：改坏了这里就会红。
  */
-import { numberOf } from '../../src/tools/index.ts';
+import { numberOf } from '../../src/shared/number.ts';
 
 describe('numberOf：宽容读数字的边界', () => {
   it('**字符串数字要收**（真机事故就是它导致的整轮中断）', () => {

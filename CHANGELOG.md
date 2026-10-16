@@ -5,6 +5,49 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.3.28] — 真机验证抓到"忙"判据的时效缺陷；数值转换抽到无依赖模块
+
+> 环境说明：用户把 DSH 从 CLI 换成了 **Desktop**。Desktop 的 profile **由 Electron 独占管理**
+> （`dsh plugin --profile desktop` 直接拒绝），且包是从 npm registry 装的 ⇒ 我把打包产物
+> 直接替换进 profile 的 `node_modules`（唯一可行路径），已备份可回退。
+
+### ① 真机上抓到的缺陷：会话"忙"的时效只看 agent 信号，不看写入
+
+修完安装后在 Desktop 上做了一次真机写入验证，`/pm/debug` 的 `liveness` 给出**一对矛盾的数字**：
+
+```
+at = 03:00:01.739Z（冻结不动）   ageMs = 23.9s
+nodeCount = 1                    newestNodeAgeMs = 5.4s   ← 刚写过
+```
+
+`entry.at` 来自 `agent/status` 信号，**写节点不刷新它**；而 `busySessionIds` 的剔除判据用的正是它。
+于是：**一个持续写节点、但 agent status 时间戳不再更新的会话，过了 5 分钟就会被判"不忙"
+⇒ 转圈整体消失，哪怕它正在写。** 这正是用户反复说的"灵时不灵"的形态之一。
+
+**修法**：`busy` 的"最后活动时刻"改成 **`max(会话信号, 该会话最新的节点写入)`** ——
+只要还在写，就持续算忙；与"哪个节点在转圈"用同一把尺子（同一个 `BUSY_SESSION_TTL_MS`），
+两套信息不会再自相矛盾。
+
+### ② 数值转换抽到 `src/shared/number.ts`（我上一版把测试搞挂了）
+
+0.3.27 我为修"测试复刻实现"的隐患，把 `numberOf` 从 `src/tools/index.ts` **导出**了。
+后果：`tests/tools/number-of.test.ts` 一 import 就**把整个工具模块拖进加载图**，
+而该模块依赖 `@deepseek-ai/dsh-tools` ⇒ **6 个测试文件整文件加载失败**。
+
+抽到无依赖的 `src/shared/number.ts` 后，工具侧（`pm_progress`/`pm_report` 的参数）、
+服务侧（`reportBatch` 每项、`progress` 写入）与测试**取同一份实现**，且测试不再碰宿主依赖。
+
+⚠️ 顺带记两个坑：`export { x } from '...'` **不把名字带进本模块作用域**（调用点会
+运行期 `ReferenceError`，而 bundle 照样成功）；类 `static` 里引用类名会被打包器改名搞坏。
+
+### 本机验证受限（如实记录）
+
+**仓库 `node_modules` 里 17 个 `link:` 全部指向已被卸载的旧 CLI 路径**（junction 建于 10-13），
+Desktop 的 DSH 包在 `app.asar` 内部、普通 Node 读不了。所以**本机跑不了全量测试**
+（`node --test` 只剩 491 条、5 个文件整文件失败），这是**环境问题，不是代码问题**。
+本次能做的验证：纯模块 15/15 断言通过；构建产物含修复；Desktop 上 0.3.27 的安装与实时链已真机验证。
+**修好仓库依赖链接后应重跑一次全量。**
+
 ## [0.3.27] — 独立审查（两份）后的修复与更正
 
 > 用户要求"代码和功能审查"。我派了两个**独立审查者**（功能/UI 一份、代码一份），各自有报告。

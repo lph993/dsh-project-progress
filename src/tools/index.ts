@@ -76,34 +76,21 @@ function renderResult(result: ApplyResult): string {
 }
 
 /**
- * **宽容地把模型给的值读成数字**（0.3.18）。
+ * **宽容地把模型给的值读成数字**（0.3.18 引入，0.3.28 抽到无依赖模块）。
  *
- * ## 为什么要它（有实测证据，不是防御性编程）
+ * 实现与理由都在 `src/shared/number.ts`（那里有真机事故的完整取证）。
  *
- * 真机事故取证：一次工具调用的参数被拆成 531 个流式片断，拼出来的 JSON 里
- * `"progress": "0.3"` —— **数字被写成了带引号的字符串**，于是整串 JSON 非法，
- * 宿主以 `MALFORMED_RESPONSE` **中断整个回合**（那一轮工作全丢，插件连调用都收不到）。
+ * ① **不许写成类的 `static`** —— 静态方法里引用类名会被打包器改名搞坏
+ *    （实测 `Service is not defined`，e2e 一次挂 6 条）；
+ * ② **不许放回本文件** —— 本模块 import 了 `@deepseek-ai/dsh-tools`，
+ *    测试直接引用纯函数会被拖进宿主依赖树而整文件失败（实测同样挂 6 个文件）。
  *
- * 这一类的形态在插件侧**是可以兜住的**：schema 里 `progress` 声明为 number，
- * 而 `"0.3"` 语义上就是 0.3。宽容一次，比让用户丢掉一整轮强得多。
- *
- * ## 边界（不许变成"什么都收"）
- *
- * 只接受**能读成有限数**的字符串/数字；`''`、`'跑了一半'`、`NaN`、`Infinity` 一律
- * 返回 `undefined`（调用方据此当作"没给"），**绝不猜**。
- *
- * ⚠️ **导出是为了让测试用真实现**（0.3.27，独立审查指出）：此前 `tests/tools/number-of.test.ts`
- * 在测试文件里**复刻了一份**同名函数，两边逐字一致但**任何一边漂移都不会被发现** ——
- * 那条防线实际上不设防。导出后测试 import 它，漂移就会红。
+ * ⚠️ 写成 `import` + `export` **两行**，不能只写 `export { numberOf } from '...'`：
+ * 后者**不把名字带进本模块作用域**，而下面多处调用点直接用了 `numberOf(...)`
+ * —— 那会变成运行期 `ReferenceError`（bundle 照样成功，测不出来）。
  */
-export function numberOf(value: unknown): number | undefined {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  if (trimmed === '') return undefined;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
+import { numberOf } from '../shared/number.ts';
+export { numberOf };
 
 /**
  * 注册全部 `pm_*` 工具。

@@ -41,6 +41,7 @@ import {
   type HandoffSupplements,
 } from './domain/handoff.ts';
 import { utf8ByteLength } from './shared/bytes.ts';
+import { clampProgress, numberOf } from './shared/number.ts';
 import { deriveGraph, statsForRoots, unfinishedLeaves, type DerivedGraph } from './domain/progress.ts';
 import type { WatchEventKind } from './domain/watch.ts';
 import { startWatching, type WatchEvent, type WatcherHandle } from './adapter/watcher.ts';
@@ -664,26 +665,21 @@ export interface AiBuildTreeOk {
 }
 
 /**
- * **数值宽容**（0.3.27，服务层版）。
+ * **数值宽容与进度夹紧**：实现在 `src/shared/number.ts`（0.3.28 抽出的无依赖模块）。
  *
- * 为什么服务层也要一份：`src/tools/index.ts` 里那份 `numberOf()` 只管**工具入口**，
+ * 为什么服务层也用同一份：`src/tools/index.ts` 里那份只管**工具入口**，
  * 而 `reportBatch` 是**逐项**往下传的（`pm_report` 最多 50 项）——
  * 模型给 `progress: "0.6"` 时那一项会直接 `E_REPORT_ITEM` 整项失败，而不是被宽容掉。
  * 讽刺的是 0.3.18 做这个转换的**起因**就是 `pm_report` 里 `"progress": "0.3"` 那次事故。
  *
- * ⚠️ 写成**模块级函数**而不是类的 `static`：静态方法里引用类名会被打包器改名搞坏
- * （实测报 `Service is not defined` —— 我第一版就是这么写的）。
- * 两处必须同语义（读不成数 ⇒ `undefined`），所以这里不另立规则，只做同样的转换。
+ * ⚠️ 两个历史坑都记在这里，免得再踩：
+ * ① **不许写成类的 `static`** —— 静态方法里引用类名会被打包器改名搞坏
+ *    （实测 `Service is not defined`，e2e 一次挂 6 条）；
+ * ② **不许放回 `tools/index.ts`** —— 那个模块依赖 `@deepseek-ai/dsh-tools`，
+ *    测试直接引用纯函数会被拖进宿主依赖树而整文件失败（实测同样挂 6 个文件）。
  */
 function numberOfValue(value: unknown): number | undefined {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    if (trimmed === '') return undefined;
-    const parsed = Number(trimmed);
-    return Number.isFinite(parsed) ? parsed : undefined;
-  }
-  return undefined;
+  return numberOf(value);
 }
 
 /**
@@ -694,11 +690,7 @@ function numberOfValue(value: unknown): number | undefined {
  * 一次汇总里 49 项成功、第 50 项因数值越界整项丢掉。语义上 `1.5` 就是"满了"。
  */
 function clampProgressValue(value: unknown): number | undefined {
-  const parsed = numberOfValue(value);
-  if (parsed === undefined) return undefined;
-  if (parsed < 0) return 0;
-  if (parsed > 1) return 1;
-  return parsed;
+  return clampProgress(value);
 }
 
 /**
@@ -8226,9 +8218,35 @@ export class ProjectService {
     activeNodeIds: string[];
   }> {
     const now = Date.parse(this.deps.clock.now());
+    /**
+     * **"最后活动时刻"要取 max(会话信号, 最新的节点写入)**（0.3.28 真机验证时抓到）。
+     *
+     * ## 缺陷（真机实测的数据）
+     *
+     * `entry.at` 来自 agent/status 信号，**写节点不会刷新它**。真机上看到的正好是这一对：
+     *
+     * ```
+     * at = 03:00:01.739Z（冻结不动）   ageMs = 23.9s
+     * nodeCount = 1                    newestNodeAgeMs = 5.4s   ← 刚写过
+     * ```
+     *
+     * 于是判据只看 `at` 时：一个**持续写节点、但 agent status 时间戳不再更新**的会话，
+     * 过了 `BUSY_SESSION_TTL_MS`（5 分钟）就会被判"不忙" ⇒ **转圈整体消失，哪怕它正在写**。
+     * 这正好是用户反复说的"灵时不灵"的形态之一。
+     *
+     * 改成取两者较大值后：**只要还在写节点，就持续算忙** —— 与"哪个节点在转圈"
+     * 用的是同一把尺子（同一个 `BUSY_SESSION_TTL_MS`），两套信息不会再自相矛盾。
+     */
+    const livelinessOf = (entry: { at: string; nodeIds: Map<string, number> }): number => {
+      let newest = Date.parse(entry.at);
+      for (const touchedAt of entry.nodeIds.values()) {
+        if (Number.isFinite(touchedAt) && (!Number.isFinite(newest) || touchedAt > newest)) newest = touchedAt;
+      }
+      return newest;
+    };
     const busy: string[] = [];
     for (const [id, entry] of this.busySessions) {
-      const stamp = Date.parse(entry.at);
+      const stamp = livelinessOf(entry);
       if (Number.isFinite(stamp) && Number.isFinite(now) && now - stamp <= BUSY_SESSION_TTL_MS) {
         busy.push(id);
       }
