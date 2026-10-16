@@ -5,6 +5,57 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.3.31] — 排除表在嵌套目录上**完全失效**（这才是"refs 指向产物"的根因）
+
+> 用户问"要不要重建 PEIS 的树"。我去查那棵树的 refs，发现它们指向的不是源码：
+
+```
+移动端页面与交互 → Mobile/MPOut/dist/build/h5/assets/pages-Login-Login.24746e3d.js   ← 压缩产物
+H5 构建与发布    → Mobile/MPOut/dist/build/h5/static/main.css                      ← 产物
+工程与依赖管理    → Mobile/MPOut/MPOut.esproj + **Mobile/MPOut/node_modules**       ← node_modules
+PEIS 测试工程    → PEIS.Test/**bin/Debug/net8.0** + bin/Debug/net6.0               ← 编译输出
+PEIS 体检信息系统 → PEIS.Web/**bin/Debug**/BlazorLayui, bin/Debug/Modules            ← 编译输出
+```
+
+### 根因：裸名 glob **只匹配仓库顶层**
+
+`matchesGlob(path, glob)` 对裸名的判据是 `path === glob || path.startsWith(glob + '/')`；
+而扫描器剪枝时传的是**工作区相对路径**。实测：
+
+```
+matchesGlob('node_modules',              'node_modules') = true
+matchesGlob('Mobile/MPOut/node_modules', 'node_modules') = false   ← 嵌套的漏了
+matchesGlob('PEIS.Web/bin/Debug/net8.0', 'bin')          = false   ← 嵌套的漏了
+matchesGlob('a/dist/x.js',               'dist')         = false   ← 嵌套的漏了
+```
+
+`DEFAULT_SCAN_EXCLUDE` 里 `node_modules` / `dist` / `build` / `lib` / `out` / `tmp` … **全是裸名**，
+于是**每一个嵌套的产物目录都被完整遍历**。PEIS 约 9 万文件、骨架预算只有 400 条 ⇒
+构建产物把预算吃满，模型看到的"关键文件"大量是产物 ⇒ 建出来的树 refs 全指向产物。
+
+同表里的 Python 那几条（`**/.venv`）写法本来就是对的 —— 这次是把 JS/.NET 对齐过去。
+
+### 修法
+
+`DEFAULT_SCAN_EXCLUDE` 全部改成 `**/xxx`，并**补上 .NET 的 `**/bin` / `**/obj` / `**/publish`**
+（此前完全不在表里）。
+
+**实测对比（同一个探针，修复前 → 修复后）**：
+
+```
+Mobile/MPOut/dist/.../pages-Login-*.js   保留 → 排除（**/dist）
+Mobile/MPOut/node_modules                保留 → 排除（**/node_modules）
+PEIS.Test/bin/Debug/net8.0               保留 → 排除（**/bin）
+PEIS.Test/obj/project.assets.json        保留 → 排除（**/obj）
+PEIS.Web/Views/Home/Index.cshtml         保留 → 保留  ← 源码不受影响
+Modules/PEIS.Card/.../Form.cshtml        保留 → 保留
+```
+
+回归测试用**真实临时目录树**跑一遍 `scanWorkspaceEntries`，钉住"任意深度的产物都不进结果"；
+**实测过注入缺陷后它会红**（一次泄漏 16 条产物路径，与真机 refs 现象一致）。
+
+全量 **570/570**。
+
 ## [0.3.30] — "PEIS 是 web 应用，为什么被判成 mobile 应用"：根节点选错、层级倒置
 
 > 用户提问："PEIS 是个 web 应用，为什么会被判为 mobile 应用，分析下"。**分析如下。**

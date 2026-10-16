@@ -81,24 +81,47 @@ export const DEFAULT_SCAN_EXCLUDE: readonly string[] = [
   // 非代码产物（虚拟环境 / 缓存 / 构建输出 / 日志）：与建树表**同一份定义**，
   // 否则就会重演"只排了 JS 生态"那一幕（见 NON_CODE_ARTIFACT_EXCLUDE 的注释）。
   ...NON_CODE_ARTIFACT_EXCLUDE,
-  'node_modules',
-  '.git',
-  '.pm',
-  'dist',
-  'build',
-  'lib',
-  'out',
-  'esm',
-  'cjs',
-  'umd',
-  'coverage',
-  '.next',
-  '.nuxt',
-  '.turbo',
-  '.cache',
-  '.output',
-  'storybook-static',
-  'tmp',
+  /**
+   * ⚠️ **目录名一律写成 `**\/xxx`，不许写裸名**（0.3.31 真机 PEIS 取证的 bug）。
+   *
+   * `matchesGlob(path, glob)` 对**裸名**的判据是 `path === glob || path.startsWith(glob + '/')`
+   * —— 也就是说裸名**只匹配仓库顶层**。而扫描器剪枝时传的是**工作区相对路径**，于是：
+   *
+   * ```
+   * matchesGlob('node_modules',              'node_modules') = true
+   * matchesGlob('Mobile/MPOut/node_modules', 'node_modules') = false   ← 嵌套的漏了
+   * matchesGlob('PEIS.Web/bin/Debug/net8.0', 'bin')          = false   ← 嵌套的漏了
+   * ```
+   *
+   * 真机后果（PEIS，约 9 万文件）：**每一个嵌套的 `node_modules` / `dist` / `bin` 都被完整遍历**，
+   * 骨架预算（400 条）被构建产物吃满 ⇒ 建出来的树 refs 指向
+   * `Mobile/MPOut/dist/build/h5/assets/pages-*.js`、`PEIS.Web/bin/Debug/net8.0` 这类**产物**而非源码。
+   *
+   * 同表里的 Python 那几条（`**\/.venv`）写法本来就是对的 —— 这次是把 JS/.NET 这几条对齐过去，
+   * 并**补上 .NET 的 `bin` / `obj`**（此前完全不在表里）。
+   */
+  '**/node_modules',
+  '**/.git',
+  '**/.pm',
+  '**/dist',
+  '**/build',
+  '**/lib',
+  '**/out',
+  '**/esm',
+  '**/cjs',
+  '**/umd',
+  '**/coverage',
+  '**/.next',
+  '**/.nuxt',
+  '**/.turbo',
+  '**/.cache',
+  '**/.output',
+  '**/storybook-static',
+  '**/tmp',
+  // .NET / MSBuild 的编译输出与中间产物（此前缺失）
+  '**/bin',
+  '**/obj',
+  '**/publish',
   '**.map',
   '**.min.js',
   '**.min.css',
