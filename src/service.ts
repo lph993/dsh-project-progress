@@ -1445,8 +1445,35 @@ export class ProjectService {
    * ① 已经有一个项目记录了这个根 → 直接切过去；
    * ② 库里只有一个**没记录过根**的项目（老数据）→ 认领它（不孤立用户已有的树）；
    * ③ 其余 → 为该根新建项目。
+   *
+   * ## ⚠️ **必须串行化**（0.3.25 真机取证）
+   *
+   * 判据是"先 `listProjects()` 查同根、没有就新建"。**并发进入时谁也看不到对方刚建的项目**，
+   * 于是同一个工作区被建出**多个项目** —— 真机存储里正好有**三个 `e:/CSP/PEIS/PEIS`
+   * 项目、创建时间戳精确到同一秒 `00:52:48`**（当时有 3 个会话在跑）。
+   *
+   * 后果正是用户报的"**树一直在变**"：面板按会话/绑定在几个同根项目之间来回切，
+   * 每切一次看到的都是"另一棵（空）树"。所以这里用一条**绑定串行链**把临界区锁住，
+   * 并在锁内**重新查一次**（可能前一个刚建好）。
    */
+  private bindChain: Promise<void> = Promise.resolve();
+
   private async bindProjectToRoot(root: string | undefined, sessionId?: string): Promise<void> {
+    // 串到链尾：任何时刻只有一个绑定在走「查 → 建」这一临界区
+    const previous = this.bindChain;
+    let release: () => void = () => undefined;
+    this.bindChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await this.bindProjectToRootLocked(root, sessionId);
+    } finally {
+      release();
+    }
+  }
+
+  private async bindProjectToRootLocked(root: string | undefined, sessionId?: string): Promise<void> {
     if (root === undefined || root === '') return;
     if (this.boundRoot !== undefined && isSameRoot(this.boundRoot, root)) {
       // 同一个根：仍要更新"谁在用这个根"的记账（否则具名/匿名的锚点会停在旧值上）

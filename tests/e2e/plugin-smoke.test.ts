@@ -1313,6 +1313,63 @@ test('惰性认领：重启后在跑的会话写入仍要记账；idle 的会话
 });
 
 /**
+ * **并发绑定同一个工作区，不许建出多个项目**（0.3.25，真机取证的"树一直在变"根因）。
+ *
+ * ## 现场
+ *
+ * 存储里出现过**三个 `e:/CSP/PEIS/PEIS` 项目、创建时间戳精确到同一秒 `00:52:48`**
+ * （当时有 3 个会话在跑）。而 `bindProjectToRoot` 的判据是"先 listProjects 查同根、
+ * 没有就新建" —— **并发进入时谁也看不到对方刚建的项目**，于是各建一个。
+ *
+ * 后果是用户报的"**树一直在变**"：面板在几个同根项目之间来回切，每次看到的都是另一棵（空）树。
+ */
+test('并发绑定同一工作区只建一个项目（"树一直在变"的回归点）', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'pm-e2e-race-'));
+  const ctx = createFakeContext({ workspace: ws });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    listProjects(): Promise<Array<{ projectId: string; workspaceRoot?: string }>>;
+    board(sessionId?: string, root?: string): Promise<{ projectId: string }>;
+  };
+
+  // 同一秒内三个"会话"各自发起一次读（真机现场就是三个会话 + 面板轮询）
+  const results = await Promise.all([
+    service.board('race-1', ws),
+    service.board('race-2', ws),
+    service.board('race-3', ws),
+  ]);
+  const ids = new Set(results.map((r) => r.projectId));
+  assert.equal(ids.size, 1, `并发绑定必须收敛到同一个项目，实际得到 ${ids.size} 个：${[...ids].join(',')}`);
+
+  const projects = await service.listProjects();
+  const matching = projects.filter(
+    (p) => String(p.workspaceRoot ?? '').replace(/\\/g, '/').toLowerCase() === ws.replace(/\\/g, '/').toLowerCase(),
+  );
+  assert.equal(
+    matching.length,
+    1,
+    `同一个工作区只该有一个项目（并发会各建一个 ⇒ "树一直在变"），实际 ${matching.length} 个`,
+  );
+  /**
+   * ⚠️ **诚实记下这条测试的强度**：我**没能验证出"去掉串行化它会红"**。
+   *
+   * 试过把 `bindProjectToRoot` 里的串行链临时短路（直接调 `…Locked`），它仍然通过 ——
+   * 假上下文里 `listProjects()` 在第一个 `await` 之前就返回，第一个调用已经把 `boundRoot` 设上，
+   * 另外两个走的是**早返回**那条路，竞态窗口在测试里重现不出来。
+   *
+   * 所以它现在钉的是"**并发调用最终收敛到同一个项目**"（这个不变量本身有价值），
+   * **不是**"竞态一定被这条测试挡住"。真机依据是存储里那三个**同一秒创建**的同根项目 ——
+   * 那是竞态存在的直接证据，而串行化把「查 → 建」整个临界区锁住是对症的。
+   */
+
+  ctx.disposeAll();
+  rmSync(ws, { recursive: true, force: true });
+});
+
+/**
  * 绑定副作用（多工作区并发时的真实数据混入）。
  *
  * ## 现场
