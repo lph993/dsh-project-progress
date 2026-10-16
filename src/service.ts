@@ -722,6 +722,26 @@ export interface AiBuildTreeOk {
  * ② **不许放回 `tools/index.ts`** —— 那个模块依赖 `@deepseek-ai/dsh-tools`，
  *    测试直接引用纯函数会被拖进宿主依赖树而整文件失败（实测同样挂 6 个文件）。
  */
+/**
+ * **按 `updatedAt` 从新到旧排序**（0.3.34）。
+ *
+ * 用途：同一个工作区根下有多个项目时，"用户刚建的那棵"必然是 `updatedAt` 最新的
+ * （见 `bindProjectToRootLocked` 的注释里那段真机现场）。
+ *
+ * 为什么用字符串比较而不是 `new Date()`：宿主的时间戳是**统一的 ISO 字符串**
+ * （`YYYY-MM-DDTHH:mm:ss.sssZ`），字典序与时间序**一致**，而 `Date.parse` 对
+ * 非法值会返回 `NaN` 让排序整体失效（`NaN` 参与比较永远是 false ⇒ 顺序不变）。
+ * 拿不到字段的排到最后，不抛。
+ */
+function sortByUpdatedAtDesc<T extends { updatedAt?: unknown }>(items: readonly T[]): T[] {
+  return [...items].sort((a, b) => {
+    const av = typeof a.updatedAt === 'string' ? a.updatedAt : '';
+    const bv = typeof b.updatedAt === 'string' ? b.updatedAt : '';
+    if (av === bv) return 0;
+    return av < bv ? 1 : -1;
+  });
+}
+
 function numberOfValue(value: unknown): number | undefined {
   return numberOf(value);
 }
@@ -1641,10 +1661,35 @@ export class ProjectService {
     }
 
     const projects = await this.listProjects();
-    const match = projects.find(
+    /**
+     * **同一个根下有多个项目时，选"最新的"那个**（0.3.34 真机抓到的 bug）。
+     *
+     * 真机现场：`e:/CSP/PEIS/PEIS` 下同时存在**两个**项目——
+     * `pm_8d91544e`（刚建树，**36 个节点**，06:14:59）与 `pm_228d6790`（00:52 造出来的空壳）。
+     * 而这里用的是 `projects.find(...)` ⇒ **取到列表里第一个匹配的**，
+     * 结果面板和 `/pm/board` 都停在那个**空壳**上：用户看到一棵 14 节点的旧树，
+     * 以为"重建只有这么点节点"，**而真正新建的 36 个节点在另一个项目里躺着**。
+     *
+     * 为什么必须选最新的：多个项目共根是**历史遗留**（早期并发绑定、删后自愈各建一个），
+     * 而"用户刚建的那棵"必然是 `updatedAt` 最新的 —— 这与人的直觉一致，
+     * 也不要求用户自己去清理空壳（那是我该处理好的事）。
+     *
+     * ⚠️ 为什么不顺手**把空壳删掉**：删除是破坏性操作，且"空壳"的判据（0 节点？无描述？）
+     * 我没把握一刀切 —— 这属于用户该拍板的事（面板有「删除此项目」）。
+     * **只改选择口径，不动任何数据。**
+     */
+    const matches = projects.filter(
       (meta) => meta.workspaceRoot !== undefined && isSameRoot(meta.workspaceRoot, root),
     );
+    const match = matches.length <= 1 ? matches[0] : sortByUpdatedAtDesc(matches)[0];
     if (match) {
+      if (matches.length > 1) {
+        debugBus.info(
+          'project',
+          `工作区根 ${root} 下有 ${matches.length} 个项目，按"最新"选中 ${match.projectId}` +
+            `（另一个是历史遗留，可用面板的「删除此项目」清理）`,
+        );
+      }
       this.switchProject(match.projectId, root, sessionId);
       this.noteBoundOwner(root, sessionId);
       return;
