@@ -7123,6 +7123,34 @@ export class ProjectService {
               '看板上的 0% 表示**未评估**，不是"没做"。',
           ]
         : [`完成度初判：${estimatedCount} / ${tree.nodes.length} 个节点给了 progress。`];
+
+    /**
+     * **根节点看起来像"某个端/子应用"时如实提醒**（0.3.30，真机 PEIS 现场）。
+     *
+     * 那次建树的根 = 「移动端外出登记」，于是 Web 门户 / 桌面客户端 / AI 接口服务
+     * 全被挂到了**移动端下面** —— 用户看到的是"PEIS 是个 web 应用，为什么被判成 mobile 应用"。
+     * **节点一个都不缺，错的是层级方向**。
+     *
+     * 提示词里已经加了"根必须是项目本体"的硬规则，但**提示词管不住模型**（这条正是它违反过的），
+     * 所以再加一道事后检查：名字里带端/面词就先提醒 —— **不自动改**（自动改会掩盖问题，
+     * 而且"移动端外出登记"这种名字也可能是真的项目名）。
+     */
+    const rootNodes = tree.nodes.filter((node) => node.parent === null || node.parent === undefined);
+    const endpointWords = ['移动端', '前端', '后端', '客户端', '网页', 'Web', 'Android', 'iOS', '小程序', 'H5'];
+    const looksLikeEndpoint = (name: string): boolean =>
+      endpointWords.some((w) => name.includes(w));
+    if (rootNodes.length === 1 && looksLikeEndpoint(rootNodes[0]!.name)) {
+      const others = tree.nodes.filter(
+        (node) => node.parent === null || node.parent === undefined ? false : true,
+      );
+      progressNotes.push(
+        `⚠ **根节点「${rootNodes[0]!.name}」看起来是"某个端/子应用"，不像项目本体**：` +
+          '若这个项目是多端工程（Web + 客户端 + 移动端…），把它当根会让**其余各端全挂到它下面**，' +
+          '层级方向整个反掉。建议重建成「' +
+          `${collected.projectName}」为根、各端作为**并列**的大功能。` +
+          `（本轮共 ${others.length} 个节点挂在这个根之下——是真的项目名叫这个，可以忽略本条。）`,
+      );
+    }
     if (estimatedCount === 0 && tree.nodes.length > 0) {
       debugBus.warn(
         'ai',
