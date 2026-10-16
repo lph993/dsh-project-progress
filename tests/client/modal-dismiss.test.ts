@@ -68,6 +68,43 @@ test('执行中必须给出**显式**中止入口，并且真的调用取消通�
   );
 });
 
+test('「删除此项目」必须是**带取消**的确认弹窗（0.3.24）', () => {
+  const source = panelSource();
+  /**
+   * 用户口径："删除此项目 没有取消操作，弹出一个 modal 确认框怎么了，办不到吗"。
+   *
+   * 原先是两段式内联（点一下显示影响范围、再点同一个按钮才真删），缺陷是**没有取消**：
+   * 想反悔时唯一能点的恰好是"确认删除"。一个删掉整棵树的动作不该这样。
+   *
+   * 这条测试钉住三件事：有弹窗、有确认、**有取消**（最后一条是本缺陷的核心）。
+   */
+  assert.match(source, /'data-pm-delete-modal': '1'/, '删除项目要有确认弹窗');
+  assert.match(source, /'data-pm-delete-confirm': '1'/, '弹窗里要有显式确认按钮');
+  assert.match(source, /'data-pm-delete-cancel': '1'/, '**必须有取消按钮** —— 这正是原先缺的东西');
+  assert.match(source, /cancelDeleteProject/, '取消要真的有处理函数，而不是只画个按钮');
+  assert.match(
+    source,
+    /onMouseDown: \(event: React\.MouseEvent\) => \{\s*if \(event\.target !== event\.currentTarget\) return;\s*cancelDeleteProject\(\);/,
+    '点遮罩也算取消（但必须先判"点的是空白"，否则点卡片内部就会误关）',
+  );
+  /**
+   * 不许退回"再点一次"那种两段式。**只查代码/文案，不查注释** ——
+   * 注释里出现这串字是**故意的**（它在解释这次改动为什么必要），
+   * 连注释一起禁会把"记录历史"也一起禁掉。
+   */
+  const codeOnly = source
+    .split('\n')
+    .filter((line) => {
+      const t = line.trim();
+      return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
+    })
+    .join('\n');
+  assert.ok(
+    !codeOnly.includes('再点一次确认删除'),
+    '不许退回"再点一次"那种没有取消的两段式（注释里说明历史是允许的）',
+  );
+});
+
 test('实时进度：粗估措辞 + 完成后保留（保持 100%）+ 有真实用量时说"实际消耗"', () => {
   const source = panelSource();
   assert.match(source, /'data-pm-ai-run': '1'/);

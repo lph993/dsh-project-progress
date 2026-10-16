@@ -1282,12 +1282,8 @@ export class ProjectService {
      * - **`activePanelScope` 之外的一切调用（工具、写路径、后台任务）看不到面板作用域** ——
      *   它们只认调用会话自己的 cwd。这个区分有 e2e 专门钉住，不许再被合并。
      */
-    const scope = this.activePanelScope;
-    if (
-      scope !== undefined &&
-      (sessionId === undefined || sessionId === '' || scope.sessionId === sessionId) &&
-      Date.now() - scope.at <= PANEL_SCOPE_TTL_MS
-    ) {
+    const scope = this.effectivePanelScope(sessionId);
+    if (scope !== undefined) {
       return {
         root: scope.root,
         source: 'panel-scope',
@@ -1348,6 +1344,22 @@ export class ProjectService {
   private activePanelScope: { root: string; sessionId?: string; at: number } | undefined;
 
   /**
+   * **当前生效的面板作用域**（判据只写在这里一处）。
+   *
+   * 生效条件三条，缺一不可：① `withPanelScope` 提升过它（或调用方显式读了持久值）；
+   * ② 会话一致（`undefined`/空 = 无会话约束）；③ 未超 `PANEL_SCOPE_TTL_MS`。
+   */
+  private effectivePanelScope(
+    sessionId: string | undefined,
+    source: { root: string; sessionId?: string; at: number } | undefined = this.activePanelScope,
+  ): { root: string; sessionId?: string; at: number } | undefined {
+    if (source === undefined) return undefined;
+    if (sessionId !== undefined && sessionId !== '' && source.sessionId !== sessionId) return undefined;
+    if (Date.now() - source.at > PANEL_SCOPE_TTL_MS) return undefined;
+    return source;
+  }
+
+  /**
    * 在"面板作用域生效"的上下文里执行一段代码（只有 `board()` 用）。
    *
    * 语义刻意做成**瞬时**：进入时提升、退出时恢复（用 `try/finally`，抛错也要恢复 ——
@@ -1364,6 +1376,36 @@ export class ProjectService {
     } finally {
       this.activePanelScope = previous;
     }
+  }
+
+  /**
+   * **在"面板正在看的那个工作区"上执行一段操作**（0.3.23）。
+   *
+   * ## 为什么必须有它（真机事故：建树搞错了工作区，删掉/清空了别处的树）
+   *
+   * 用户的现场：面板明明选着 PEIS（`e:/CSP/PEIS/PEIS`），点「用 AI 建树」之后提示
+   * "已删除项目（70 个节点一并删除）" —— **操作落在了别的工作区**。
+   *
+   * 根因是 `aiBuildTree` 里那一行 `this.resolveRoot(input.sessionId).root`：
+   * 它拿的是**本会话 cwd**，而不是面板声明的作用域。而 `activePanelScope` 是
+   * `board()` 读取期间的**瞬时**值（0.3.13 为了不让它污染写路径才做成瞬时），
+   * 建树那一刻它早就退回去了。
+   *
+   * 关键在于**"面板发起的操作"与"会话发起的工具调用"是两回事**：
+   * - 工具调用（`pm_*`）的目标必须是**会话的 cwd**；
+   * - 面板发起的操作，目标是**用户在面板里选的那个工作区** —— 那是他此刻的意图，
+   *   而且他眼前看的就是那棵树。
+   *
+   * 所以面板路径（HTTP `/pm/ai/*`）用这个方法包一层，把**持久**的 `panelScopeRoot`
+   * 作为上下文提升起来；工具路径不碰它。这与 0.3.13 的纪律不冲突：
+   * 写路径**默认**仍然看不到面板作用域，只有**显式声明由面板发起**的入口才看得到。
+   */
+  private async withPanelIntent<T>(
+    sessionId: string | undefined,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const scope = this.effectivePanelScope(sessionId, this.panelScopeRoot);
+    return await this.withPanelScope(scope, run);
   }
   /**
    * 由工具层在每次执行时写入当前会话的工作区根。
@@ -6003,6 +6045,18 @@ export class ProjectService {
       };
     }
 
+    /**
+     * ⚠️ **整段建树必须在"面板正在看的那个工作区"上进行**（0.3.23 真机事故修的）。
+     *
+     * 原先这里只有 `this.resolveRoot(input.sessionId).root` —— 拿的是**本会话 cwd**，
+     * 于是面板选着 PEIS、操作却落在别的工作区，删掉了那边的树（用户现场：
+     * 提示"已删除项目（70 个节点一并删除）"，而 PEIS 那棵不是 70 个节点）。
+     *
+     * **建树是破坏性操作**（`replaceAutoDraft` 会删自动草稿），所以目标工作区必须是
+     * "用户眼前那棵树的那个工作区"，不能是"这个会话碰巧在哪"。
+     * 用 `withPanelIntent` 把显式的面板意图提升为上下文，工具调用路径不受影响。
+     */
+    return await this.withPanelIntent(input.sessionId, async () => {
     const root = this.resolveRoot(input.sessionId).root;
     if (root === undefined) {
       return { status: 'denied', reason: 'no-workspace-root', hint: '工作区根丢失，请刷新后重试。' };
@@ -6342,6 +6396,7 @@ export class ProjectService {
         changedPaths: cache.diff ? changedSummary(cache.diff) : { added: [], removed: [], changed: [] },
       },
     };
+    });
   }
 
   /**

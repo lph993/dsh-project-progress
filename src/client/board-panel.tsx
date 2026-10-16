@@ -1213,6 +1213,13 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         return;
       }
       if (value.status === 'needs-confirm') {
+        /**
+         * 第一步只拿到影响范围 ⇒ **开弹窗**（0.3.24）。
+         *
+         * 原先这里只 `setRootNotice(preview)` 并改按钮文案成"再点一次确认删除" ——
+         * 那就是用户说的"没有取消操作"：想反悔只能再点一下，而那一按就是真删。
+         * `rootNotice` 仍然写一份（弹窗关掉后还能从提示行看到上次的影响范围）。
+         */
         setProjectDelete({ projectId, preview: value.preview });
         setRootNotice(value.preview);
         return;
@@ -1232,6 +1239,23 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       refresh();
     });
   }, [board?.projectId, projectDelete, refresh, sessionId]);
+
+  /** 确认删除（弹窗里那个按钮）：走服务端 `confirm: true`。 */
+  const confirmDeleteProject = useCallback(() => {
+    doDeleteProject();
+  }, [doDeleteProject]);
+
+  /**
+   * **取消删除**（用户口径："没有取消操作"）—— 这是本次新增的东西。
+   *
+   * 语义就是"我改主意了"：撤掉待确认状态 + 清掉影响范围提示。
+   * 它必须在弹窗里有一个**显式按钮**：只有一个"再点一次"的话，用户想反悔时
+   * 唯一的操作恰好是"确认删除"。
+   */
+  const cancelDeleteProject = useCallback(() => {
+    setProjectDelete(undefined);
+    setRootNotice(undefined);
+  }, []);
 
   /**
    * 回滚浮层（FR-51b/53b）：**选回滚点 + 选范围**，所以不能复用"是/否"确认框。
@@ -1661,7 +1685,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                     : '删除这个项目（把整棵树连同记录一起清掉；当前绑定的项目不允许删）',
                 onClick: doDeleteProject,
               },
-              projectDelete !== undefined ? '再点一次确认删除' : '删除此项目',
+              projectDelete !== undefined ? '等待确认…' : '删除此项目',
             )
           : null,
       ),
@@ -1786,6 +1810,68 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           '只发送目录骨架与关键文件签名；建树、相对工作量、完成度初判在同一次调用里完成。',
         ),
       ),
+      /**
+       * **「删除此项目」的确认弹窗**（0.3.24，用户口径："删除此项目 没有取消操作，
+       * 弹出一个 modal 确认框怎么了，办不到吗"）。
+       *
+       * 原先是**两段式内联**：点一下显示影响范围、**再点同一个按钮**才真删。两个问题：
+       * ① **没有取消操作** —— 想反悔只能再点一下，而那正是"确认删除"；
+       * ② 影响范围只是页面上多一行小字，一个删掉整棵树的动作不该这么轻。
+       *
+       * 现在走弹窗：影响范围写在框里，**「确认删除」与「取消」并列**，点遮罩也算取消。
+       * 服务层不动（它本来就是 `needs-confirm` → `confirm: true` 两段式，AI 工具那条路还在用）。
+       */
+      projectDelete !== undefined
+        ? React.createElement(
+            'div',
+            {
+              style: styles.modalBackdrop,
+              role: 'presentation',
+              'data-pm-delete-modal': '1',
+              /** 点遮罩 = 取消（这里没有"执行中"的副作用，关掉没有代价）。 */
+              onMouseDown: (event: React.MouseEvent) => {
+                if (event.target !== event.currentTarget) return;
+                cancelDeleteProject();
+              },
+            },
+            React.createElement(
+              'div',
+              {
+                style: styles.modalCard,
+                role: 'dialog',
+                'aria-modal': true,
+                'aria-label': '确认删除这个项目',
+                onMouseDown: (event: React.MouseEvent) => event.stopPropagation(),
+              },
+              React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '确认删除这个项目？'),
+              React.createElement('div', { style: styles.note }, projectDelete.preview),
+              React.createElement(
+                'div',
+                { style: { display: 'flex', gap: 8, marginTop: 10 } },
+                React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    style: styles.headerButton,
+                    'data-pm-delete-confirm': '1',
+                    onClick: confirmDeleteProject,
+                  },
+                  '确认删除',
+                ),
+                React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    style: styles.headerButton,
+                    'data-pm-delete-cancel': '1',
+                    onClick: cancelDeleteProject,
+                  },
+                  '取消',
+                ),
+              ),
+            ),
+          )
+        : null,
       // **AI 建树的确认框（红框）与结果（白框）都以模态框呈现**（用户口径："红框部分，和生成的
       // 内容展示部分（白框），用 modal 吧，执行中不可点击空白取消，只能明确点取消或关闭"）。
       // 原来内联在标题区：① 内容一长就把画布挤下去；② 点空白会连带触发画布"取消选中"，

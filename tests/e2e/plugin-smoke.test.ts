@@ -143,6 +143,27 @@ function createFakeFs(workspace: string) {
 /** 本文件创建过的假上下文（供失败兜底卸载，见文件末尾的 `after`）。 */
 const createdContexts: Array<{ disposeAll(): void }> = [];
 
+/**
+ * **模块级假模型流**：把一段 JSON 当成模型的输出喂进去（不烧真 token）。
+ *
+ * 与用例内部的 `fakeStream` 同一形态；提出来是因为它现在被不止一处用
+ * （0.3.23 的"面板发起的建树必须落在面板作用域"那条回归用例也要它）。
+ */
+function fakeAiStream(json: string): {
+  stream: () => AsyncGenerator<Record<string, unknown>>;
+} {
+  return {
+    stream: () =>
+      (async function* () {
+        yield { type: 'block-start', index: 0, blockType: 'text' };
+        yield { type: 'text-delta', index: 0, text: json.slice(0, 40) };
+        yield { type: 'text-delta', index: 0, text: json.slice(40) };
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
+        yield { type: 'finish', reason: 'stop' };
+      })(),
+  };
+}
+
 /** 最小假 cordis 上下文。 */
 function createFakeContext(options: { workspace: string; agents?: unknown }) {  const services = new Map<string, unknown>();
   const storage = createFakeStorageDomain();
@@ -954,6 +975,80 @@ test('看板作用域：面板声明的工作区路径优先，且只认存在�
     ['B树'],
     'B 的树不受影响（写路径没被面板作用域带偏）',
   );
+
+  /**
+   * ⑦ **面板发起的 AI 建树必须落在面板作用域，而不是会话 cwd**（0.3.23 真机事故的回归点）。
+   *
+   * ## 现场（用户的树被清掉）
+   *
+   * 面板明明选着 PEIS，点「用 AI 建树」后提示"已删除项目（70 个节点一并删除）" ——
+   * **操作落在了别的工作区**。根因：`aiBuildTree` 里 `resolveRoot(sessionId)` 拿的是
+   * **本会话 cwd**，而 `activePanelScope` 是 `board()` 期间的瞬时值，建树那一刻早已退回。
+   *
+   * 判据：面板在看 B（带 `root`）、会话 cwd 是 A ⇒ 建树必须把节点写进 **B 的项目**。
+   *
+   * 需要一个可用的模型路由才走得到"解析根"那一步；这里补上最小路由 + 假模型流
+   * （不烧真 token），断言只看**落点**。
+   */
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  ctx.services.set('llm', { stream: () => { throw new Error('该用例应当走注入的假流'); } });
+  await service.board('session-A', wsB); // 面板：会话 A 要看 B —— 这就是真机现场
+  service.noteWorkspaceRoot(wsA, 'session-A'); // 会话 cwd 仍是 A
+  const buildJson = JSON.stringify({
+    projectName: 'B树',
+    nodes: [{ name: 'B树新枝', kind: 'feature', parent: null, weight: 3, priority: 2 }],
+  });
+  /**
+   * **落点判据：全局节点数差量**。
+   *
+   * 为什么不用 `board()`：`board('session-A', wsB)` 会**按面板作用域把项目重新绑回 B** ——
+   * 于是无论树建到哪儿去，那次读都返回 B，断言**永远成立**（我第一版就是这么写错的：
+   * 连"注入缺陷应当变红"都验不出来）。也不要用 `aiBuildTree` 的返回值 ——
+   * 它的 ok 分支里**没有** `projectId`（我一度以为有，于是断言恒为 undefined）。
+   *
+   * 差量判定只依赖行为：建树让**某个**项目的节点数 +1，那个项目就是落点。
+   */
+  const svc = service as unknown as {
+    listProjects(): Promise<Array<{ projectId: string }>>;
+    port: { readGraph(id: string): Promise<{ nodes: Record<string, unknown> } | undefined> };
+  };
+  const snapshotCounts = async (): Promise<Map<string, number>> => {
+    const out = new Map<string, number>();
+    for (const meta of await svc.listProjects()) {
+      const graph = await svc.port.readGraph(meta.projectId);
+      out.set(meta.projectId, Object.keys(graph?.nodes ?? {}).length);
+    }
+    return out;
+  };
+  const before = await snapshotCounts();
+  const builtInScope = await service.aiBuildTree({
+    sessionId: 'session-A',
+    stream: fakeAiStream(buildJson),
+  });
+  assert.equal(builtInScope['status'], 'ok', `面板发起的建树应当成功：${JSON.stringify(builtInScope)}`);
+  const after = await snapshotCounts();
+  const grew = [...after.entries()].filter(([id, n]) => n > (before.get(id) ?? 0)).map(([id]) => id);
+  assert.deepEqual(
+    grew,
+    [projectB],
+    '**AI 建树必须落在面板作用域那个项目**（0.3.23 回归点：搞错工作区会删掉别处的树）；' +
+      `实际增长的项目=${grew.join(',')}，面板在看=${projectB}`,
+  );
+  /**
+   * ⚠️ **诚实的局限**：这条断言我**没能验证出"修复前会红"**。
+   *
+   * 试过把 `withPanelIntent` 的作用域临时改成 `undefined`（模拟 0.3.22），它仍然通过 ——
+   * 说明在本用例的假上下文里，走"会话 cwd"那条路**恰好也解析到 B**
+   * （假上下文没有真实宿主的会话注册表/全局最近根，几条兜底判据的行为与真机不同）。
+   *
+   * 所以这条测试**能防"以后改成别的落点"，但不能证明它抓得住 0.3.22 那个具体缺陷**。
+   * 真机上的正确性依据是另外两条：
+   * ① 语义上的单一改动（面板发起的入口显式提升面板意图，工具路径不碰）；
+   * ② 用户现场可复现（面板选 PEIS、建树落在别处）。
+   * **不要**因为这条测试绿了就认为"这个类别的 bug 已经被测试挡住了"。
+   */
 
   ctx.disposeAll();
   rmSync(wsA, { recursive: true, force: true });
