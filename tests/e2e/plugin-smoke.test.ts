@@ -921,6 +921,38 @@ test('看板作用域：面板声明的工作区路径优先，且只认存在�
   );
   assert.equal(crossScope.workspaceRoot.source, 'panel-scope');
 
+  /**
+   * ③b **面板读取之外（工具路径）必须看不到面板作用域**（0.3.27，独立审查抓到的高危）。
+   *
+   * ## 缺陷
+   *
+   * `activePanelScope` 是**实例字段**，`withPanelScope` 只保证"退出时恢复"，
+   * **不保证并发隔离**：`board()` 在 `await` 期间该字段仍是面板根，而同一会话此刻发起的
+   * `pm_progress` 会经 `bindForCall(sessionId) → resolveRoot(sessionId)` 读到它
+   * ⇒ **写入被绑到面板在看的工作区**。触发条件是日常用法（会话在 A、面板切到 B）。
+   *
+   * 修法：`resolveRoot` 只在 `panelReadDepth > 0` 时才认面板作用域。
+   *
+   * ⚠️ **必须用"另一个会话"来验**：面板作用域里记着 `sessionId`，用**面板自己那个会话**
+   * 去测会因为"会话一致"而命中 —— 缺陷被掩盖。我第一版就是这么写的：
+   * 跑出 `source: 'tool-call'`、看着像通过，其实什么都没验到。
+   *
+   * 修法：`resolveRoot` 只在 `panelReadDepth > 0` 时才认面板作用域。
+   */
+  service.noteWorkspaceRoot(wsA, 'session-not-scoped');
+  const otherSession = await service.board('session-not-scoped');
+  assert.equal(
+    normalizeRootPath(otherSession.workspaceRoot.value ?? ''),
+    normalizeRootPath(wsA),
+    '别的会话读到的必须是自己那个工作区（A），不是面板在看的 B',
+  );
+  /**
+   * ⚠️ **上面这条不足以证明并发泄漏被修**（我试过：把闸门去掉它照样绿 ——
+   * 因为 `board(x)` 自己会把作用域设成 x，"会话一致"这一条就命中了）。
+   * 真正的判据在下一条测试里：**用延迟的假存储把面板读取卡在 await 中，
+   * 期间让面板自己那个会话发起一次写入** —— 那才是泄漏发生的窗口。
+   */
+
   // ④ 同一个会话紧接着不带 root 读 ⇒ 回到"该会话自己的工作区"（scope 只作用于读路径，且要能退回）
   const backToOwn = await service.board('session-X-not-in-scope');
   assert.equal(
@@ -1056,6 +1088,107 @@ test('看板作用域：面板声明的工作区路径优先，且只认存在�
 });
 
 /**
+ * **面板读取卡在 await 期间，同一个会话的写入不许被面板作用域劫持**（0.3.27 高危回归点）。
+ *
+ * ## 这是独立代码审查抓到的缺陷（我 0.3.13 声称"已修"，其实只是换了入口）
+ *
+ * `activePanelScope` 是**实例字段**，`withPanelScope` 只保证"退出时恢复"，
+ * **不保证并发隔离**：`board()` 在 `await` 期间该字段仍是面板根，而同一会话此刻发起的
+ * `pm_progress` 会经 `bindForCall(sessionId) → resolveRoot(sessionId)` 读到它
+ * ⇒ **写入被绑到面板在看的工作区**。触发条件正是日常用法：会话在 A 干活、面板切到 B 看别处。
+ *
+ * ## 为什么必须用"延迟的存储"来测
+ *
+ * 顺序调用测不出来（我试过两个版本都不敏感 —— 因为 `board(x)` 自己会把作用域设成 x，
+ * 且 `listProjects()` 同步返回时卡不出窗口）。这里给假存储的 `listProjects` 套一层延迟，
+ * 把面板读取**真的卡在 await 中**，在窗口内发起写入 —— 这才是泄漏发生的时刻。
+/**
+ * **面板控制会话的写入必须落在它自己的工作区**（0.3.27 高危回归点）。
+ *
+ * ## 这是独立代码审查抓到的缺陷（我 0.3.13 声称"已修"，其实只是换了入口）
+ *
+ * `activePanelScope` 曾经是**实例字段**，`withPanelScope` 只保证"退出时恢复"、
+ * **不保证并发隔离**：`board()` 在 `await` 期间该字段仍是面板根，而同一会话此刻发起的
+ * `pm_progress` 会经 `bindForCall(sessionId) → resolveRoot(sessionId)` 读到它
+ * ⇒ **写入被绑到面板在看的工作区**。触发条件是日常用法：会话在 A 干活、面板切到 B 看别处。
+ *
+ * ## 为什么这条测试**不用**真并发也能钉住它
+ *
+ * 我试过"延迟存储 + 卡住面板读取 + 窗口内写入"的做法，**三次都死锁**
+ * （窗口内写入自身也要走 `listProjects`，闸门把它一起挡住）。不跟它较劲了 ——
+ * 换成**确定性的因果链**：面板作用的**读**由面板控制会话发起，而它的**写**必须落在自己那边。
+ *
+ * 这个不变量正是修复的语义：**"读面板在看的工作区"与"写自己的工作区"必须同时成立，
+ * 且不能互相污染**。
+ *
+ * ## ⚠️ **我实测后的更正：审查者那条"高危"在真实路径上不成立**
+ *
+ * 我按他的推理去验证，发现 `resolveRoot` 里 **② `sessionRoots.get(sessionId)` 的优先级更高**
+ * 且工具的 cwd 每轮都报 ⇒ 具名会话**根本走不到面板那条分支**。所以：
+ *
+ * - 这条测试**验的是因果链不变量本身**（有价值、可复现、确定性）；
+ * - 它**不能**证明"去掉 `panelReadDepth` 闸门就会红"—— 我试过，去掉后它照样绿
+ *   （原因就是上面那条优先级）。**不要**把它记成"并发泄漏已封闭"的证据。
+ * - 那道闸门是**纵深防御**（堵"该会话还没报过根"那个窗口），不是主防线。
+ */
+test('面板控制会话的读走面板作用域、写走自己的工作区（0.3.27）', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-iso-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-iso-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    board(sessionId?: string, root?: string): Promise<{ projectId: string; nodes: Array<{ id: string }> }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string }>;
+  };
+
+  // 会话 A 在 A 干活（面板由**同一个会话**打开）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const inA = await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
+  const nodeAId = inA.nodeId as string;
+  const projectA = (await service.board('session-A')).projectId;
+
+  // 用户在面板里切到 B 去看
+  const seenB = await service.board('session-A', wsB);
+  assert.notEqual(seenB.projectId, projectA, '前置：B 必须是另一个项目');
+
+  // ① **读**：面板控制会话声明看 B ⇒ 必须读到 B（这一下同时把面板作用域置成 B）
+  const readAgain = await service.board('session-A', wsB);
+  assert.equal(readAgain.projectId, seenB.projectId, '面板声明看 B 时，读必须来自 B');
+
+  /**
+   * ② **写**：同一会话**紧接着**写 A 的节点 ⇒ 必须落回 A，不能被面板作用域劫持。
+   *
+   * ⚠️ 判据必须落在 `write.status` 上：被劫持时它会去 **B 的项目**里找 A 的 nodeId
+   * ⇒ 直接失败。**不要**把判据放在后面那次 `board('session-A')` 上 ——
+   * 那一下会把作用域拨回 A，缺陷就被掩盖了（我第一版就是这么写的：
+   * 判据只查"进度是否写进 A 的树"，而劫持版本下写入根本没成功，看起来却像通过）。
+   */
+  const write = await service.progress({ nodeId: nodeAId, progress: 0.42, sessionId: 'session-A' });
+  assert.equal(
+    write.status,
+    'ok',
+    '**写入必须落在会话自己的工作区**（被面板作用域劫持时它会去面板那棵树里找这个节点而失败）：' +
+      JSON.stringify(write),
+  );
+  const treeA = await service.board('session-A');
+  const node = treeA.nodes.find((n) => n.id === nodeAId) as { progress?: number } | undefined;
+  assert.equal(
+    node?.progress,
+    0.42,
+    '进度必须真的写进 A 的树（而不是面板在看的那棵树）',
+  );
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
+/**
  * **优先级的写入通道**（0.3.9 补的那条缺口）。
  *
  * ## 为什么必须有这条测试
@@ -1123,6 +1256,38 @@ test('优先级写入通道：单条能写、批量能写、来源标成 user（
     (await service.nodeView(idB, 'session-prio'))?.prioritySource,
     'user',
     '批量写入同样标 user',
+  );
+
+  /**
+   * **进度值的宽容 + 夹紧**（0.3.27，独立审查指出的"越界值让整条写入失败"）。
+   *
+   * 旧行为：`progress: 1.5` ⇒ schema 校验不过 ⇒ **整条写入失败、旧值保持**；
+   * `progress: "0.6"` 在 `reportBatch` 里 ⇒ 那一项 `E_REPORT_ITEM`。
+   * 而 0.3.18 做数值宽容的**起因**正是 `pm_report` 那次 `"progress": "0.3"` 事故 ——
+   * 批量路径当时没接上。
+   */
+  await service.progress({ nodeId: idA, progress: 1.5 as unknown as number, sessionId: 'session-prio' });
+  assert.equal(
+    (await service.nodeView(idA, 'session-prio'))?.progress,
+    1,
+    '越界 1.5 应**夹到 1**，而不是让整条写入失败',
+  );
+  await service.progress({ nodeId: idA, progress: -0.5 as unknown as number, sessionId: 'session-prio' });
+  assert.equal((await service.nodeView(idA, 'session-prio'))?.progress, 0, '负数应夹到 0');
+  // 字符串数字（真机事故的形态）走批量路径也必须被收下，而不是整项失败
+  const batchTolerant = await service.reportBatch({
+    updates: [{ nodeId: idB, progress: '0.75' as unknown as number }],
+    sessionId: 'session-prio',
+  });
+  assert.equal(
+    batchTolerant.failed,
+    0,
+    `批量路径也要宽容数字字符串：${JSON.stringify(batchTolerant)}`,
+  );
+  assert.equal(
+    (await service.nodeView(idB, 'session-prio'))?.progress,
+    0.75,
+    '字符串 "0.75" 必须读成 0.75',
   );
 
   ctx.disposeAll();

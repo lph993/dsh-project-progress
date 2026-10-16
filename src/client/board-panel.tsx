@@ -1246,16 +1246,34 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   }, [doDeleteProject]);
 
   /**
-   * **取消删除**（用户口径："没有取消操作"）—— 这是本次新增的东西。
+   * **取消删除**（用户口径："没有取消操作"）—— 0.3.24 新增。
    *
-   * 语义就是"我改主意了"：撤掉待确认状态 + 清掉影响范围提示。
-   * 它必须在弹窗里有一个**显式按钮**：只有一个"再点一次"的话，用户想反悔时
-   * 唯一的操作恰好是"确认删除"。
+   * 语义就是"我改主意了"：只撤掉待确认状态。
+   *
+   * ⚠️ **不要顺手清 `rootNotice`**（0.3.27 独立审查指出）：那行还承载着
+   * "整理为单一根"之类的**上一次操作结果**，取消删除不该把它一起抹掉 —— 那是信息丢失。
    */
   const cancelDeleteProject = useCallback(() => {
     setProjectDelete(undefined);
-    setRootNotice(undefined);
   }, []);
+
+  /**
+   * **切换项目时作废"待确认的删除"**（0.3.27 独立审查指出的"可跨工作区确认"缺陷）。
+   *
+   * ## 缺陷现场
+   *
+   * 弹窗开着（针对项目 A）→ 用户切到工作区 B（面板每秒轮询，`board.projectId` 跟着变）→
+   * 点「确认删除」⇒ `doDeleteProject` 取的是**当下**的 `board.projectId`（= B），
+   * 而 `projectDelete.projectId` 是 A ⇒ `pending` 判为 undefined ⇒ 发出 `{projectId: B}` **不带 confirm**
+   * ⇒ 服务端只回 preview（**不删**，这条防线救了一命）⇒ 弹窗内容变成 B ⇒ **再点一次才真删 B**。
+   *
+   * 也就是说：它不会误删，但会**把确认框悄悄换成另一个项目**，用户以为在删 A、其实在删 B。
+   * 修法：项目一变就作废待确认状态，弹窗自己关掉。
+   */
+  const projectIdForDeleteGuard = board?.projectId;
+  useEffect(() => {
+    setProjectDelete(undefined);
+  }, [projectIdForDeleteGuard]);
 
   /**
    * 回滚浮层（FR-51b/53b）：**选回滚点 + 选范围**，所以不能复用"是/否"确认框。
@@ -2411,7 +2429,7 @@ function EmptyState(_props: { onApplied: () => void; sessionId?: string }): Reac
     React.createElement(
       'div',
       { style: styles.note },
-      '用上方的「用 AI 建树（先看成本）」生成功能/任务点树 —— 它按代码的功能语义分，不按目录分。',
+      '用上方的「用 AI 建树（直接生成）」生成功能/任务点树 —— 它按代码的功能语义分，不按目录分。',
     ),
     React.createElement(
       'div',

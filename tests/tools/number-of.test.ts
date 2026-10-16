@@ -14,15 +14,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-/** 与 `src/tools/index.ts` 里的实现保持一致（那里未导出，这里复刻同一套规则）。 */
-function numberOf(value: unknown): number | undefined {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  if (trimmed === '') return undefined;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
+/**
+ * ⚠️ **用真实现，不再复刻**（0.3.27，独立审查指出的隐患）。
+ *
+ * 原先这里在测试文件里**重新定义了一份**同名函数（因为真实现没导出）。
+ * 两份当时逐字一致，但**任何一边漂移都不会被发现** —— 那条防线实际上不设防，
+ * 测试永远绿。现在 import 真实现：改坏了这里就会红。
+ */
+import { numberOf } from '../../src/tools/index.ts';
 
 describe('numberOf：宽容读数字的边界', () => {
   it('**字符串数字要收**（真机事故就是它导致的整轮中断）', () => {

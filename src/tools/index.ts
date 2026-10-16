@@ -91,8 +91,12 @@ function renderResult(result: ApplyResult): string {
  *
  * 只接受**能读成有限数**的字符串/数字；`''`、`'跑了一半'`、`NaN`、`Infinity` 一律
  * 返回 `undefined`（调用方据此当作"没给"），**绝不猜**。
+ *
+ * ⚠️ **导出是为了让测试用真实现**（0.3.27，独立审查指出）：此前 `tests/tools/number-of.test.ts`
+ * 在测试文件里**复刻了一份**同名函数，两边逐字一致但**任何一边漂移都不会被发现** ——
+ * 那条防线实际上不设防。导出后测试 import 它，漂移就会红。
  */
-function numberOf(value: unknown): number | undefined {
+export function numberOf(value: unknown): number | undefined {
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
@@ -460,7 +464,10 @@ export function registerTools(ctx: Context, service: ProjectService): () => void
           '名字/描述过时、该拆的功能点。这些正是本工具补的。' +
           '\n\n' +
           '它 **不改任何东西**：不落库、不建节点、不删枝，只回一份方案（含模型自述"拿不准"的部分、' +
-          '以及被校验拒掉的动作）。要执行就按方案逐条调用 `pm_move` / `pm_update` / `pm_remove` ——' +
+          '以及被校验拒掉的动作）。要执行就按方案逐条调用**真实存在的工具**：' +
+          '`pm_move`（改父）/ `pm_progress`（改进度、状态、note、priority）/' +
+          '`pm_add`（补节点）/ `pm_remove`（删除，走审批）——' +
+          '**本插件没有 `pm_update` 这个工具**（早先描述里指错过，模型照着调会白白浪费一整轮）。' +
           '其中**删除/性质修改仍要走审批通道**（用户明确要求保留）。' +
           '\n\n' +
           '**不做 token 预算前置**（用户口径已取消："不再做 token 预算"）。',

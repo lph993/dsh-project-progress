@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-progress",
-  "version": "0.3.26",
+  "version": "0.3.27",
   "description": "Project Manager — 侧边栏实时进度看板（DSH 双面插件）：项目进度树 + 百分比与未完成计数、关注/门控/交接、回滚点与审查。",
   "type": "module",
   "main": "lib/index.js",

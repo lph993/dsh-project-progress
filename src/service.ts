@@ -664,6 +664,44 @@ export interface AiBuildTreeOk {
 }
 
 /**
+ * **数值宽容**（0.3.27，服务层版）。
+ *
+ * 为什么服务层也要一份：`src/tools/index.ts` 里那份 `numberOf()` 只管**工具入口**，
+ * 而 `reportBatch` 是**逐项**往下传的（`pm_report` 最多 50 项）——
+ * 模型给 `progress: "0.6"` 时那一项会直接 `E_REPORT_ITEM` 整项失败，而不是被宽容掉。
+ * 讽刺的是 0.3.18 做这个转换的**起因**就是 `pm_report` 里 `"progress": "0.3"` 那次事故。
+ *
+ * ⚠️ 写成**模块级函数**而不是类的 `static`：静态方法里引用类名会被打包器改名搞坏
+ * （实测报 `Service is not defined` —— 我第一版就是这么写的）。
+ * 两处必须同语义（读不成数 ⇒ `undefined`），所以这里不另立规则，只做同样的转换。
+ */
+function numberOfValue(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed === '') return undefined;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * **进度值归一**：宽容转换 + **夹紧到 [0,1]**（0.3.27）。
+ *
+ * 为什么夹紧而不是拒绝：模型给 `1.5` / `-0.1` 这类越界值时，旧行为是**整条汇报失败**
+ * （schema 校验不过 ⇒ 那一项白写）。夹到边界比"什么都不记"更符合直觉，也不会让
+ * 一次汇总里 49 项成功、第 50 项因数值越界整项丢掉。语义上 `1.5` 就是"满了"。
+ */
+function clampProgressValue(value: unknown): number | undefined {
+  const parsed = numberOfValue(value);
+  if (parsed === undefined) return undefined;
+  if (parsed < 0) return 0;
+  if (parsed > 1) return 1;
+  return parsed;
+}
+
+/**
  * 项目服务。
  */
 export class ProjectService {
@@ -1282,7 +1320,30 @@ export class ProjectService {
      * - **`activePanelScope` 之外的一切调用（工具、写路径、后台任务）看不到面板作用域** ——
      *   它们只认调用会话自己的 cwd。这个区分有 e2e 专门钉住，不许再被合并。
      */
-    const scope = this.effectivePanelScope(sessionId);
+    /**
+     * **只有"面板读取"上下文才认面板作用域**（0.3.27 修并发泄漏，见 `panelReadDepth` 的注释）。
+     *
+     * 原先这里无条件读 `activePanelScope` ⇒ 面板读取的 `await` 期间，
+     * 同一会话的工具调用也会读到它（写入被绑到面板在看的工作区）。
+     * 现在多一道 `panelReadDepth > 0`：**只有 `board()` 那条链内部才可能为真**，
+     * 工具路径（`bindForCall(sessionId)`）永不置位 ⇒ 看不到面板作用域。
+     */
+    /**
+     * **只有"面板读取/面板意图"上下文才认面板作用域**（0.3.27）。
+     *
+     * ## 先说清楚：这条闸门是**纵深防御**，不是当前唯一防线
+     *
+     * 独立审查报了"面板读取 `await` 期间同一会话的工具写入会被面板作用域劫持"。
+     * 我按那条推理去实测，结论是**在真实路径上不成立**：下面第 ② 条
+     * `sessionRoots.get(sessionId)` **优先级更高**，而工具的 cwd 每轮都会报
+     * （`noteWorkspaceRoot`），所以具名会话**根本走不到这条面板分支**。
+     *
+     * 那为什么还留着这道闸门：`sessionRoots` 里没有该会话记录时（进程刚起来、
+     * 该会话还没报过根），分支顺序就会让面板作用域接住它 —— 而"面板读得久一点"
+     * 恰好就是这个窗口。加一道 `panelReadDepth > 0` 成本为零、语义明确
+     * （**只有面板自己发起的读取/操作才认面板作用域**），把那条理论路径也堵上。
+     */
+    const scope = this.panelReadDepth > 0 ? this.effectivePanelScope(sessionId) : undefined;
     if (scope !== undefined) {
       return {
         root: scope.root,
@@ -1360,6 +1421,42 @@ export class ProjectService {
   }
 
   /**
+   * **这次解析是不是"面板读取"上下文**（0.3.27，独立审查抓到的高危）。
+   *
+   * ## 缺陷（我 0.3.13 声称"修好了写路径"，其实只是换了个入口）
+   *
+   * `activePanelScope` 是**实例字段**，`withPanelScope` 只保证"退出时恢复"，
+   * **不保证并发隔离**：`board()` 在 `await derive()/readGraph()` 期间该字段仍是面板根，
+   * 而同一会话此刻发起的 `pm_progress` 会经 `bindForCall(sessionId) → resolveRoot(sessionId)`
+   * 读到它 ⇒ **写入被绑到面板在看的工作区**。触发条件正是这个插件的日常用法
+   * （会话在 A 干活、面板切到 B 看别处）。
+   *
+   * 原有那道 `inFlightProject` 守卫**只护匿名调用**，具名会话（工具调用的形态）绕过它。
+   *
+   * ## 修法：把"读上下文"从隐式字段改成**显式标记**
+   *
+   * 只有 `board()` 这条读路径会把它置位；**工具路径（`pm_*`）永不置位**，
+   * 于是它们解析根时**看不到面板作用域**，与 0.3.13 想要的口径一致。
+   * 用一个**计数器**而不是布尔：面板读取可能嵌套/并发，退出时按层还。
+   */
+  private panelReadDepth = 0;
+
+  private async withPanelReadContext<T>(
+    scope: { root: string; sessionId?: string; at: number } | undefined,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.activePanelScope;
+    this.activePanelScope = scope;
+    this.panelReadDepth += 1;
+    try {
+      return await run();
+    } finally {
+      this.panelReadDepth -= 1;
+      this.activePanelScope = previous;
+    }
+  }
+
+  /**
    * 在"面板作用域生效"的上下文里执行一段代码（只有 `board()` 用）。
    *
    * 语义刻意做成**瞬时**：进入时提升、退出时恢复（用 `try/finally`，抛错也要恢复 ——
@@ -1405,7 +1502,13 @@ export class ProjectService {
     run: () => Promise<T>,
   ): Promise<T> {
     const scope = this.effectivePanelScope(sessionId, this.panelScopeRoot);
-    return await this.withPanelScope(scope, run);
+    /**
+     * 用 `withPanelReadContext`：面板发起的操作**也需要** `panelReadDepth` 置位，
+     * 否则它内部的 `bindForCall/derive` 解析根时会被那道闸门挡住
+     * （`resolveRoot` 只在深度 > 0 时才认面板作用域）—— 那就把面板意图打成空补丁了。
+     * 它**不会**因此泄漏给工具调用：工具路径根本不经过 `withPanelIntent`。
+     */
+    return await this.withPanelReadContext(scope, run);
   }
 
   /**
@@ -2354,7 +2457,10 @@ export class ProjectService {
     sessionId?: string;
   }): Promise<ApplyResult> {
     const patch: PatchFields = {};
-    if (input.progress !== undefined) patch.progress = input.progress;
+    // 宽容 + 夹紧（0.3.27）：字符串数字与越界值都不该让整条写入失败（越界夹到 0/1）
+    if (clampProgressValue(input.progress) !== undefined) {
+      patch.progress = clampProgressValue(input.progress) as number;
+    }
     if (input.selfState !== undefined) patch.selfState = input.selfState;
     if (input.note !== undefined) patch.note = input.note;
     if (input.priority !== undefined) {
@@ -2513,7 +2619,7 @@ export class ProjectService {
          */
         const touchesProgress =
           update.finish === true ||
-          update.progress !== undefined ||
+          numberOfValue(update.progress) !== undefined ||
           update.selfState !== undefined ||
           update.note !== undefined ||
           update.priority !== undefined;
@@ -2543,10 +2649,15 @@ export class ProjectService {
               })
             : await this.progress({
                 nodeId: update.nodeId,
-                ...(update.progress !== undefined ? { progress: update.progress } : {}),
+                // 宽容 + 夹紧（0.3.27）：模型给 "0.6" / 1.5 / -0.1 都不该让这一项整项失败
+                ...(clampProgressValue(update.progress) !== undefined
+                  ? { progress: clampProgressValue(update.progress) as number }
+                  : {}),
                 ...(update.selfState !== undefined ? { selfState: update.selfState } : {}),
+                ...(numberOfValue(update.priority) !== undefined
+                  ? { priority: numberOfValue(update.priority) as number }
+                  : {}),
                 ...(update.note !== undefined ? { note: update.note } : {}),
-                ...(update.priority !== undefined ? { priority: update.priority } : {}),
                 ...(update.rev !== undefined ? { rev: update.rev } : {}),
                 ...(input.reason !== undefined ? { reason: input.reason } : {}),
                 ...(input.by !== undefined ? { by: input.by } : {}),
@@ -5203,9 +5314,13 @@ export class ProjectService {
      * `bindForCall → resolveRoot` 再解析一次根，上下文必须活着穿过去，
      * 否则刚绑好的面板工作区会被**会话自己的 cwd** 拨回去
      * （"切了工作区还是同一棵树"就是这个成因）。
-     * 而出了这个作用域，`resolveRoot` 看不到面板声明 ⇒ 写路径不受影响。
+     *
+     * ⚠️ **用 `withPanelReadContext` 而不是 `withPanelScope`**（0.3.27）：
+     * 后者只设置字段，于是面板读取的 `await` 期间**同一会话的工具调用也能读到它**
+     * —— 写入会被绑到面板在看的工作区。前者额外把 `panelReadDepth` 置位，
+     * 而 `resolveRoot` 只在深度 > 0 时才认面板作用域 ⇒ 工具路径看不到。
      */
-    return await this.withPanelScope(
+    return await this.withPanelReadContext(
       scoped
         ? { root: demanded, ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}), at: Date.now() }
         : this.panelScopeRoot,
@@ -8063,6 +8178,30 @@ export class ProjectService {
     if (text.trim() === '') return { status: 'error', reason: 'empty-output', message: '模型没有输出任何内容。' };
 
     const parsed = parseRepairPlan(text, [...viewById.keys()]);
+    /**
+     * **解析失败不能报 `ok`**（0.3.27 独立审查指出）。
+     *
+     * `parseRepairPlan` 在"整份输出不是 JSON 对象"时返回 `{actions: [], rejected: [...]}`，
+     * 而这里原先一律回 `status: 'ok'` —— 于是**模型输出被 token 上限截断**（大树、长提示词）
+     * 这种情况看起来是"AI 审完了、什么都没提"，与"Ai 认为树没问题"**根本无法区分**。
+     * 那正是我最该避免的一类错误：**把失败表达成成功**。
+     *
+     * 判据：一个动作都没解析出来、却留有 rejected ⇒ 这是"输出不可用"，不是"树没问题"。
+     */
+    const outputUnusable =
+      parsed.actions.length === 0 &&
+      parsed.uncertain.length === 0 &&
+      parsed.rejected.some((r) => r.reason.includes('不是 JSON 对象'));
+    if (outputUnusable) {
+      return {
+        status: 'error',
+        reason: 'invalid-output',
+        message:
+          '模型的输出不是可解析的 JSON 对象（很可能是被输出上限截断）—— ' +
+          '**这不代表"树没问题"**，请重试或缩小范围。' +
+          `原始输出前 200 字符：${text.slice(0, 200)}`,
+      };
+    }
     return {
       status: 'ok',
       summary: parsed.summary,
