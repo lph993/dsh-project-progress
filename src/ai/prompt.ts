@@ -161,7 +161,22 @@ export function renderSkeleton(input: PromptInput): string {
   }
   lines.push('');
   lines.push(`文件（${files.length} 个，只列关键文件的内容签名）：`);
-  for (const file of files.slice(0, 60)) {
+  /**
+   * **关键文件必须排在最前面**（0.3.32，独立审查挖出的病灶）。
+   *
+   * 此前这里是 `files.slice(0, 60)` **纯按顺序取**，而顺序 = `allocFairly` 的遍历顺序 ——
+   * `.vs` / `.codeartsdoer` / `.arts` 这类以点开头的目录名排在前面，会把
+   * `README.md` / `PEIS.sln` / 根 `package.json` 挤到第 300 多位 ⇒ **判据材料到不了模型**。
+   *
+   * 这不是"宽松点更好"的问题：0.3.30 加的那条硬规则正是"**先看 README / `*.sln` / 根
+   * `package.json` 判断这是一个应用还是多端工程**" —— 材料看不见，规则就是空的。
+   *
+   * 为什么**不是**把上限从 60 放宽：那会同时多塞噪声（实测前 60 个里有 28 个是
+   * `.vs`/`.codeartsdoer`/`.arts`/`.vscode`）且更费 token。**优先**比**更多**对。
+   */
+  const keyEntries = files.filter((file) => file.keyFile === true);
+  const restEntries = files.filter((file) => file.keyFile !== true);
+  for (const file of [...keyEntries, ...restEntries].slice(0, 60)) {
     const size = file.sizeBytes === undefined ? '' : ` ${Math.round(file.sizeBytes / 1024)}KB`;
     lines.push(`- ${file.path}${size}`);
     if (file.signature !== undefined && file.signature.trim() !== '') {

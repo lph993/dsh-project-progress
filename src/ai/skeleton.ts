@@ -171,6 +171,24 @@ export async function collectSkeleton(input: SkeletonInput): Promise<SkeletonRes
     });
   }
 
+  /**
+   * **关键文件的两件事要分开**（0.3.32，独立审查挖出的病灶）：
+   *
+   * 1. **打标记**：凡是**进了骨架**的关键文件都该被标上 `keyFile: true`。
+   *    此前只在"读签名那 12 个"的循环里顺手标 —— 而那 12 个的候选来自 `files`（全量）
+   *    的**遍历顺序**，且 `skeleton.find()` 只会在**已分配的 400 条**里找。
+   *    后果实测：**`keyFile` 标记数 = 0**（一个都没标上），而 `keyFile` 在渲染侧本来也没人读。
+   * 2. **读签名**：仍然只读 `MAX_SIGNATURE_FILES` 个（成本上限，不动）。
+   *
+   * 为什么必须分开：`renderSkeleton` 按 `files.slice(0, 60)` **顺序**取，而关键文件
+   * （`README.md` / `PEIS.sln` / 根 `package.json`）可能被 `.vs` / `.codeartsdoer` 之类
+   * 以点开头的目录名挤到第 300 多位 ⇒ **判据材料到不了模型**。
+   */
+  for (const item of skeleton) {
+    if (item.kind !== 'file') continue;
+    if (isKeyFileName(item.path.split('/').pop() ?? item.path)) item.keyFile = true;
+  }
+
   // 关键文件签名：只读前 MAX_SIGNATURE_BYTES 字节
   const keyFiles = files
     .filter((file) => isKeyFileName(file.path.split('/').pop() ?? file.path))

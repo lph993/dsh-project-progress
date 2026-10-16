@@ -21,9 +21,14 @@
  *
  * ## 为什么不做成 `DEFAULT_SCAN_EXCLUDE` 的一部分
  *
- * `DEFAULT_SCAN_EXCLUDE` 服务扫描 / 建树 / 行数统计多条路径，改它会波及所有路径；
  * "只看主要代码"是**建树这一个场景**的口径，所以做成叠加层：
  * `DEFAULT_SCAN_EXCLUDE + AI_BUILD_EXCLUDE + 用户自己的 scanExclude`。
+ *
+ * ⚠️ **注释更正**（0.3.32，独立审查核实）：这里原先写"`DEFAULT_SCAN_EXCLUDE` 服务**扫描 / 建树 /
+ * 行数统计多条路径**，改它会波及所有路径" —— **不成立（过时）**。全仓 grep `DEFAULT_SCAN_EXCLUDE`
+ * 共 7 处，**生产代码只有 1 个使用点**（`service.ts` 的 `collectAiSkeleton`）；
+ * `scanWorkspace` 没有生产调用者，`DEFAULT_SCAN_OPTIONS.exclude` 是 `[]`。
+ * 所以改那张表**只影响 AI 建树** —— 这条更正**缩小**了改动面，留着旧说法会让人误判波及范围。
  */
 
 import { matchesGlob, NON_CODE_ARTIFACT_EXCLUDE } from '../domain/scanner.ts';
@@ -40,12 +45,12 @@ export const AI_BUILD_EXCLUDE: readonly string[] = [
   // 少一边就等于 Python/Rust 生态没排（真机后果见 NON_CODE_ARTIFACT_EXCLUDE 的注释）。
   ...NON_CODE_ARTIFACT_EXCLUDE,
   // ── 测试（含测试资产）────────────────────────────────────
-  'tests',
-  'test',
-  '__tests__',
-  '__mocks__',
-  'mocks',
-  'fixtures',
+  '**/tests',
+  '**/test',
+  '**/__tests__',
+  '**/__mocks__',
+  '**/mocks',
+  '**/fixtures',
   '**.test.ts',
   '**.test.tsx',
   '**.test.js',
@@ -54,46 +59,65 @@ export const AI_BUILD_EXCLUDE: readonly string[] = [
   '**.spec.tsx',
   '**.spec.js',
   // ── 示例 / 演示 / 端到端脚本 ────────────────────────────
-  'examples',
-  'example',
-  'demo',
-  'demos',
-  'samples',
-  'sample',
-  'playground',
-  'e2e',
+  '**/examples',
+  '**/example',
+  '**/demo',
+  '**/demos',
+  '**/samples',
+  '**/sample',
+  '**/playground',
+  '**/e2e',
   // ── 生成物**本身**（目录、缓存、第三方产物）──────────────
-  '.render-check',
-  '.turbo',
-  '.parcel-cache',
-  '.next',
-  '.nuxt',
-  '.output',
-  'vendor',
+  '**/.render-check',
+  '**/.turbo',
+  '**/.parcel-cache',
+  '**/.next',
+  '**/.nuxt',
+  '**/.output',
+  '**/vendor',
+  /**
+   * **.NET / VS 的噪声目录**（0.3.32，独立审查在真机 PEIS 上量出来的）。
+   *
+   * 修复"裸名不跨目录"之后骨架里**仍有约 22% 是噪声**，前 60 个可见文件里 28 个来自这几个目录
+   * ——而它们**一个都不在表里**（`.vscode` 在、`.vs` 不在）。
+   *
+   * 为什么必须排：骨架预算只有 400 条，这些条目**直接挤掉真实源码**，
+   * 而它们对"这个项目是什么"零信息量（真机实测：`.vs` 34 条、`libs` 38、`packages` 38、
+   * `TestResults` 25）。
+   */
+  '**/.vs',
+  '**/TestResults',
+  '**/packages',
+  '**/libs',
+  // 华为 CodeArts / VS 的探针产物与索引库（真机 PEIS 里前 60 个可见文件占了 11 条）
+  '**/.codeartsdoer',
+  '**/.arts',
+  '**.snk',
+  '**.pdb',
   // ── 仓库级配置与 IDE/CI 配置（**文件本身**，不含生成它们的代码）──
-  '.github',
-  '.vscode',
-  '.idea',
-  '.husky',
+  '**/.github',
+  '**/.vscode',
+  '**/.idea',
+  '**/.husky',
   // ── 配置文件本身：点名常见的那些，而不是一刀切 `**.json`
   //（一刀切会把 `src/**/*.schema.json` 这类真实数据也挡掉）
-  'tsconfig**.json',
-  'jsconfig**.json',
-  'package.json',
-  'package-lock.json',
-  'pnpm-lock.yaml',
-  'yarn.lock',
+  '**/tsconfig**.json',
+  '**/jsconfig**.json',
+  '**/package.json',
+  '**/package-lock.json',
+  '**/pnpm-lock.yaml',
+  '**/yarn.lock',
   '**.lock',
-  'cordis**.yml',
-  'cordis**.yaml',
-  'Dockerfile',
-  'Makefile',
-  '.env**',
-  '.editorconfig',
-  '.gitignore',
-  '.npmrc',
-  '.eslintrc**',
-  '.prettierrc**',
+  '**/cordis**.yml',
+  '**/cordis**.yaml',
+  '**/Dockerfile',
+  '**/Makefile',
+  '**/.env**',
+  '**/.editorconfig',
+  '**/.gitignore',
+  '**/.npmrc',
+  '**/.eslintrc**',
+  '**/.prettierrc**',
 ];
 
 /** 一条工作区相对路径是否被"仅主要代码"这条口径排除（纯函数，可单测）。 */
