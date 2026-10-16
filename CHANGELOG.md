@@ -5,6 +5,42 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.3.29] — 实时记账按项目过滤；仓库依赖链路修复（测试恢复全绿）
+
+### ① `activeNodeIds` 没按项目过滤（真机对照实验抓到）
+
+真机实测，我在 `E:\thirty` 写下节点后，去读 **`e:/CSP/PEIS/PEIS`** 的看板：
+
+```
+我所在项目: active = 02dc7f7c…（我刚写的节点）   ← 正确
+PEIS 项目 : active = 02dc7f7c…（**同一个 nodeId**） ← 错误：那棵树里根本没这个节点
+```
+
+根因：`busySessions` 是**跨项目的全局记账**。某个会话在别的工作区写节点时，它同样进
+`activeNodeIds`；而画布拿这个列表点火 ⇒ **看板字段与它描述的那棵树不自洽**。
+修法：在 `assembleBoard` 里与本项目节点集合求交（`busySessionIds` 保持全局 —— "谁在忙"本就跨项目）。
+
+回归测试用**双向**断言（读 A 只许出现 A 的、读 B 只许出现 B 的），**并实测过它真的会红**。
+
+### ② 仓库依赖链路修复（原本跑不了测试）
+
+用户把 DSH 从 CLI 换成 Desktop 后，仓库 `node_modules` 里 **17 个 `link:` 全部指向已卸载的旧 CLI**
+（junction 建于 10-13）⇒ `node --test` 只剩 491 条、5 个文件整文件失败、`lib/index.js` 都 import 不了。
+Desktop 的 DSH 包在 `app.asar` 内部（普通 Node 读不了），所以：
+
+- 新建 `E:\thirty\dsh-devlinks\`，按 Desktop 的 DSH 运行时版本（**0.2.0-rc.2**）装上
+  `@deepseek-ai/*` 的**全部 36 个包**（含 peer 依赖 —— 加 `--legacy-peer-deps` 时 npm 不会自动装 peer，
+  我因此踩过一次 `dsh-scope` / `dsh-storage` 缺失）；
+- 把那 17 个 junction 重指过去，**不动仓库的 `package.json`**（链接意图保留、可随时换回）。
+
+结果：**全量 569/569 通过**、client 类型检查 **0 错误**。
+
+### ③ 数值转换抽到 `src/shared/number.ts`（0.3.27 我把测试搞挂的收尾）
+
+0.3.27 为修"测试复刻实现"把 `numberOf` 从 `src/tools/index.ts` 导出 ⇒ 测试一 import 就
+**把整个工具模块拖进加载图**（它依赖 `@deepseek-ai/dsh-tools`）⇒ **6 个测试文件整文件失败**。
+抽到无依赖模块后，工具侧/服务侧/测试取同一份实现。
+
 ## [0.3.28] — 真机验证抓到"忙"判据的时效缺陷；数值转换抽到无依赖模块
 
 > 环境说明：用户把 DSH 从 CLI 换成了 **Desktop**。Desktop 的 profile **由 Electron 独占管理**

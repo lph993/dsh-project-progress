@@ -1131,6 +1131,81 @@ test('看板作用域：面板声明的工作区路径优先，且只认存在�
  *   （原因就是上面那条优先级）。**不要**把它记成"并发泄漏已封闭"的证据。
  * - 那道闸门是**纵深防御**（堵"该会话还没报过根"那个窗口），不是主防线。
  */
+/**
+ * **别的项目里正在写的节点，不许在本项目流程图上"转圈"**（0.3.29 真机对照实验抓到）。
+ *
+ * `busySessions` 是**跨项目的全局记账**：会话在别的工作区写节点时，同样进 `activeNodeIds`。
+ * 真机现场：我在 `E:\thirty` 写下节点后，`e:/CSP/PEIS/PEIS` 的看板 `activeNodeIds` 里
+ * 出现了**同一个 nodeId** —— 而 PEIS 那棵树里根本没有这个节点。
+ *
+ * 画布拿 `activeNodeIds` 点火，于是"别人的节点"可能让本项目某个 id 巧合亮起；
+ * 更直接的问题是：**看板字段与它描述的那棵树不自洽**。
+ */
+test('实时记账按项目过滤：别的项目在写的节点不许出现在本项目的 activeNodeIds', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-live-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-live-b-'));
+  const ctx = createFakeContext({ workspace: wsA });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  /**
+   * **必须让 agent 报 `running`** —— `noteNodeTouched` 只在会话确实在跑时才记账
+   * （查不到账就向 agent 问一次实时状态，不是 running 就直接 return）。
+   * 我前几版没给这个 stub，于是"记账根本不会发生"，测试永远量到一个空的 activeNodeIds。
+   */
+  ctx.services.set('agents', {
+    get: (id: string) => (id === 'session-A' || id === 'session-B' ? { status: 'running' } : undefined),
+  });
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined, sessionId?: string): void;
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+    board(sessionId?: string, root?: string): Promise<{ activeNodeIds: string[]; nodes: Array<{ id: string }> }>;
+    progress(input: Record<string, unknown>): Promise<{ status: string }>;
+  };
+
+  // A 里建一个节点（会话 A 来写，于是它进 activeNodeIds）
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  const inA = await service.addNode({ parentId: null, name: 'A树', sessionId: 'session-A' });
+  const nodeAId = inA.nodeId as string;
+  service.noteWorkspaceRoot(wsA, 'session-A');
+  await service.progress({ nodeId: nodeAId, progress: 0.5, sessionId: 'session-A' });
+
+  // B 是另一个工作区、另一棵树
+  service.noteWorkspaceRoot(wsB, 'session-B');
+  const inB = await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  const nodeBId = inB.nodeId as string;
+  await service.progress({ nodeId: nodeBId, progress: 0.5, sessionId: 'session-B' });
+
+  /**
+   * **双向验证**（这样比"只看一边"严格，也不依赖"哪个会话还忙着"的时序）：
+   * 读 A ⇒ 只许出现 A 自己写的节点；读 B ⇒ 只许出现 B 自己写的节点。
+   *
+   * 过滤只该"去掉不属于本项目的 id"，不该把本项目自己那条也一起去掉。
+   */
+  const boardA = await service.board('session-A');
+  assert.ok(
+    boardA.activeNodeIds.includes(nodeAId),
+    '会话 A 自己那个项目里，它写的节点必须照常亮：' + JSON.stringify(boardA.activeNodeIds),
+  );
+  assert.ok(
+    !boardA.activeNodeIds.includes(nodeBId),
+    '反之 A 的看板里不许出现 B 的节点：' + JSON.stringify(boardA.activeNodeIds),
+  );
+
+  // 面板在看 B：B 的实时字段里**不许**出现 A 的节点
+  const boardB = await service.board('session-B', wsB);
+  assert.ok(
+    !boardB.activeNodeIds.includes(nodeAId),
+    '**别的项目正在写的节点不许出现在本项目的 activeNodeIds**（否则流程图会点错灯）：' +
+      JSON.stringify(boardB.activeNodeIds),
+  );
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});
+
 test('面板控制会话的读走面板作用域、写走自己的工作区（0.3.27）', async () => {
   const wsA = mkdtempSync(join(tmpdir(), 'pm-e2e-iso-a-'));
   const wsB = mkdtempSync(join(tmpdir(), 'pm-e2e-iso-b-'));
@@ -1834,7 +1909,9 @@ test('多工作区：move/focus/gate/remove 也走「调用会话自己的工作
 
   // B 工作区：另一个会话也建一棵树，并且它的面板轮询过（绑定停在 B）
   service.noteWorkspaceRoot(wsB, 'session-B');
-  await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  const inB = await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  const nodeBId = inB.nodeId as string;
+  await service.progress({ nodeId: nodeBId, progress: 0.5, sessionId: 'session-B' });
   await service.board('session-B');
   assert.notEqual(service.currentProjectId, projectA, '前置条件：当前绑定应当已停在 B 的项目');
 
@@ -2009,7 +2086,9 @@ test('删除项目：两段式确认、删当前项目自愈出空项目、删�
 
   // B：另一个工作区也建一棵树（拿来删）
   service.noteWorkspaceRoot(wsB, 'session-B');
-  await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  const inB = await service.addNode({ parentId: null, name: 'B树', sessionId: 'session-B' });
+  const nodeBId = inB.nodeId as string;
+  await service.progress({ nodeId: nodeBId, progress: 0.5, sessionId: 'session-B' });
   const projectB = service.currentProjectId;
   assert.notEqual(projectA, projectB);
 

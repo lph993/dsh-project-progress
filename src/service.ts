@@ -5372,6 +5372,16 @@ export class ProjectService {
     );
     const doc = await this.checkDocumentFile(graph);
     const meta = await this.port.getMeta(this.projectId);
+    /**
+     * 实时记账（跨项目的全局值）与本项目节点集合。
+     *
+     * `busySessions` 是**跨项目**记账：某个会话在别的工作区写节点时也会进 `activeNodeIds`。
+     * 不过滤的话，**别的项目里正在写的节点会跑到本项目流程图上"转圈"** ——
+     * 真机实测：我在 `E:\thirty` 写下节点后，`e:/CSP/PEIS/PEIS` 的看板 `activeNodeIds`
+     * 里出现了**同一个 nodeId**（那棵树里根本没有这个节点）。
+     */
+    const liveLiveness = await this.busySessionAndActiveNodes();
+    const ownNodeIds = new Set(liveNodes.map((d) => d.node.id));
 
     return {
       projectId: this.projectId,
@@ -5404,8 +5414,16 @@ export class ProjectService {
       /**
        * 正在真干活的会话 + **它们这轮真的动过的节点**（两者同源，见
        * `busySessionAndActiveNodes`）。客户端据此决定谁转圈。
+       *
+       * ⚠️ **节点列表必须与本项目的节点求交**（0.3.29 真机对照实验抓到）：`busySessions`
+       * 是**跨项目的全局记账** —— 某个会话在别的工作区写节点时，它同样进 `activeNodeIds`。
+       * 不筛的话，**别的项目里正在写的节点会跑到本项目流程图上"转圈"**。
+       * 真机实测：我在 `E:\thirty` 写下节点后，`e:/CSP/PEIS/PEIS` 的看板 `activeNodeIds`
+       * 里出现了**同一个 nodeId**（那棵树里根本没有这个节点）。
        */
-      ...(await this.busySessionAndActiveNodes()),
+      busySessionIds: liveLiveness.busySessionIds,
+      activeNodeIds: liveLiveness.activeNodeIds.filter((id) => ownNodeIds.has(id)),
+      lastTurnNodeIds: liveLiveness.lastTurnNodeIds.filter((id) => ownNodeIds.has(id)),
       // 每个节点有几个可用回滚点：菜单要**同步**决定「回滚 / 整枝回滚」显不显示
       // （FR：没有回滚点时不显示，而不是画一个点了没反应的项）
       rollbackPoints: await this.rollbackPointCounts(liveNodes.map((d) => d.node.id)),
