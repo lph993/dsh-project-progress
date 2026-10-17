@@ -168,10 +168,22 @@ export function effectiveSandboxMode(ctx: Context, session?: unknown): SandboxMo
  * 因此这里按沙箱模式**主动降级**，并给出原因供 UI 明示（FR-89d）。
  */
 export function resolveSnapshotMode(
-  preferred: 'auto' | 'git' | 'patch' | 'full',
+  preferred: 'auto' | 'git' | 'patch' | 'full' | undefined,
   report: CapabilityReport,
 ): { mode: 'git' | 'patch' | 'full'; reason: string } {
-  if (preferred !== 'auto') {
+  /**
+   * **只认真正的三个档位，其余一律当成 `auto`**（0.3.46 修）。
+   *
+   * 原先写的是 `if (preferred !== 'auto')` —— 那只在"配置一定被 schema 补过默认值"时成立。
+   * 一旦配置还没经过 schema（例如程序化构造、或某个入口漏了默认值），
+   * `preferred` 就是 `undefined`，于是走进这条分支、返回 `{ mode: undefined }`，
+   * 下游 `SnapshotManager` 的 schema 校验直接抛
+   * `Invalid option: expected one of "git"|"patch"|"full"` ——
+   * **而报错信息里根本看不出"配置没默认值"这件事**（真机 e2e 现场就这么被绊了一次）。
+   *
+   * 改成白名单判断：认不出就当作 `auto` 去探测，行为更保守、也不会炸。
+   */
+  if (preferred === 'git' || preferred === 'patch' || preferred === 'full') {
     return { mode: preferred, reason: '由设置项显式指定' };
   }
   if (report.sandboxMode === 'read-only') {

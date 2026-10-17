@@ -202,6 +202,12 @@ import { parseRepairPlan, type RepairParseResult } from './ai/repair-parse.ts';
 import { planConsolidation, type ConsolidateNode, type ConsolidatePlan } from './domain/consolidate.ts';
 import { decideRootNormalize } from './domain/root-normalize.ts';
 import { reshapeRootToProjectBody } from './ai/root-reshape.ts';
+import {
+  AI_REGROUP_SYSTEM_PROMPT,
+  buildRegroupPrompt,
+  parseRegroupPlan,
+  validateRegroupPlan,
+} from './ai/regroup.ts';
 import { decideRootCollapse } from './domain/root-collapse.ts';
 import { aiRunProgressOf, type AiRunProgress } from './ai/progress.ts';
 import { shouldShard, shardSkeleton, type Shard } from './ai/shard.ts';
@@ -7044,6 +7050,30 @@ export class ProjectService {
      */
     const shardedNormalized = await this.normalizeProjectRoot(input.sessionId);
     if (shardedNormalized.moved > 0) notes.push(`根节点归位：${shardedNormalized.reason}`);
+    /**
+     * **跨片按功能归拢**（0.3.46）。
+     *
+     * 用户原则（`docs/开发须知.md` §0.0）："切分单位 ≠ 树的分支单位，合并时必须按功能归拢。"
+     *
+     * 分批出来的分支天然是**目录形状**的；这一步拿"根的直接子节点"去问模型
+     * "按业务功能该怎么归拢"，再把分组落到树上（只 create/move，**不删任何东西**）。
+     *
+     * **只有分批才做**：单次建树时模型本来就看得全仓库，不必再花一次调用。
+     */
+    const regrouped = await this.regroupShardedBranches({
+      route: input.route,
+      ...(input.stream !== undefined ? { stream: input.stream } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+    });
+    if (regrouped.status === 'ok' && regrouped.createdGroups > 0) {
+      notes.push(`按功能归拢：${regrouped.reason}`);
+      calls += 1;
+    } else if (regrouped.status !== 'skipped') {
+      /** 归拢没成就如实说 —— 别让人以为树已经是按功能长的。 */
+      notes.push(`按功能归拢未生效：${regrouped.reason}`);
+      if (regrouped.status === 'ok') calls += 1;
+    }
     notes.push(
       '分批路径**不写整份树缓存**（没有"一份提示词对应一棵树"的产物），所以下次会重新调用模型 —— ' +
         '这是刻意的：宁可慢，也不要下次命中一棵不完整的树。',
@@ -8493,6 +8523,213 @@ export class ProjectService {
   }
 
   /**
+   * **跨片按功能归拢**（0.3.46）。
+   *
+   * ## 补的是哪一块
+   *
+   * 用户原则（`docs/开发须知.md` §0.0）：
+   * > "不能按目录…切分单位 ≠ 树的分支单位，合并时必须按功能归拢。"
+   *
+   * 0.3.45 修的是"一片吞 20 个目录被串成链"；这一步补的是"**分支仍是目录形状**"。
+   * 拿"根的直接子节点"去问模型"按业务功能该怎么归拢"，再把分组落到树上。
+   *
+   * ## 为什么这套可以**自动应用**（而 `aiPlanRepair` 只能提议）
+   *
+   * 动作集只有两种：**建一个组节点** + **把分支挂到它下面**。
+   * 不删节点、不合并节点、不改任何节点的内容 —— 最坏情况是"层多加了一个"，而不是"东西没了"。
+   * 加上五条硬校验（`ai/regroup.ts` 文件头）与**应用前建回滚点**，风险可控。
+   *
+   * ## 判据都在纯函数里
+   *
+   * `parseRegroupPlan` / `validateRegroupPlan` 负责结构解析与五条硬约束；
+   * 这里只负责"读树 → 调模型 → 按方案搬节点"，不重写任何判据。
+   */
+  async regroupShardedBranches(input: {
+    route: AiRoute;
+    stream?: LlmStreamLike;
+    signal?: AbortSignal;
+    sessionId?: string;
+  }): Promise<
+    | { status: 'ok'; createdGroups: number; moved: number; reason: string }
+    | { status: 'skipped'; reason: string }
+    | { status: 'error'; reason: string }
+  > {
+    try {
+      const { graph, derived } = await this.derive(input.sessionId);
+      const alive = (id: string): boolean =>
+        graph.nodes[id] !== undefined && derived.nodes.get(id)?.derivedState !== 'removed';
+      const roots = graph.rootIds.filter((id) => alive(id) && graph.nodes[id]?.parentId === null);
+      if (roots.length !== 1) {
+        return { status: 'skipped', reason: `顶级节点 ${roots.length} 个（不是 1），不归拢` };
+      }
+      const rootId = roots[0] as string;
+      const childIds = (derived.index.childrenOf.get(rootId) ?? []).filter((id) => alive(id));
+      /**
+       * **分支太少就不值得再花一次调用**：2~4 个分支本来就能一眼看完，
+       * 强行归拢只会把两三个分支塞进一个"大功能"里，反而更难理解。
+       */
+      const MIN_BRANCHES = 5;
+      if (childIds.length < MIN_BRANCHES) {
+        return {
+          status: 'skipped',
+          reason: `根下只有 ${childIds.length} 个分支（少于 ${MIN_BRANCHES} 个，不值得再调一次模型）`,
+        };
+      }
+
+      const branches = childIds.map((id) => {
+        const node = graph.nodes[id] as (typeof graph.nodes)[string];
+        return {
+          id,
+          name: node.name,
+          refs: (node.refs ?? []).map((ref) => ref.target),
+          childCount: (derived.index.childrenOf.get(id) ?? []).length,
+          ...(node.description !== undefined && node.description.trim() !== ''
+            ? { description: node.description }
+            : {}),
+        };
+      });
+
+      const prompt = buildRegroupPrompt({ projectName: graph.projectName, branches });
+      let text = '';
+      const stream = input.stream ?? llmStreamOf(this.ctx);
+      if (stream === undefined) {
+        return { status: 'skipped', reason: '没有可用的模型路由（不发起调用）' };
+      }
+      try {
+        for await (const chunk of stream.stream({
+          provider: input.route.provider,
+          model: input.route.model,
+          messages: [pmUserMessage(prompt)],
+          system: AI_REGROUP_SYSTEM_PROMPT,
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        })) {
+          const delta = readTextDelta(chunk);
+          if (delta !== '') text += delta;
+        }
+      } catch (error) {
+        return {
+          status: 'error',
+          reason: `调用失败：${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if (text.trim() === '') return { status: 'error', reason: '模型没有输出任何内容' };
+
+      const parsed = parseRegroupPlan(text);
+      const verdict = validateRegroupPlan(parsed.groups, branches, graph.projectName);
+      if (!verdict.ok) {
+        return {
+          status: 'error',
+          reason: `${verdict.reason}${verdict.rejected.length > 0 ? `（另：${verdict.rejected.slice(0, 3).join('；')}）` : ''}`,
+        };
+      }
+
+      /**
+       * **应用前尽量建一个回滚点**，但**不硬依赖它**（0.3.46）。
+       *
+       * ## 为什么不是"建不了就不做"
+       *
+       * 我一开始写的就是硬依赖 —— 结果 e2e 里（临时目录不是 git 仓库）归拢**永远不执行**，
+       * 而真机上如果项目没进 git，这个功能就等于没有。可它并**不是**不可逆操作：
+       * 只做两类写入 —— **新增组节点** + **把分支搬进组**，
+       * 要撤销只需把分支搬回根下、删掉组节点（面板上都能做）。不删任何东西。
+       *
+       * 所以改成：**能建就建（多一层保险），建不了也照做，但如实记进结果里**
+       * —— 让人知道"这次归拢没有回滚点可用"。
+       */
+      let snapshotNote = '';
+      try {
+        const snapshot = await this.captureSnapshot({
+          nodeId: rootId,
+          reason: 'manual',
+          ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+        });
+        if (!snapshot.created) snapshotNote = `；未建回滚点（${snapshot.reason}）`;
+      } catch (error) {
+        snapshotNote = `；未建回滚点（${error instanceof Error ? error.message : String(error)}）`;
+      }
+
+      let createdGroups = 0;
+      let moved = 0;
+      const failures: string[] = [];
+      /** 已经建出来的组（用于"一个分支都没搬成"时把空组撤掉）。 */
+      const createdGroupIds: Array<{ id: string; name: string; moved: number }> = [];
+      for (const group of verdict.plan.groups) {
+        const created = await this.addNode({
+          parentId: rootId,
+          name: group.name,
+          kind: 'feature',
+          ...(group.description !== undefined ? { description: group.description } : {}),
+        });
+        if (created.status !== 'ok') {
+          failures.push(`组「${group.name}」建不出来（${created.status}）`);
+          continue;
+        }
+        const groupId = 'nodeId' in created && typeof created.nodeId === 'string' ? created.nodeId : undefined;
+        if (groupId === undefined) {
+          failures.push(`组「${group.name}」建出来了但拿不到 id`);
+          continue;
+        }
+        createdGroups += 1;
+        const record = { id: groupId, name: group.name, moved: 0 };
+        createdGroupIds.push(record);
+        for (const branchId of group.branchIds) {
+          const movedOne = await this.reparentNode({
+            nodeId: branchId,
+            parentId: groupId,
+            reason: `按功能归拢：把「${graph.nodes[branchId]?.name ?? branchId}」归入「${group.name}」`,
+          });
+          if (movedOne.status === 'ok') {
+            moved += 1;
+            record.moved += 1;
+          } else {
+            failures.push(
+              `「${graph.nodes[branchId]?.name ?? branchId}」没搬进「${group.name}」（${movedOne.status}）`,
+            );
+          }
+        }
+      }
+
+      /**
+       * **空组要撤掉**（一个分支都没搬进去的组）：留在树上就是用户明确要消掉的那种"包装层"。
+       * 撤失败也不当成功 —— 如实记进 failures，让人能从诊断里看到树上多了个空节点。
+       */
+      const emptyGroups = createdGroupIds.filter((group) => group.moved === 0);
+      for (const group of emptyGroups) {
+        const removed = await this.removeOne({ nodeId: group.id, policy: 'record' });
+        if (removed.status !== 'ok') {
+          failures.push(`空组「${group.name}」没撤掉（${removed.status}），需要人工处理`);
+        }
+      }
+      if (emptyGroups.length > 0) {
+        createdGroups -= emptyGroups.filter((group) => group.moved === 0).length;
+      }
+
+      /** 一个分支都没搬成 ⇒ 这次归拢没意义，如实报错（空组上面已经撤过了）。 */
+      if (moved === 0) {
+        return {
+          status: 'error',
+          reason: `建了 ${createdGroups} 个组但一个分支都没搬成${failures.length > 0 ? `：${failures.slice(0, 3).join('；')}` : ''}`,
+        };
+      }
+
+      return {
+        status: 'ok',
+        createdGroups,
+        moved,
+        reason:
+          `按业务功能重排成 ${createdGroups} 组、搬动 ${moved} 个分支` +
+          (failures.length > 0 ? `（${failures.length} 项未成：${failures[0]}）` : '') +
+          (parsed.summary !== undefined ? `。模型的说明：${parsed.summary}` : ''),
+      };
+    } catch (error) {
+      return {
+        status: 'error',
+        reason: `归拢出错：${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
    * **AI 树修复：只提议、不执行**（0.3.21，用户口径："算法不行让 AI 上…直接 AI 生成树和修复维护树"）。
    *
    * ## 为什么规则不够，而这里补的是哪一块
@@ -9351,6 +9588,5 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
-
 
 
