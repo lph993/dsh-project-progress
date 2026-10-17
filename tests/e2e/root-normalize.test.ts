@@ -28,7 +28,7 @@ import { test } from 'node:test';
 
 import { createFakeContext, fakeAiStream } from './fake-host.ts';
 
-test('根节点归位：现行领域模型下做不到时，必须如实报告且不动树（0.3.40）', async () => {
+test('建树时就把根扶正：根是端、项目本体是它的子节点 ⇒ 重排（0.3.41）', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'pm-normalize-'));
   const ctx = createFakeContext({ workspace: ws });
   const module = (await import('../../lib/index.js')) as {
@@ -69,45 +69,36 @@ test('根节点归位：现行领域模型下做不到时，必须如实报告�
   });
   const built = await service.aiBuildTree({ stream: fakeAiStream(json), forceRebuild: true });
   assert.equal(built['status'], 'ok', `建树应当成功：${JSON.stringify(built)}`);
-
-  const before = await service.board();
-  const rootsBefore = before.nodes.filter((n) => n.parentId === null);
-  assert.equal(rootsBefore.length, 1, '前置：建完应当是 1 个根');
-  assert.equal(rootsBefore[0]?.name, 'Web 服务端', '前置：根是"某个端"（这样才需要归位）');
-  const body = before.nodes.find((n) => n.name === 'PEIS 体检管理系统');
-  assert.ok(body, '前置：项目本体必须在树里');
-  assert.equal(body.parentId, rootsBefore[0]?.id, '前置：项目本体是根的子节点');
+  const noteText = JSON.stringify(built['notes'] ?? []);
+  assert.match(
+    noteText,
+    /根节点整形/,
+    '整形必须留下说明（否则用户不知道树被重排过）：' + noteText.slice(0, 400),
+  );
 
   /**
-   * **现行领域模型下"事后归位"做不到**（0.3.40 实测定性）。
+   * **建树过程里就该把根扶正**（0.3.41：改在**落库前**）。
    *
-   * 两条路都被领域层的**正确约束**封死：
-   *
-   * - 提根 ⇒ `C13：项目根唯一`（不许造第二个根）；
-   * - 降级旧根 ⇒ `E_CYCLE：不能挂到自己的子孙下面`（**旧根正是项目本体的父**）。
-   *
-   * 所以正确行为是：**如实报告做不到、一个节点都不搬**，而不是假装修、也不是抛错。
-   * 这条测试钉的就是这个"诚实的失败" —— 顺带钉住"不许悄悄改坏树"。
+   * 落库后修不了 —— 提根被 `C13：项目根唯一` 挡、降级旧根被 `E_CYCLE` 挡
+   * （旧根正是项目本体的父）。所以整形必须发生在模型输出上。
    */
-  const attempt = await service.normalizeProjectRoot(undefined);
-  assert.equal(attempt.moved, 0, '**做不到就不许搬节点**：' + JSON.stringify(attempt));
-  assert.match(
-    attempt.reason,
-    /C13|E_CYCLE|无法执行/,
-    '报告必须说清"为什么做不到"（否则用户只会看到"点了没变化"）：' + JSON.stringify(attempt),
-  );
-
   const after = await service.board();
   const rootsAfter = after.nodes.filter((n) => n.parentId === null);
-  assert.equal(rootsAfter.length, 1, '**单根不变量必须保持**（归位失败也不许把树弄成两个根）');
+  assert.equal(rootsAfter.length, 1, '**单项根不变量**：只能有一个根');
   assert.equal(
-    after.nodes.length,
-    before.nodes.length,
-    '**失败不许丢节点**（归位是整理，整理不成也要原样保留）',
+    rootsAfter[0]?.name,
+    'PEIS 体检管理系统',
+    '**根必须是项目本体**（建树阶段就该扶正）：' +
+      `实际根=「${rootsAfter[0]?.name}」，全树=${JSON.stringify(after.nodes.map((n) => n.name))}`,
   );
-  const bodyAfter = after.nodes.find((n) => n.name === 'PEIS 体检管理系统');
-  assert.ok(bodyAfter, '项目本体仍在树里');
-  assert.equal(bodyAfter.parentId, rootsAfter[0]?.id, '结构保持原样（没修成，也没改坏）');
+  assert.equal(after.nodes.length, 5, '整形只改层级方向：**节点一个都不许丢**（原样 5 个）');
+  const demoted = after.nodes.find((n) => n.name === 'Web 服务端');
+  assert.ok(demoted, '旧根不许被丢掉（降级 ≠ 删除）');
+  assert.equal(demoted.parentId, rootsAfter[0]?.id, '旧根降级为项目本体的子节点');
+  const movedChild = after.nodes.find((n) => n.name === '前端界面框架');
+  assert.equal(movedChild?.parentId, demoted.id, '旧根原有的子节点跟随它们的父');
+  const bodyChild = after.nodes.find((n) => n.name === '体检业务办理');
+  assert.equal(bodyChild?.parentId, rootsAfter[0]?.id, '项目本体原有的子节点保持不动');
 
   ctx.disposeAll();
   rmSync(ws, { recursive: true, force: true });

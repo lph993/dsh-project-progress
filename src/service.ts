@@ -201,6 +201,8 @@ import { AI_REPAIR_SYSTEM_PROMPT, buildRepairPrompt, type RepairNodeView } from 
 import { parseRepairPlan, type RepairParseResult } from './ai/repair-parse.ts';
 import { planConsolidation, type ConsolidateNode, type ConsolidatePlan } from './domain/consolidate.ts';
 import { decideRootNormalize } from './domain/root-normalize.ts';
+import { reshapeRootToProjectBody } from './ai/root-reshape.ts';
+import { decideRootCollapse } from './domain/root-collapse.ts';
 import { aiRunProgressOf, type AiRunProgress } from './ai/progress.ts';
 import { shouldShard, shardSkeleton, type Shard } from './ai/shard.ts';
 import {
@@ -7232,6 +7234,30 @@ export class ProjectService {
     staleCleared: number;
   }> {
     const notes: string[] = [];
+    /**
+     * **落库前先把根扶正**（0.3.41）。
+     *
+     * ## 为什么在这里，而不是落库后
+     *
+     * 我先前在落库后改父子关系，撞上领域层两条**正确**的不变量：提根 ⇒ `C13：项目根唯一`、
+     * 降级旧根 ⇒ `E_CYCLE：不能挂到自己的子孙下面`（旧根正是项目本体的父）。
+     * `E_CYCLE` 是树的基本性质，**事后不可能修**；而模型的输出只是"待整理的中间产物"
+     * （`AiTree.nodes` 用数组下标表示父子），**在这里重排既合法又零丢失**。
+     *
+     * ## 为什么分批路径不整形
+     *
+     * 分批时每一片是**局部树**（只覆盖一个分片），片内的"根"不是整棵树的根 ——
+     * 在那儿整形等于每片各自换一个根。整棵树的根只能等**全部片落库之后**看，
+     * 而那正是落库后那条走不通的路 ⇒ **分批树不做这项整形**。
+     */
+    if (options?.partialView !== true) {
+      const reshaped = reshapeRootToProjectBody(tree, tree.projectName ?? '');
+      if (reshaped.reshaped) {
+        /** 局部重绑参数即可：方法内后续引用 `tree` 的地方自动用上新形状。 */
+        tree = reshaped.tree;
+        if (reshaped.note !== undefined) notes.push(reshaped.note);
+      }
+    }
     const { graph, derived } = await this.derive();
     const failures: Array<{ name: string; reason: string }> = [];
     /**
@@ -8299,7 +8325,7 @@ export class ProjectService {
       /**
        * **让项目本体成为唯一的根**。
        *
-       * ## 领域层有一条不变量挡住了"直接提根"
+       * ## 提根会被单根不变量挡下
        *
        * 真机取证的原文（0.3.38 补的诊断信息直接把它指出来了）：
        *
@@ -8307,19 +8333,22 @@ export class ProjectService {
        * 根节点归位失败（提根）：C13：项目根唯一：已存在顶级节点「Web 服务端」
        * ```
        *
-       * `mutateReparent` 的检查表里写着：「**提升为根时已有活根 ⇒ `C13`**（单根不变量）」。
-       * 也就是说 —— **只要根已经存在，"把某节点提为根"这条路永远走不通**，
-       * 跟那个节点是枝还是光杆无关（我一开始按"枝能动、光杆不能"去分情况，是判断错了）。
+       * `mutateReparent` 的检查表写着「**提升为根时已有活根 ⇒ `C13`**」，
+       * 所以"把某个**非根**节点提为根"在根已存在时走不通。
        *
-       * ## 所以：先试提根，失败就**降级旧根**
+       * ## 但"根与根互换层级"是可以的（我 0.3.40 下错了结论）
        *
-       * - **提根**：项目本体搬上去当根 —— 只在"原本没有活根"时才可能成功；
-       * - **降级旧根**（退路）：把**当前根整枝**挂到项目本体下面 ⇒ 项目本体自然成为唯一根。
-       *   这一步是"把非根节点挂到别的节点下"，**根数从 1 变 1**，不触发 C13；
-       *   而且**一个节点都不丢**。
+       * 我在 0.3.40 断言过"事后归位做不到"，理由是"降级旧根会成环（`E_CYCLE`）"。
+       * **那个结论是错的** —— 我只试了搬"非根"节点。`mergeRoots()` 早就在用另一条路：
+       * 把**根**挂到另一个**根**下面。成环检查是"从新父往上走，看会不会走到自己"，
+       * 而被搬的是根 ⇒ 祖先只有它自己 ⇒ **永不成环**；根数 2 → 1 ⇒ **不触发 C13**。
        *
-       * 降级之后「Web 服务端」变成项目本体的一个**子**节点（名字保留）——
-       * 语义上仍然成立（它本来就是"这个项目里的一个端"）。
+       * 于是两种情形各有出路：
+       *
+       * | 树的现状 | 做法 |
+       * |---|---|
+       * | **一个**根 + 本体是它的子节点（单次建树） | 提根（`parentId: null`）—— 此时根就是本体的父，提根不新增根 |
+       * | **两个**根（分批建树每片各自成根） | 把"端"那个根**降级**到本体下（`decideRootCollapse` 判据） |
        *
        * ⚠️ **刻意不传 `sessionId`**：`reparentNode` 内部第一件事是 `bindForCall(sessionId)`，
        * 而具名会话会**按它自己的 cwd 重新解析根** ⇒ 把上面刚绑好的项目又拨走，
@@ -8332,27 +8361,61 @@ export class ProjectService {
           ? `${result.code}${'message' in result && typeof result.message === 'string' ? `：${result.message}` : ''}`
           : result.status;
 
+      /** ① 先试"提根"：只有一个根、且本体是它的子节点时，这一步就能成。 */
+      const promoteFirst = await this.reparentNode({
+        nodeId: promoteId,
+        parentId: null,
+        reason: decision.reason,
+      });
+      if (promoteFirst.status === 'ok') {
+        /**
+         * 提根成功 ⇒ 原根与本体的其余子节点并入本体下面。
+         * 顺序上**先提根再搬孩子**：反过来会把孩子挂到"即将失去根地位"的节点上，中间态更乱。
+         */
+        let moved = 1;
+        for (const childId of children) {
+          if (childId === promoteId || !alive(childId)) continue;
+          const movedOne = await this.reparentNode({
+            nodeId: childId,
+            parentId: promoteId,
+            reason: '根节点归位：原根的其余子节点并入项目本体',
+          });
+          if (movedOne.status === 'ok') moved += 1;
+        }
+        debugBus.info('ai', `根节点归位：提根 1 个、并入 ${moved - 1} 个。${decision.reason}`);
+        return { moved, reason: decision.reason };
+      }
+
       /**
-       * ## 结论：**现行领域模型下做不到**（0.3.40 实测）
+       * ② 提根被挡（`C13`：已有活根）⇒ 试"**把另一个根降级到本体下**"。
        *
-       * 两条路都被封死，而且都是**领域层的正确约束**，不是 bug：
-       *
-       * | 做法 | 结果 | 为什么 |
-       * |---|---|---|
-       * | 把项目本体**提为根**（`parentId: null`） | `C13：项目根唯一` | 单根不变量不许造第二个根 |
-       * | 把旧根**降级**到项目本体下 | `E_CYCLE：不能挂到自己的子孙下面` | **旧根正是项目本体的父** —— 父挂到子下必然成环 |
-       *
-       * `E_CYCLE` 这条是**树的基本性质**：只要模型把"项目本体"建成了根的**子节点**，
-       * 就不可能靠"改父子关系"把根换过来（要么造第二个根，要么成环）。
-       * 我先前以为"提根失败就降级"能绕过去 —— **判断错了**。
-       *
-       * 所以这里不再假装能修：**如实报告，不搬任何节点**。
-       * 真正的出路在**建树侧**（别让模型把根选成某个端），那是提示词与判据的活；
-       * 已经建错的树只能**重建**。
+       * 这条正是 `mergeRoots()` 用的那条路，**不成环、不触发 C13**。
+       * 判据交给纯函数 `decideRootCollapse`（恰好两个根、其中一个明显是项目本体）。
        */
-      const detail = `${decision.reason}；但现行领域模型下无法执行：提根会被单根不变量（C13）挡下，降级旧根会成环（E_CYCLE）—— 旧根正是项目本体的父节点`;
-      debugBus.warn('ai', `根节点归位：判定要归位但无法执行。${detail}`);
-      return { moved: 0, reason: detail };
+      const collapseRoots = roots
+        .map((id) => ({ id, name: graph.nodes[id]?.name ?? '' }))
+        .filter((root) => root.id !== promoteId);
+      const collapse = decideRootCollapse(
+        [...collapseRoots, { id: promoteId, name: graph.nodes[promoteId]?.name ?? '' }],
+        graph.projectName,
+      );
+      if (collapse === null) {
+        const detail = describeReject(promoteFirst);
+        debugBus.warn('ai', `根节点归位失败（提根）：${detail}；且没有可降级的另一个根`);
+        return { moved: 0, reason: `归位失败（提根）：${detail}` };
+      }
+      const demoted = await this.reparentNode({
+        nodeId: collapse.demoteId,
+        parentId: collapse.bodyId,
+        reason: `根节点归位：${collapse.reason}`,
+      });
+      if (demoted.status !== 'ok') {
+        const detail = describeReject(demoted);
+        debugBus.warn('ai', `根节点归位失败（降级旧根）：${detail}`);
+        return { moved: 0, reason: `归位失败（降级旧根）：${detail}` };
+      }
+      debugBus.info('ai', `根节点归位：把「${graph.nodes[collapse.demoteId]?.name ?? ''}」降级到「${graph.nodes[collapse.bodyId]?.name ?? ''}」下面。${collapse.reason}`);
+      return { moved: 2, reason: collapse.reason };
     } catch (error) {
       /**
        * 归位只是整理：**它失败不该让建树整体失败**（树已经落库了）。
@@ -9223,7 +9286,6 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
-
 
 
 

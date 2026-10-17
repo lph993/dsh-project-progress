@@ -79,6 +79,25 @@ function isSameOrigin(projectCore: string, candidate: string): boolean {
   return prefix * 2 >= shorter;
 }
 
+/**
+ * **两个名字是否"同源"**（对外暴露，供建树前的整形共用同一份判据）。
+ *
+ * 为什么不各写一份：判据一旦分叉，"落库前整形"与"落库后校验"就会对**同一棵树**
+ * 给出不同结论 —— 而"同一件事两处实现"正是我这几轮反复踩的坑。
+ */
+export function isSameOriginName(projectName: string, candidateName: string): boolean {
+  const core = coreNameOf(projectName);
+  if (core.length < 4) return false;
+  return isSameOrigin(core, coreNameOf(candidateName));
+}
+
+/**
+ * **两个名字的公共前缀长度**（对外暴露，供"最像项目名的那个"这类判据共用）。
+ */
+export function projectNamePrefixLength(projectName: string, candidateName: string): number {
+  return commonPrefixLength(coreNameOf(projectName), coreNameOf(candidateName));
+}
+
 export interface RootNormalizeCandidate {
   id: string;
   name: string;
