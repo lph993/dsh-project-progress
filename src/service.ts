@@ -200,6 +200,7 @@ import { callTreeBuilder, llmStreamOf, readTextDelta, type BuildTreeCallInput, t
 import { AI_REPAIR_SYSTEM_PROMPT, buildRepairPrompt, type RepairNodeView } from './ai/repair.ts';
 import { parseRepairPlan, type RepairParseResult } from './ai/repair-parse.ts';
 import { planConsolidation, type ConsolidateNode, type ConsolidatePlan } from './domain/consolidate.ts';
+import { decideRootNormalize } from './domain/root-normalize.ts';
 import { aiRunProgressOf, type AiRunProgress } from './ai/progress.ts';
 import { shouldShard, shardSkeleton, type Shard } from './ai/shard.ts';
 import {
@@ -6633,6 +6634,14 @@ export class ProjectService {
       'ai',
       `AI 建树完成：新建 ${applied.created}，更新 ${applied.updated}，失败 ${applied.failures.length}`,
     );
+    /**
+     * **落库后做一次根节点归位**（0.3.35）。
+     *
+     * 三次真机重建、三次不同的错法，提示词路线已证伪（详见 `domain/root-normalize.ts`）。
+     * 放在**落库之后**而不是改模型输出：这样用的是真实节点 id，能复用 `reparentNode`
+     * （自带成环保护 + 审计），出问题也能回滚。
+     */
+    const normalized = await this.normalizeProjectRoot(input.sessionId);
     return {
       status: 'ok',
       projectName: applied.projectName,
@@ -6643,6 +6652,7 @@ export class ProjectService {
       notes: [
         ...call.parsed.notes,
         ...applied.notes,
+        ...(normalized.moved > 0 ? [`根节点归位：${normalized.reason}`] : []),
         ...(cache.diff && cache.diff.dirty
           ? [
               `增量：相比上次建树，文件新增 ${cache.diff.added.length}、删除 ${cache.diff.removed.length}、内容变化 ${cache.diff.changed.length}。`,
@@ -6978,6 +6988,12 @@ export class ProjectService {
     }
 
     notes.push(`分批结果：成功 ${okShards}/${shards.length} 片；没成功的片已如实写进 failures。`);
+    /**
+     * **分批路径也要归位**（0.3.35）：每片各建一棵局部树，落库后**共用一个根**才是完整的树，
+     * 所以归位必须在**全部片落库之后**做一次 —— 放在片循环里做会把"某一片的局部根"当成根。
+     */
+    const shardedNormalized = await this.normalizeProjectRoot(input.sessionId);
+    if (shardedNormalized.moved > 0) notes.push(`根节点归位：${shardedNormalized.reason}`);
     notes.push(
       '分批路径**不写整份树缓存**（没有"一份提示词对应一棵树"的产物），所以下次会重新调用模型 —— ' +
         '这是刻意的：宁可慢，也不要下次命中一棵不完整的树。',
@@ -8174,6 +8190,73 @@ export class ProjectService {
       /** 事件路径记下的会话 id（有账的那些）；**缺账的忙会话**就是本轮要查的对象。 */
       busyFromEvents: [...this.busySessions.keys()],
     };
+  }
+
+  /**
+   * **根节点归位**：项目本体被建成"某个端的子节点"时，把它提升为根（0.3.35）。
+   *
+   * 判据是**纯函数** `decideRootNormalize`（`domain/root-normalize.ts`，含三次真机现场与边界）。
+   * 这里只负责"按决定搬节点"，并保证：
+   *
+   * - **不在部分视图下做**（分批路径的每片是局部树，根的概念不存在于单片里）；
+   * - 用 `reparentNode` 搬（成环保护 + 审计 + 可回滚），不直接改图；
+   * - **失败不影响建树结果**：归位是"整理"，整理不成不该把整次建树判失败。
+   */
+  private async normalizeProjectRoot(
+    sessionId: string | undefined,
+  ): Promise<{ moved: number; reason: string }> {
+    try {
+      const { graph, derived } = await this.derive(sessionId);
+      const alive = (id: string): boolean =>
+        graph.nodes[id] !== undefined && derived.nodes.get(id)?.derivedState !== 'removed';
+      const roots = graph.rootIds.filter((id) => alive(id));
+      if (roots.length !== 1) return { moved: 0, reason: '顶级节点不是恰好 1 个，跳过归位' };
+      const rootId = roots[0] as string;
+      const children = derived.index.childrenOf.get(rootId) ?? [];
+      const decision = decideRootNormalize(
+        graph.projectName,
+        graph.nodes[rootId]?.name ?? '',
+        children
+          .filter((id) => alive(id))
+          .map((id) => ({ id, name: graph.nodes[id]?.name ?? '' })),
+      );
+      if (decision.promoteId === null) return { moved: 0, reason: decision.reason };
+
+      const promoteId = decision.promoteId;
+      /** ① 把项目本体那支提到根（`parentId: null`）。 */
+      const first = await this.reparentNode({
+        nodeId: promoteId,
+        parentId: null,
+        reason: decision.reason,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+      });
+      if (first.status !== 'ok') return { moved: 0, reason: `归位失败（提根）：${first.status}` };
+      /**
+       * ② 原根的其余子节点并入它下面 —— 顺序上**先提根再搬孩子**：
+       * 反过来会把孩子挂到"即将失去根地位"的节点上，中间态更乱。
+       */
+      let moved = 1;
+      for (const childId of children) {
+        if (childId === promoteId || !alive(childId)) continue;
+        const movedOne = await this.reparentNode({
+          nodeId: childId,
+          parentId: promoteId,
+          reason: '根节点归位：原根的其余子节点并入项目本体',
+          ...(sessionId !== undefined ? { sessionId } : {}),
+        });
+        if (movedOne.status === 'ok') moved += 1;
+      }
+      debugBus.info('ai', `根节点归位：提根 1 个、并入 ${moved - 1} 个。${decision.reason}`);
+      return { moved, reason: decision.reason };
+    } catch (error) {
+      /**
+       * 归位只是整理：**它失败不该让建树整体失败**（树已经落库了）。
+       * 如实记一条日志，让人能从诊断里看到"这次没归位"。
+       */
+      const message = error instanceof Error ? error.message : String(error);
+      debugBus.warn('ai', `根节点归位出错（建树结果不受影响）：${message}`);
+      return { moved: 0, reason: `归位出错：${message}` };
+    }
   }
 
   /**
