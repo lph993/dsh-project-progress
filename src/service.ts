@@ -8245,6 +8245,24 @@ export class ProjectService {
   ): Promise<{ moved: number; reason: string }> {
     try {
       const { graph, derived } = await this.derive(sessionId);
+      /**
+       * ⚠️ **归位必须作用在"刚才读的那棵树"所属的项目上**（0.3.38 真机取证）。
+       *
+       * 真机现场：面板看的是 A 工作区，而建树是给 B 工作区建的 —— 分批时**第一片落库就把
+       * 绑定改成 B**，`derive(undefined)` 于是读到 B 的图、算出了要提升的节点 id；
+       * 可紧接着 `reparentNode` 内部又 `bindForCall(sessionId)` **拨回 A** ⇒ 在那个项目里
+       * 找 B 的节点 ⇒ `E_NOT_FOUND`。用户看到的结果是那句毫无信息量的
+       * `{"ok":true,"moved":0,"reason":"归位失败（提根）：denied"}` ——
+       * **点了按钮"没变化"**。
+       *
+       * 修法：把**读到的那个项目**显式绑回来再搬。`switchProject` 本身是幂等的
+       * （同一个 id 进去时 `changed === false`，只是重置快照缓存），所以这里安全。
+       */
+      const targetProjectId = this.projectId;
+      const targetRoot = this.boundRoot;
+      if (targetRoot !== undefined && targetRoot !== '') {
+        this.switchProject(targetProjectId, targetRoot, sessionId);
+      }
       const alive = (id: string): boolean =>
         graph.nodes[id] !== undefined && derived.nodes.get(id)?.derivedState !== 'removed';
       const roots = graph.rootIds.filter((id) => alive(id));
@@ -8278,14 +8296,35 @@ export class ProjectService {
       }
 
       const promoteId = decision.promoteId;
-      /** ① 把项目本体那支提到根（`parentId: null`）。 */
+      /**
+       * ① 把项目本体那支提到根（`parentId: null`）。
+       *
+       * ⚠️ **刻意不传 `sessionId`**：`reparentNode` 内部第一件事是 `bindForCall(sessionId)`，
+       * 而具名会话会**按它自己的 cwd 重新解析根** ⇒ 把上面刚绑好的项目又拨走，
+       * 搬动就会打到另一个项目上（真机就是 `E_NOT_FOUND`）。
+       * 这里传 `undefined` ⇒ `bindForCall` 走"匿名"分支，认的就是上面绑定的那棵树。
+       */
       const first = await this.reparentNode({
         nodeId: promoteId,
         parentId: null,
         reason: decision.reason,
-        ...(sessionId !== undefined ? { sessionId } : {}),
       });
-      if (first.status !== 'ok') return { moved: 0, reason: `归位失败（提根）：${first.status}` };
+      if (first.status !== 'ok') {
+        /**
+         * ⚠️ **必须把 `code` / `message` 带上**（0.3.38 的教训）。
+         *
+         * 我原先只记 `first.status`（`"denied"`），真机上看到的就是
+         * `{"ok":true,"moved":0,"reason":"归位失败（提根）：denied"}` ——
+         * **一个"denied"什么也说明不了**（领域层好几种 reject 都映射成它）。
+         * 补上 code/message 后一眼能分清是"节点不存在（读错了项目）"还是"成环"。
+         */
+        const detail =
+          'code' in first && typeof first.code === 'string'
+            ? `${first.code}${'message' in first && typeof first.message === 'string' ? `：${first.message}` : ''}`
+            : first.status;
+        debugBus.warn('ai', `根节点归位失败（提根）：${detail}`);
+        return { moved: 0, reason: `归位失败（提根）：${detail}` };
+      }
       /**
        * ② 原根的其余子节点并入它下面 —— 顺序上**先提根再搬孩子**：
        * 反过来会把孩子挂到"即将失去根地位"的节点上，中间态更乱。
@@ -8297,7 +8336,7 @@ export class ProjectService {
           nodeId: childId,
           parentId: promoteId,
           reason: '根节点归位：原根的其余子节点并入项目本体',
-          ...(sessionId !== undefined ? { sessionId } : {}),
+          // 同理不传 sessionId：见上面"提根"那段说明
         });
         if (movedOne.status === 'ok') moved += 1;
       }
