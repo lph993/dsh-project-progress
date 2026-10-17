@@ -897,6 +897,17 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [projectDelete, setProjectDelete] = useState<
     { projectId: string; preview: string } | undefined
   >(undefined);
+  /**
+   * **删除请求正在飞**（0.3.37，用户反馈："点击后没有锁页面，好像在删除过程中能点其他地方"）。
+   *
+   * 三个作用：① 防重入（不可逆操作不许重复提交）；
+   * ② 弹窗按钮禁用并改文案（让人看到"在删"）；
+   * ③ 遮罩点了也不关 —— 那一刻关掉只会让人以为"取消了"，而请求已经发出去了。
+   *
+   * ⚠️ 但**第一次点击到拿到影响范围之间**这一段没有锁：那时还没有确认框，
+   * 用户看到的仍是普通面板。那是"预览"阶段，可取消、无副作用，不上锁是合理的。
+   */
+  const [deleting, setDeleting] = useState(false);
   const [hideDone, setHideDone] = useState(false);
   const [showStatus, setShowStatus] = useState(false);
   /**
@@ -1201,12 +1212,22 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const doDeleteProject = useCallback(() => {
     const projectId = board?.projectId;
     if (projectId === undefined || projectId === '') return;
+    /**
+     * **防重入**（0.3.37，用户反馈："删除过程中能点其他地方"）。
+     *
+     * 删除是**不可逆**的，请求还在飞的时候绝不能再来一次：
+     * 之前没有这道闸门 ⇒ 连点两次「确认删除」会发两次真删请求（第二次打的是刚被删掉的项目，
+     * 只会失败，但"能重复提交"本身就是不该有的行为）。
+     */
+    if (deleting) return;
     const pending = projectDelete?.projectId === projectId ? projectDelete : undefined;
+    if (pending !== undefined) setDeleting(true);
     void deleteProject(
       pending !== undefined ? { projectId, confirm: true } : { projectId },
       undefined,
       sessionId,
     ).then((outcome) => {
+      setDeleting(false);
       const value = outcome.value;
       if (value === undefined) {
         setRootNotice(`删除项目失败：${outcome.error ?? '未知错误'}`);
@@ -1239,7 +1260,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       );
       refresh();
     });
-  }, [board?.projectId, projectDelete, refresh, sessionId]);
+  }, [board?.projectId, deleting, projectDelete, refresh, sessionId]);
 
   /** 确认删除（弹窗里那个按钮）：走服务端 `confirm: true`。 */
   const confirmDeleteProject = useCallback(() => {
@@ -1880,60 +1901,87 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
        * ① **没有取消操作** —— 想反悔只能再点一下，而那正是"确认删除"；
        * ② 影响范围只是页面上多一行小字，一个删掉整棵树的动作不该这么轻。
        *
-       * 现在走弹窗：影响范围写在框里，**「确认删除」与「取消」并列**，点遮罩也算取消。
-       * 服务层不动（它本来就是 `needs-confirm` → `confirm: true` 两段式，AI 工具那条路还在用）。
-       */
-      projectDelete !== undefined
-        ? React.createElement(
-            'div',
-            {
-              style: styles.modalBackdrop,
-              role: 'presentation',
-              'data-pm-delete-modal': '1',
-              /** 点遮罩 = 取消（这里没有"执行中"的副作用，关掉没有代价）。 */
-              onMouseDown: (event: React.MouseEvent) => {
-                if (event.target !== event.currentTarget) return;
-                cancelDeleteProject();
-              },
-            },
-            React.createElement(
+         * 现在走弹窗：影响范围写在框里，**「确认删除」与「取消」并列**，点遮罩也算取消。
+         * 服务层不动（它本来就是 `needs-confirm` → `confirm: true` 两段式，AI 工具那条路还在用）。
+         *
+         * ⚠️ **执行中要锁**（0.3.37，用户反馈："点击后没有锁页面，好像在删除过程中能点其他地方"）：
+         * 删除请求发出去之后 —— 按钮禁用并改文案、遮罩点了也不关、重复点击直接忽略。
+         * 理由：那一刻关掉弹窗只会让人以为"取消了"，而请求**已经发出去了**；
+         * 不可逆操作最怕的就是"以为没生效，于是又点了一次"。
+         */
+        projectDelete !== undefined
+          ? React.createElement(
               'div',
               {
-                style: styles.modalCard,
-                role: 'dialog',
-                'aria-modal': true,
-                'aria-label': '确认删除这个项目',
-                onMouseDown: (event: React.MouseEvent) => event.stopPropagation(),
+                style: {
+                  ...styles.modalBackdrop,
+                  /** 执行中给一个"忙"的光标反馈（视觉上也说明这一下点不动）。 */
+                  ...(deleting ? { cursor: 'progress' as const } : {}),
+                },
+                role: 'presentation',
+                'data-pm-delete-modal': '1',
+                'data-pm-delete-busy': deleting ? '1' : '0',
+                /** 点遮罩：不忙时算取消；执行中不关（关掉会误导成"取消了"）。 */
+                onMouseDown: (event: React.MouseEvent) => {
+                  if (event.target !== event.currentTarget) return;
+                  if (deleting) return;
+                  cancelDeleteProject();
+                },
               },
-              React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '确认删除这个项目？'),
-              React.createElement('div', { style: styles.note }, projectDelete.preview),
               React.createElement(
                 'div',
-                { style: { display: 'flex', gap: 8, marginTop: 10 } },
+                {
+                  style: styles.modalCard,
+                  role: 'dialog',
+                  'aria-modal': true,
+                  'aria-label': '确认删除这个项目',
+                  onMouseDown: (event: React.MouseEvent) => event.stopPropagation(),
+                },
+                React.createElement('div', { style: { fontWeight: 600, marginBottom: 4 } }, '确认删除这个项目？'),
+                React.createElement('div', { style: styles.note }, projectDelete.preview),
+                deleting
+                  ? React.createElement(
+                      'div',
+                      { style: { ...styles.note, marginTop: 6 }, 'data-pm-delete-progress': '1' },
+                      '正在删除…删除期间请勿操作（这一步不可撤销）。',
+                    )
+                  : null,
                 React.createElement(
-                  'button',
-                  {
-                    type: 'button',
-                    style: styles.headerButton,
-                    'data-pm-delete-confirm': '1',
-                    onClick: confirmDeleteProject,
-                  },
-                  '确认删除',
-                ),
-                React.createElement(
-                  'button',
-                  {
-                    type: 'button',
-                    style: styles.headerButton,
-                    'data-pm-delete-cancel': '1',
-                    onClick: cancelDeleteProject,
-                  },
-                  '取消',
+                  'div',
+                  { style: { display: 'flex', gap: 8, marginTop: 10 } },
+                  React.createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      style: {
+                        ...styles.headerButton,
+                        ...(deleting ? { opacity: 0.5, cursor: 'not-allowed' as const } : {}),
+                      },
+                      'data-pm-delete-confirm': '1',
+                      disabled: deleting,
+                      onClick: confirmDeleteProject,
+                    },
+                    deleting ? '删除中…' : '确认删除',
+                  ),
+                  React.createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      style: {
+                        ...styles.headerButton,
+                        ...(deleting ? { opacity: 0.5, cursor: 'not-allowed' as const } : {}),
+                      },
+                      'data-pm-delete-cancel': '1',
+                      /** 执行中不给取消：请求已经发出去了，"取消"给不了任何保证。 */
+                      disabled: deleting,
+                      onClick: cancelDeleteProject,
+                    },
+                    '取消',
+                  ),
                 ),
               ),
-            ),
-          )
-        : null,
+            )
+          : null,
       // **AI 建树的确认框（红框）与结果（白框）都以模态框呈现**（用户口径："红框部分，和生成的
       // 内容展示部分（白框），用 modal 吧，执行中不可点击空白取消，只能明确点取消或关闭"）。
       // 原来内联在标题区：① 内容一长就把画布挤下去；② 点空白会连带触发画布"取消选中"，
@@ -2482,6 +2530,4 @@ function EmptyState(_props: { onApplied: () => void; sessionId?: string }): Reac
     ),
   );
 }
-
-
 

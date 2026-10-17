@@ -84,7 +84,7 @@ test('「删除此项目」必须是**带取消**的确认弹窗（0.3.24）', (
   assert.match(source, /cancelDeleteProject/, '取消要真的有处理函数，而不是只画个按钮');
   assert.match(
     source,
-    /onMouseDown: \(event: React\.MouseEvent\) => \{\s*if \(event\.target !== event\.currentTarget\) return;\s*cancelDeleteProject\(\);/,
+    /onMouseDown: \(event: React\.MouseEvent\) => \{\s*if \(event\.target !== event\.currentTarget\) return;(\s*if \(deleting\) return;)?\s*cancelDeleteProject\(\);/,
     '点遮罩也算取消（但必须先判"点的是空白"，否则点卡片内部就会误关）',
   );
   /**
@@ -120,4 +120,26 @@ test('实时进度：粗估措辞 + 完成后保留（保持 100%）+ 有真实�
     '不许再加回"只在执行中显示进度条"——那会让完成后的 token 消耗看不见',
   );
   assert.match(source, /phase === 'done' \? 100/, '完成时进度条按 100% 画');
+});
+
+test('「删除此项目」执行中必须上锁（0.3.37）', () => {
+  const source = panelSource();
+  /**
+   * 用户反馈："点击后没有锁页面，好像在删除过程中能点其他地方"。
+   *
+   * 删除**不可逆**，所以请求发出去之后那一段必须锁住：
+   * ① 防重复提交（连点两次会发两次真删请求）；
+   * ② 按钮禁用并改文案（让人看到"在删"）；
+   * ③ **遮罩点了也不关** —— 那一刻关掉只会让人以为"取消了"，而请求已经发出去了。
+   */
+  assert.match(source, /'data-pm-delete-busy': deleting \? '1' : '0'/, '弹窗要暴露"忙碌中"状态（可被测试与调试观察）');
+  assert.match(source, /'data-pm-delete-progress': '1'/, '忙碌时要有明确的"正在删除"提示');
+  assert.equal(
+    (source.match(/disabled: deleting/g) ?? []).length,
+    2,
+    '「确认删除」与「取消」两个按钮在执行中都要禁用',
+  );
+  assert.match(source, /if \(deleting\) return;\s*\n\s*cancelDeleteProject\(\);/, '执行中点遮罩不许关弹窗');
+  assert.match(source, /if \(deleting\) return;/, 'doDeleteProject 必须防重入');
+  assert.match(source, /deleting \? '删除中…' : '确认删除'/, '确认按钮要改口成"删除中…"');
 });
