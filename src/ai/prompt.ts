@@ -70,6 +70,34 @@ export interface PromptInput {
    * 不传（`undefined`）= 按常规要求每个节点都给描述（首次建树用）。
    */
   describeOnly?: readonly string[] | undefined;
+  /**
+   * **这一片是分批建树里的第几片 / 共几片，覆盖哪些目录**（0.3.45）。
+   *
+   * ## 为什么必须告诉模型
+   *
+   * 分批时每片只拿到**一部分**骨架，但提示词此前**完全没提这件事** ——
+   * 模型以为"这就是整个仓库"，于是把片内的几个目录当成了项目的全部层级。
+   *
+   * 真机代价（PEIS，`SHARD_MAX_COUNT = 6` 时）：合并片吞下 **20 个互不相关的目录**，
+   * 模型只能把它们**串成一条 8 层深的链**：
+   *
+   * ```
+   * 职业健康业务模块 > … > 客户端资源与启动加载 > 数据访问与仓储层 > 领域模型与业务事件 > Blazor 组件库
+   * ```
+   *
+   * 跨度从"职业健康"到"Blazor 组件库"——移动端/外检客户端/基础库全被串进同一个分支。
+   *
+   * 告诉它"你只看到一部分、把这些目录当**并列**的区域"之后，它至少知道
+   * **不该把它们串起来**，而应产出并列分支。
+   */
+  shardScope?: {
+    index: number;
+    total: number;
+    /** 这一片覆盖的顶层目录（给人/模型看的标签，如 `Modules 等 5 个目录`）。 */
+    label: string;
+    /** 这一片实际覆盖的顶层目录名（逐个列出来）。 */
+    groups: readonly string[];
+  };
 }
 
 /** 系统提示词：把"不许做什么"写清楚，比"要做什么"更能省 token。 */
@@ -188,6 +216,33 @@ export function renderSkeleton(input: PromptInput): string {
   const lines: string[] = [];
   const dirs = input.skeleton.filter((entry) => entry.kind === 'dir');
   const files = input.skeleton.filter((entry) => entry.kind === 'file');
+  /**
+   * **分批时先把"你只看到一部分"讲清楚**（0.3.45）。
+   *
+   * 不说的后果（真机 PEIS）：模型以为自己看到的是整个仓库，把片里的多个不相关目录
+   * 串成了一条 8 层深的链。说清楚之后它才知道这些目录是**并列的区域**、不该套在一起。
+   */
+  if (input.shardScope !== undefined && input.shardScope.total > 1) {
+    const scope = input.shardScope;
+    lines.push(`⚠ **这是分批建树的第 ${scope.index}/${scope.total} 片，你只看到仓库的一部分。**`);
+    lines.push(`这一片覆盖：${scope.label}`);
+    if (scope.groups.length > 1) {
+      lines.push(
+        `具体是这 ${scope.groups.length} 个**互不相关**的顶层目录：${scope.groups.join('、')}`,
+      );
+      lines.push(
+        '**它们不是一棵树上的上下级，是并列的几块区域** —— ' +
+          '请给出并列的大功能/分支，**绝不许把它们串成一条链**' +
+          '（例如不许让"目录 A 的业务"下面挂着"目录 B 的基础库"）。',
+      );
+    }
+    lines.push(
+      '其余 ' +
+        `${scope.total - 1} 片各自建自己那部分；所有片**共用一个根**（根名用项目名），` +
+        '你不要为这一片另起一个叫项目名的子节点。',
+    );
+    lines.push('');
+  }
   lines.push(`项目名建议：${input.projectName}`);
   lines.push(`目录（${dirs.length} 个）：`);
   for (const dir of dirs.slice(0, 120)) {

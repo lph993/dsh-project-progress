@@ -6945,6 +6945,20 @@ export class ProjectService {
         maxNodes: shardMaxNodes,
         ...(shardSkeletonResult.truncated ? { truncated: true } : {}),
         ...(input.describeOnly !== undefined ? { describeOnly: input.describeOnly } : {}),
+        /**
+         * **告诉模型"你只看得到这一片"**（0.3.45 真机病灶）。
+         *
+         * 之前这句完全没有 —— 模型以为片内那几个目录就是整个仓库，
+         * 于是把互不相关的目录串成一条链（真机 8 层深管道）。
+         */
+        shardScope: {
+          index: index + 1,
+          total: shards.length,
+          label: shard.rootDir === '' ? '(仓库根下的散文件)' : shard.rootDir,
+          groups: [...new Set(shard.entries.map((entry) => String(entry.path).split('/')[0] ?? ''))].filter(
+            (group) => group !== '',
+          ),
+        },
       });
       const call = await this.callTreeBuilderWithProgress(
         {

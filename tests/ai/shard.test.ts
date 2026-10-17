@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import {
   SHARD_MAX_COUNT,
   SHARD_MAX_FILES,
+  SHARD_MAX_GROUPS_PER_SHARD,
   SHARD_THRESHOLD_FILES,
   shardSkeleton,
   shouldShard,
@@ -98,10 +99,48 @@ test('片数收口：顶层目录很多时并到上限以内，且**一片都不
   const seen = shards.flatMap((shard) => shard.entries.map((entry) => entry.path));
   assert.equal(seen.length, entries.length, '并片不许丢内容');
   for (const entry of entries) assert.ok(seen.includes(entry.path), `${entry.path} 在并片时丢了`);
-  assert.ok(
-    shards[shards.length - 1]?.rootDir.includes('等'),
-    '被并的那一片必须**如实标出**它是多个目录合起来的（不能假装只有一个目录）',
-  );
+  /**
+   * 旧断言是"**最后一片**必须标出它合并了多个目录" —— 那是旧策略（前 N-1 片各自一个目录、
+   * 其余全并进最后一片）的产物。现在改成**均衡分配**，每一片都可能是多目录，
+   * 所以真正的判据是：**凡是合并过的片都必须如实标出**，没合并的片不许瞎标。
+   */
+  for (const shard of shards) {
+    const groups = new Set(shard.entries.map((entry) => entry.path.split('/')[0]));
+    if (groups.size > 1) {
+      assert.ok(
+        shard.rootDir.includes('等'),
+        `「${shard.rootDir}」合并了 ${groups.size} 个目录，必须标明（不能假装只有一个目录）`,
+      );
+    } else {
+      assert.ok(!shard.rootDir.includes('等'), `「${shard.rootDir}」只有一个目录，不该标"等 N 个目录"`);
+    }
+  }
+});
+
+test('片数收口：**每片最多 SHARD_MAX_GROUPS_PER_SHARD 个顶层目录**（0.3.45 真机病灶）', () => {
+  /**
+   * 真机现场：25 个顶层目录、`SHARD_MAX_COUNT = 6`。
+   *
+   * 旧策略留下 5 片各 1 个目录，**其余 20 个目录全并成一片** —— 模型被要求把 20 个
+   * 互不相关的目录组织成一棵树，只能串成链，于是产出 8 层深的管道
+   * （从「职业健康业务模块」串到「Blazor 组件库」）。
+   *
+   * 现在必须是**均衡分配**：片数不合规就多切几片，但每片目录数受控。
+   */
+  const entries: ShardEntry[] = [];
+  for (let index = 0; index < 25; index += 1) entries.push(file(`dir${String(index).padStart(2, '0')}/f.ts`));
+  const shards = shardSkeleton(entries);
+  for (const shard of shards) {
+    const groups = new Set(shard.entries.map((entry) => entry.path.split('/')[0]));
+    assert.ok(
+      groups.size <= SHARD_MAX_GROUPS_PER_SHARD,
+      `每片最多 ${SHARD_MAX_GROUPS_PER_SHARD} 个目录，实际「${shard.rootDir}」有 ${groups.size} 个`,
+    );
+  }
+  /** 片数也要合理：25/6 ⇒ 至少 5 片，且不该爆到 25 片。 */
+  assert.ok(shards.length >= 5 && shards.length <= 6, `片数应当在 5~6，实际 ${shards.length}`);
+  const seen = shards.flatMap((shard) => shard.entries.map((entry) => entry.path));
+  assert.equal(seen.length, entries.length, '**一片都不许丢条目**');
 });
 
 test('片数收口：先保大目录 —— 最大的那一片不会被并掉', () => {
