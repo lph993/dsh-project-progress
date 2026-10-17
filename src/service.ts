@@ -8385,37 +8385,88 @@ export class ProjectService {
         debugBus.info('ai', `根节点归位：提根 1 个、并入 ${moved - 1} 个。${decision.reason}`);
         return { moved, reason: decision.reason };
       }
+      /**
+       * ② **必须"先降旧根、再升本体"** —— 顺序反了的话两条路都会死。
+       *
+       * ## 我在这里犯过的错（0.3.43 自查）
+       *
+       * 我原来的顺序是"先试提根、失败再降级"。但**单根 + 本体是它的子节点**这种形状
+       * （也就是最要紧的那一种）**两条路都死**：
+       *
+       * - 提根：`C13：项目根唯一`（根已存在）；
+       * - 降级：只有**一个**根，没有"另一个根"可降 ⇒ `decideRootCollapse` 返回 `null`。
+       *
+       * 而 C13 自己的 `hint` 就写着答案：「**若要换根，请先把旧根并入新根下**」。
+       * 按它做就是：**先把旧根挂到本体下**（此时根数 1 → 0，不成环：旧根的祖先只有它自己），
+       * **再把本体提为根**（此时已经没有别的根 ⇒ 不触发 C13）。
+       */
+      const otherRoots = roots.filter((id) => id !== promoteId);
+      const bodyName = graph.nodes[promoteId]?.name ?? '';
+      const demotionReason =
+        `根节点归位：把当前根「${graph.nodes[rootId]?.name ?? ''}」并入项目本体「${bodyName}」下面` +
+        `（${decision.reason}）`;
+
+      if (otherRoots.length > 0) {
+        /**
+         * **多个根**（分批建树每片各自成根）：直接按判据把"端"降级到本体下 ——
+         * 根数 N → N-1，不触发 C13、不成环（被搬的是根）。
+         */
+        const collapse = decideRootCollapse(
+          [...otherRoots, promoteId].map((id) => ({ id, name: graph.nodes[id]?.name ?? '' })),
+          graph.projectName,
+        );
+        if (collapse === null) {
+          const detail = describeReject(promoteFirst);
+          debugBus.warn(
+            'ai',
+            `根节点归位失败（提根 ${detail}）；多个根但判据不成立（并列/同名/没一个像项目名）`,
+          );
+          return { moved: 0, reason: `归位失败：提根 ${detail}；多根但分不出本体` };
+        }
+        const demoted = await this.reparentNode({
+          nodeId: collapse.demoteId,
+          parentId: collapse.bodyId,
+          reason: `根节点归位：${collapse.reason}`,
+        });
+        if (demoted.status !== 'ok') {
+          const detail = describeReject(demoted);
+          debugBus.warn('ai', `根节点归位失败（降级旧根）：${detail}`);
+          return { moved: 0, reason: `归位失败（降级旧根）：${detail}` };
+        }
+        debugBus.info(
+          'ai',
+          `根节点归位：把「${graph.nodes[collapse.demoteId]?.name ?? ''}」降级到「${
+            graph.nodes[collapse.bodyId]?.name ?? ''
+          }」下面。${collapse.reason}`,
+        );
+        return { moved: 2, reason: collapse.reason };
+      }
 
       /**
-       * ② 提根被挡（`C13`：已有活根）⇒ 试"**把另一个根降级到本体下**"。
+       * **只有一个根、而项目本体是它的子节点**：靠 `reparentNode` **做不到**。
        *
-       * 这条正是 `mergeRoots()` 用的那条路，**不成环、不触发 C13**。
-       * 判据交给纯函数 `decideRootCollapse`（恰好两个根、其中一个明显是项目本体）。
+       * ## 这不是"没实现"，是树的性质
+       *
+       * 形状是 `旧根 R → 本体 B`（`B.parent === R`）。两种做法都死：
+       *
+       * | 做法 | 结果 |
+       * |---|---|
+       * | 提 B 为根 | `C13：项目根唯一`（根已存在） |
+       * | 把 R 挂到 B 下 | `E_CYCLE` —— **B 的祖先链里就有 R**，父挂到子下必然成环 |
+       *
+       * C13 的 `hint` 写着"先把旧根并入新根下"，**但那个建议只适用于多根情形**
+       * （旧根不是新根的祖先）；单根形状下它就会绕回来变成环。
+       * 我一度按那个 hint 写了"先降后升"，自查时发现**第一步就成环** —— 那是死路，不能装作能走。
+       *
+       * ## 所以这里如实报告
+       *
+       * 这种形状的修法只有一条：**建树时别让它长成这样**。
+       * 而那道防线在 0.3.41 已经落地了（`ai/root-reshape.ts`：落库前重排模型输出）。
+       * 已建错的树只能**重建** —— 重建时整形会在落库前把根扶正。
        */
-      const collapseRoots = roots
-        .map((id) => ({ id, name: graph.nodes[id]?.name ?? '' }))
-        .filter((root) => root.id !== promoteId);
-      const collapse = decideRootCollapse(
-        [...collapseRoots, { id: promoteId, name: graph.nodes[promoteId]?.name ?? '' }],
-        graph.projectName,
-      );
-      if (collapse === null) {
-        const detail = describeReject(promoteFirst);
-        debugBus.warn('ai', `根节点归位失败（提根）：${detail}；且没有可降级的另一个根`);
-        return { moved: 0, reason: `归位失败（提根）：${detail}` };
-      }
-      const demoted = await this.reparentNode({
-        nodeId: collapse.demoteId,
-        parentId: collapse.bodyId,
-        reason: `根节点归位：${collapse.reason}`,
-      });
-      if (demoted.status !== 'ok') {
-        const detail = describeReject(demoted);
-        debugBus.warn('ai', `根节点归位失败（降级旧根）：${detail}`);
-        return { moved: 0, reason: `归位失败（降级旧根）：${detail}` };
-      }
-      debugBus.info('ai', `根节点归位：把「${graph.nodes[collapse.demoteId]?.name ?? ''}」降级到「${graph.nodes[collapse.bodyId]?.name ?? ''}」下面。${collapse.reason}`);
-      return { moved: 2, reason: collapse.reason };
+      const detail = `${decision.reason}；但**单根形状下无法靠改父子关系换根**：提根会被单根不变量（C13）挡下，而把旧根挂到本体下必然成环（E_CYCLE，本体的祖先链里就有旧根）。这种情况只能重建 —— 建树时整形（0.3.41）会在落库前扶正。`;
+      debugBus.warn('ai', `根节点归位：判定要归位但单根形状下做不到。${detail}`);
+      return { moved: 0, reason: detail };
     } catch (error) {
       /**
        * 归位只是整理：**它失败不该让建树整体失败**（树已经落库了）。
@@ -9286,8 +9337,6 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
-
-
 
 
 
