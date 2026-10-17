@@ -96,7 +96,20 @@ test('建树时就把根扶正：根是端、项目本体是它的子节点 ⇒ 
   assert.ok(demoted, '旧根不许被丢掉（降级 ≠ 删除）');
   assert.equal(demoted.parentId, rootsAfter[0]?.id, '旧根降级为项目本体的子节点');
   const movedChild = after.nodes.find((n) => n.name === '前端界面框架');
-  assert.equal(movedChild?.parentId, demoted.id, '旧根原有的子节点跟随它们的父');
+  /**
+   * 用户口径："**Web服务端没有存在的必要**" ⇒ 旧根的子节点**提到新根下**，
+   * 整层包装消掉；旧根自己退成一个叶（不删：删除是破坏性操作）。
+   */
+  assert.equal(
+    movedChild?.parentId,
+    rootsAfter[0]?.id,
+    '旧根原有的子节点必须提到新根下（不再被包装层吞一层）',
+  );
+  assert.deepEqual(
+    after.nodes.filter((n) => n.parentId === demoted.id).map((n) => n.name),
+    [],
+    '旧根不许再挂着子节点（那正是用户要消掉的层级）',
+  );
   const bodyChild = after.nodes.find((n) => n.name === '体检业务办理');
   assert.equal(bodyChild?.parentId, rootsAfter[0]?.id, '项目本体原有的子节点保持不动');
 

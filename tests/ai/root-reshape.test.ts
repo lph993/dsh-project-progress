@@ -45,13 +45,20 @@ describe('建树前根整形：让项目本体当根', () => {
     const lv = levels(out.tree);
     assert.ok(lv.includes('(根) > PEIS 体检管理系统'), '项目本体当根');
     assert.ok(lv.includes('PEIS 体检管理系统 > Web 服务端'), '**旧根降为项目本体的子节点**');
+    /**
+     * 用户口径："**Web服务端没有存在的必要**" ⇒ 旧根的子节点要**提一级挂到新根下**，
+     * 不能被那个包装层再吞一层。
+     */
     assert.ok(
-      lv.includes('Web 服务端 > 前端界面框架'),
-      '旧根的其余子节点**跟随它们的父**（挂到旧根下面）—— 这样层级不乱、也不与旧根平级',
+      lv.includes('PEIS 体检管理系统 > 前端界面框架'),
+      '旧根的子节点必须**提到新根下**（整层包装消掉），不能挂在旧根下面再深一层',
     );
-    assert.ok(lv.includes('Web 服务端 > 报表输出'), '旧根的其余子节点跟随旧根');
+    assert.ok(lv.includes('PEIS 体检管理系统 > 报表输出'), '旧根的子节点提一级');
     assert.ok(lv.includes('PEIS 体检管理系统 > 体检业务办理'), '项目本体原有的子节点保持不动');
     assert.ok(lv.includes('PEIS 体检管理系统 > 移动端'), '项目本体原有的子节点保持不动');
+    /** 旧根自己不许再当"容器"（它退成叶子；不删是因为删除是破坏性操作）。 */
+    const webChildren = lv.filter((line) => line.startsWith('Web 服务端 > '));
+    assert.deepEqual(webChildren, [], '旧根不许再挂着子节点（那正是用户要消掉的层级）');
 
     /** 根有且只有一个。 */
     assert.equal(out.tree.nodes.filter((n) => n.parent === null).length, 1, '**单项根不变量**：只能一个根');
