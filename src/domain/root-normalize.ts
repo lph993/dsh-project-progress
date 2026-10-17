@@ -98,6 +98,37 @@ export function projectNamePrefixLength(projectName: string, candidateName: stri
   return commonPrefixLength(coreNameOf(projectName), coreNameOf(candidateName));
 }
 
+/**
+ * **一条名字看起来像"某个端/子应用"吗**（0.3.48 抽出共用）。
+ *
+ * 原先这段词表**内联在 `applyAiTree` 里**，只用于"建树后提醒根名可疑"。
+ * 而树体检（`domain/tree-health.ts`）也要用同一个判断 —— 两处各写一份词表迟早分叉
+ * （我这轮已经因为"同一判断两处实现、语义不一致"栽过一次，见 `pickMostLikeProject` 的注释）。
+ * 所以收到这里，两处都用它。
+ *
+ * ⚠️ 词表里的 `Web` 是**窄匹配的代价**：像「PEIS.Web」这种真名也会命中。
+ * 所以调用方**不能**单凭它下结论 —— 它只是"可疑信号"，最终判据仍要结合
+ * "与项目名的公共前缀"一起看。
+ */
+const ENDPOINT_WORDS = [
+  '移动端',
+  '前端',
+  '后端',
+  '服务端',
+  '客户端',
+  '网页',
+  'Web',
+  'Android',
+  'iOS',
+  '小程序',
+  'H5',
+];
+
+/** 名字里出现"端/层"这类词 ⇒ 可能是某个端，而不是项目本体。 */
+export function looksLikeEndpointName(name: string): boolean {
+  return ENDPOINT_WORDS.some((word) => name.includes(word));
+}
+
 export interface RootNormalizeCandidate {
   id: string;
   name: string;

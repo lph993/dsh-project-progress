@@ -665,3 +665,39 @@ export function nodeRowTitle(node: NodeView): string {
   return lines.join('\n');
 }
 
+
+/**
+ * **树体检**（0.3.48）。
+ *
+ * 用户问过两次"这棵树是否健康"，而我两次都是临时写脚本才算出来 —— 判据只在我脑子里。
+ * 这个出口把它变成产品能力：面板点一下就能看到"哪条不对、涉及哪些节点"。
+ * **只读**，不改树。
+ */
+export interface TreeHealthIssue {
+  code: string;
+  severity: 'error' | 'warn' | 'info';
+  message: string;
+  nodeIds: string[];
+}
+
+export interface TreeHealthReport {
+  healthy: boolean;
+  stats: {
+    nodes: number;
+    alive: number;
+    roots: number;
+    maxDepth: number;
+    rootChildren: number;
+    leaves: number;
+    refsTotal: number;
+    nodesWithRefs: number;
+    nodesWithDescription: number;
+  };
+  issues: TreeHealthIssue[];
+}
+
+export async function fetchTreeHealth(
+  signal?: AbortSignal,
+): Promise<FetchOutcome<{ ok: boolean; report: TreeHealthReport }>> {
+  return getJson<{ ok: boolean; report: TreeHealthReport }>('/tree/health', signal);
+}

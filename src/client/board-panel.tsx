@@ -17,6 +17,7 @@ import {
   postRemoveBranch,
   postMergeRoots,
   postNormalizeRoot,
+  fetchTreeHealth,
   deleteProject,
   postRollback,
   fetchSnapshots,
@@ -1745,6 +1746,49 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 },
               },
               '根节点归位',
+              )
+            : null,
+          /**
+           * 「树体检」——**只读**（0.3.48）。
+           *
+           * 用户问过两次"这棵树是否健康"，而我两次都是临时写脚本才算出来。
+           * 这个按钮把结论放到用户手边：一条不带"通过"的体检结论，比十条没人看的日志有用。
+           * 判据全在服务端纯函数里，这里只负责触发与逐条展示。
+           */
+          liveRootCount > 0
+            ? React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: styles.headerButton,
+                  'data-pm-tree-health': '1',
+                  title: '检查这棵树健康不健康：根是否是项目本体、哪一层摊平了、有没有单子链/' +
+                    '名字就是目录名的节点/同一批路径被建了两遍/refs 指向不存在的路径。只读，不改树。',
+                  onClick: () => {
+                    void fetchTreeHealth()
+                      .then((outcome) => {
+                        const report = outcome.value?.report;
+                        if (!outcome.ok || report === undefined) {
+                          setRootNotice(`树体检失败：${outcome.error ?? '未知原因'}`);
+                          return;
+                        }
+                        const parts: string[] = [
+                          `树体检：${report.stats.alive} 节点 / 根 ${report.stats.roots} 个 / ` +
+                            `根下 ${report.stats.rootChildren} 支 / 最深 ${report.stats.maxDepth} 层`,
+                        ];
+                        for (const issue of report.issues) {
+                          const mark = issue.severity === 'error' ? '⛔' : issue.severity === 'warn' ? '⚠️' : 'ℹ️';
+                          parts.push(`${mark} ${issue.message}`);
+                        }
+                        if (report.issues.length === 0) parts.push('没有发现问题 ✓');
+                        setRootNotice(parts.join('\n'));
+                      })
+                      .catch((error: unknown) =>
+                        setRootNotice(`树体检失败：${error instanceof Error ? error.message : String(error)}`),
+                      );
+                  },
+                },
+                '树体检',
             )
           : null,
         /*
@@ -2530,4 +2574,3 @@ function EmptyState(_props: { onApplied: () => void; sessionId?: string }): Reac
     ),
   );
 }
-

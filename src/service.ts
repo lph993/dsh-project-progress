@@ -200,7 +200,8 @@ import { callTreeBuilder, llmStreamOf, readTextDelta, type BuildTreeCallInput, t
 import { AI_REPAIR_SYSTEM_PROMPT, buildRepairPrompt, type RepairNodeView } from './ai/repair.ts';
 import { parseRepairPlan, type RepairParseResult } from './ai/repair-parse.ts';
 import { planConsolidation, type ConsolidateNode, type ConsolidatePlan } from './domain/consolidate.ts';
-import { decideRootNormalize } from './domain/root-normalize.ts';
+import { decideRootNormalize, looksLikeEndpointName } from './domain/root-normalize.ts';
+import { analyzeTreeHealth, summarizeHealth, type HealthNode, type HealthReport } from './domain/tree-health.ts';
 import { reshapeRootToProjectBody } from './ai/root-reshape.ts';
 import {
   AI_REGROUP_SYSTEM_PROMPT,
@@ -6662,6 +6663,15 @@ export class ProjectService {
      * （自带成环保护 + 审计），出问题也能回滚。
      */
     const normalized = await this.normalizeProjectRoot(input.sessionId);
+    /**
+     * **建树后自动做一次树体检**（0.3.48）。
+     *
+     * 用户问过两次"这棵树是否健康"，而我两次都是**临时写脚本**才算出来 ——
+     * 判据不可见，用户就只能靠感觉。这里把结论写进建树说明，让它跟着建树一起出现。
+     *
+     * **只报，不改**：体检与修复是两个入口，混在一起出了错就分不清是谁干的。
+     */
+    const healthLine = await this.treeHealthSummary(input.sessionId);
     return {
       status: 'ok',
       projectName: applied.projectName,
@@ -6673,6 +6683,7 @@ export class ProjectService {
         ...call.parsed.notes,
         ...applied.notes,
         ...(normalized.moved > 0 ? [`根节点归位：${normalized.reason}`] : []),
+        ...(healthLine !== undefined ? [healthLine] : []),
         ...(cache.diff && cache.diff.dirty
           ? [
               `增量：相比上次建树，文件新增 ${cache.diff.added.length}、删除 ${cache.diff.removed.length}、内容变化 ${cache.diff.changed.length}。`,
@@ -7074,6 +7085,9 @@ export class ProjectService {
       notes.push(`按功能归拢未生效：${regrouped.reason}`);
       if (regrouped.status === 'ok') calls += 1;
     }
+    /** 分批路径同样做一次树体检（0.3.48）—— 分批最容易出结构问题，更该报。 */
+    const shardedHealth = await this.treeHealthSummary(input.sessionId);
+    if (shardedHealth !== undefined) notes.push(shardedHealth);
     notes.push(
       '分批路径**不写整份树缓存**（没有"一份提示词对应一棵树"的产物），所以下次会重新调用模型 —— ' +
         '这是刻意的：宁可慢，也不要下次命中一棵不完整的树。',
@@ -7345,9 +7359,12 @@ export class ProjectService {
      * 而且"移动端外出登记"这种名字也可能是真的项目名）。
      */
     const rootNodes = tree.nodes.filter((node) => node.parent === null || node.parent === undefined);
-    const endpointWords = ['移动端', '前端', '后端', '客户端', '网页', 'Web', 'Android', 'iOS', '小程序', 'H5'];
-    const looksLikeEndpoint = (name: string): boolean =>
-      endpointWords.some((w) => name.includes(w));
+    /**
+     * 词表**已抽到 `domain/root-normalize.ts`**（0.3.48）：树体检要用同一份判据，
+     * 两处各写一份迟早分叉（我这轮的教训见 `pickMostLikeProject` 的注释）。
+     * 这里只是给共用函数起个短名，**不是第二份实现**。
+     */
+    const looksLikeEndpoint = looksLikeEndpointName;
     if (rootNodes.length === 1 && looksLikeEndpoint(rootNodes[0]!.name)) {
       const others = tree.nodes.filter(
         (node) => node.parent === null || node.parent === undefined ? false : true,
@@ -8544,6 +8561,57 @@ export class ProjectService {
    * `parseRegroupPlan` / `validateRegroupPlan` 负责结构解析与五条硬约束；
    * 这里只负责"读树 → 调模型 → 按方案搬节点"，不重写任何判据。
    */
+  /**
+   * **读一遍树，算出健康报告**（0.3.48）。
+   *
+   * 判据全在纯函数 `domain/tree-health.ts` 里；这里只负责把"图"与"文件系统事实"喂进去：
+   * - 节点的 refs / 描述 / 进度 / 状态来自派生视图；
+   * - **refs 是否存在**用工作区根 `existsSync` 判 —— 拿不到根就**跳过这一项**
+   *   （宁可不说，也不要在没有依据时报一条"路径不存在"）；
+   * - "名字像不像某个端"复用根归位那套词表，不在这里重写第二份。
+   */
+  async treeHealth(sessionId?: string): Promise<HealthReport> {
+    const { graph, derived } = await this.derive(sessionId);
+    const nodes: HealthNode[] = [];
+    for (const node of Object.values(graph.nodes)) {
+      const state = derived.nodes.get(node.id);
+      if (state === undefined) continue;
+      nodes.push({
+        id: node.id,
+        name: node.name,
+        parentId: node.parentId,
+        kind: node.kind,
+        refs: (node.refs ?? []).map((ref) => ref.target),
+        ...(node.description !== undefined ? { description: node.description } : {}),
+        state: state.derivedState,
+        progress: state.progress,
+        selfState: node.selfState,
+      });
+    }
+    const root = this.boundRoot;
+    return analyzeTreeHealth({
+      projectName: graph.projectName,
+      nodes,
+      ...(root !== undefined && root !== ''
+        ? { refExists: (target: string) => existsSync(join(root, target)) }
+        : {}),
+      looksLikeEndpointName,
+    });
+  }
+
+  /**
+   * 树体检的一行摘要（进建树说明用）。**拿不到图就返回 `undefined`** —— 不编。
+   */
+  private async treeHealthSummary(sessionId?: string): Promise<string | undefined> {
+    try {
+      const report = await this.treeHealth(sessionId);
+      return summarizeHealth(report);
+    } catch (error) {
+      debugBus.warn('tree', `树体检没跑成（不影响建树结果）：${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+
   async regroupShardedBranches(input: {
     route: AiRoute;
     stream?: LlmStreamLike;
@@ -9588,5 +9656,4 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
-
 

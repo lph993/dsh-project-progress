@@ -399,6 +399,20 @@ export function registerRoutes(
             sendJson(res, 200, { ok: true, ...outcome });
             return;
           }
+          case 'GET /pm/tree/health': {
+            /**
+             * **树体检**（0.3.48）。
+             *
+             * 用户问过两次"这棵树是否健康"，而我两次都是**临时写脚本**才算出来 ——
+             * 判据只在我脑子里。这个路由把它变成产品能力：面板一个按钮就能看到
+             * "哪条不对、涉及哪些节点"（判据全在 `domain/tree-health.ts` 的纯函数里）。
+             *
+             * **只读**：不改树。修复走另外的入口（`roots/normalize`、面板操作）。
+             */
+            const report = await service.treeHealth();
+            sendJson(res, 200, { ok: true, report });
+            return;
+          }
           case 'POST /pm/roots/normalize': {
             /**
              * **只做根节点归位，不重建树**（0.3.36）。
