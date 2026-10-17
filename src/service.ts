@@ -6921,17 +6921,16 @@ export class ProjectService {
     let proposed = 0;
     let calls = 0;
     let okShards = 0;
-    let projectName = input.projectName;
     /**
-     * **项目名是否已由某一"片"决定**（0.3.50）。
+     * 项目名：**取各片报的里面最长的那个**（0.3.51）。
      *
-     * 不能靠 `projectName === ''` 判断：它的初值是 `input.projectName`（从目录名/package.json 猜的，
-     * 真机上那就是 `"PEIS"`）⇒ 永远不为空 ⇒ 判断形同虚设。
+     * 两个坑都踩过：
+     * - 0.3.49 之前是"最后一片覆盖"⇒ 真机最后一片报 `"PEIS"`，把「PEIS 体检管理系统」退化掉了；
+     * - 0.3.50 改成"第一片胜"⇒ 真机第一片恰好也报短名 `"PEIS"`，而根叫「PEIS 体检信息系统」。
      *
-     * 用显式标志：**第一片报的非空项目名胜出**，后面的片一律不覆盖 ——
-     * 否则最后一片偶然报个退化名（真机报的是 `"PEIS"`），会把整棵树的根判定与整形全带偏。
+     * 取最长者更具体，且**与片的顺序无关**（顺序不该影响结果）；平手保留先到的（初值 `input.projectName` 兜底）。
      */
-    let projectNameDecided = false;
+    let projectName = input.projectName;
     const failures: Array<{ name: string; reason: string }> = [];
     const notes: string[] = [
       `单次建树失败后改为**按顶层目录分批**（共 ${shards.length} 片），逐片建树并直接落库` +
@@ -7063,11 +7062,12 @@ export class ProjectService {
        * - `root-not-project` 拿 `"PEIS"` 比根名「Web 与 API 站点宿主」⇒ 公共前缀 0 ⇒ 报 error；
        * - `decideRootNormalize` / `root-reshape` 也拿 `"PEIS"` 找项目本体 ⇒ 找不到 ⇒ 整形不生效。
        *
-       * 现在：**第一个非空的说了算**，后面的不覆盖（项目名该由用户决定，不该被某一片偶然覆盖）。
+       * 现在：**取最长的那个非空项目名**（0.3.51 —— 0.3.50 只做到"第一片胜"，
+       * 但真机第一片恰好报了个短名 `"PEIS"`，而根却叫「PEIS 体检信息系统」⇒ 面板标题太含糊）。
+       * 取最长者更具体，且**与片的顺序无关**（顺序不该影响结果）；平手保留先到的。
        */
-      if (!projectNameDecided && applied.projectName.trim() !== '') {
-        projectName = applied.projectName;
-        projectNameDecided = true;
+      if (applied.projectName.trim().length > projectName.length) {
+        projectName = applied.projectName.trim();
       }
       failures.push(...applied.failures);
       await this.recordAiUsage({

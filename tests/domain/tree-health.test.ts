@@ -232,3 +232,38 @@ describe('树健康：一行摘要（面板/建树说明用）', () => {
     assert.match(text, /另 \d+ 项/);
   });
 });
+
+describe('树健康：no-refs 不许误报"聚合节点"（0.3.51 真机）', () => {
+  it('功能组自身没 refs、但子节点有 ⇒ **不报**', () => {
+    /**
+     * 真机现场：`regroupShardedBranches` 建出来的 6 个功能组自身没有 refs
+     * （它描述的是"这组功能"，不是某段代码），而它们的子节点合计 121 条。
+     * 旧判据只看"自己有没有 refs" ⇒ 6 个组全被误报成"无法核对它覆盖哪块代码"。
+     */
+    const withGroup = [
+      node('r', 'PEIS 体检信息系统', null, { refs: ['README.md'], description: '本体', progress: 0.3 }),
+      node('g', '体检业务办理与检查', 'r', { description: '一组功能（聚合节点）', progress: 0.5 }),
+      node('g1', '体检登记', 'g', { refs: ['src/reg'], description: '登记', progress: 0.6 }),
+      node('g2', '总检结论', 'g', { refs: ['src/sum'], description: '总检', progress: 0.4 }),
+    ];
+    const report = analyzeTreeHealth({ projectName: 'PEIS 体检信息系统', nodes: withGroup });
+    assert.ok(
+      !codesOf(report.issues).includes('no-refs'),
+      `聚合节点自身 refs 为空是正常的，不许报：${JSON.stringify(report.issues)}`,
+    );
+  });
+
+  it('整棵子树都没有 refs ⇒ **要报**（这才是"无法核对"）', () => {
+    const empty = [
+      node('r', 'PEIS 体检信息系统', null, { refs: ['README.md'], description: '本体', progress: 0.3 }),
+      node('x', '悬空的组', 'r', { description: '没有任何依据', progress: 0.5 }),
+      node('x1', '悬空的子项', 'x', { description: '也没有', progress: 0.4 }),
+    ];
+    const report = analyzeTreeHealth({ projectName: 'PEIS 体检信息系统', nodes: empty });
+    const issue = report.issues.find((i) => i.code === 'no-refs');
+    assert.ok(issue, '整棵子树都空 ⇒ 必须报出来');
+    /** 该报的是"整棵子树都空"的那一支；**不许**把有 refs 的聚合节点（功能组那种）算进来。 */
+    assert.ok(issue?.nodeIds.includes('x'), '整棵子树都空的那一支必须被报出来');
+    assert.ok(!issue?.nodeIds.includes('r'), '根自己有 refs，不该被报');
+  });
+});

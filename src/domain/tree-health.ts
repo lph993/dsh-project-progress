@@ -306,13 +306,32 @@ export function analyzeTreeHealth(input: HealthInput): HealthReport {
     });
   }
 
-  /** ⑧ 光杆无引用 / 无描述：不影响结构，但影响可跟踪性（info 级）。 */
-  const noRefs = alive.filter((node) => node.refs.length === 0);
+  /**
+   * ⑧ 光杆无引用 / 无描述：不影响结构，但影响可跟踪性（info 级）。
+   *
+   * ⚠️ **只报"整棵子树都没有 refs"的节点**（0.3.51 修正）。
+   *
+   * 原来只判"这个节点自己有没有 refs"，于是**归拢建出来的功能组**全被误报 ——
+   * 真机 6 个组（「体检业务办理与检查」等）自身没有 refs，但它们的子节点合计 121 条 refs。
+   * 聚合节点**本来就不该有自己那一份 refs**（它描述的是"这组功能"，不是某段代码）。
+   *
+   * 判据改成：自己没 refs、**且子树里也没有任何 refs** ⇒ 那才真叫"无法核对它覆盖哪块代码"。
+   */
+  const subtreeHasRefs = (id: string, seen: Set<string> = new Set()): boolean => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    const self = byId.get(id);
+    if (self !== undefined && self.refs.length > 0) return true;
+    return (childrenOf.get(id) ?? []).some((child) => subtreeHasRefs(child.id, seen));
+  };
+  const noRefs = alive.filter((node) => node.refs.length === 0 && !subtreeHasRefs(node.id));
   if (noRefs.length > 0) {
     issues.push({
       code: 'no-refs',
       severity: 'info',
-      message: `${noRefs.length} 个节点没有任何 refs（无法核对它到底覆盖哪块代码）`,
+      message:
+        `${noRefs.length} 个节点**连子节点都没有任何 refs**（无法核对它到底覆盖哪块代码）` +
+        '—— 只报"整棵子树都空"的；功能组这类聚合节点自身 refs 为空是正常的',
       nodeIds: noRefs.map((node) => node.id),
     });
   }
