@@ -57,13 +57,13 @@ describe('根节点归位：判据只看"同一个东西被建成了两个节点
     assert.equal(d.promoteId, null, d.reason);
   });
 
-  it('命中多个 ⇒ 歧义，宁可不动', () => {
+  it('命中多个同样相似的 ⇒ 分不出本体，宁可不动', () => {
     const d = decideRootNormalize('PEIS 体检管理系统', 'Web 服务端与门户', [
       child('a', 'PEIS 体检管理系统'),
       child('b', 'PEIS 体检管理系统移动端'),
     ]);
     assert.equal(d.promoteId, null, '有歧义就必须不动（不能猜）：' + d.reason);
-    assert.match(d.reason, /歧义/);
+    assert.match(d.reason, /分不出本体|同等相似/, '并列时必须说清"分不出来"，不许猜');
   });
 
   it('项目名核心串过短 ⇒ 不做判断（否则包含关系会到处命中）', () => {
@@ -78,3 +78,38 @@ describe('根节点归位：判据只看"同一个东西被建成了两个节点
     assert.equal(coreNameOf('  A - B / C  '), 'ABC');
   });
 });
+
+  /**
+   * **真机 0.3.43 现场**（审查时抓到的判据 bug）。
+   *
+   * 树的实际情况：
+   *
+   * ```
+   * 根   PEIS 体检信息系统    公共前缀 6
+   * 子   PEIS 体检管理系统    公共前缀 10  ← 它才是项目本体
+   * ```
+   *
+   * 旧判据先判"根自己与项目名同源 ⇒ 不动"，于是**最像的那个永远没机会当选**：
+   * 用户看到顶层 5 个节点里 3 个是前端技术件，真本体被埋在中间。
+   *
+   * 新口径：把"根 + 直接子节点"放一起比，**最像的当根**。
+   */
+  it('真机现场：根本身已像项目名（6），但子节点更像（10）⇒ 子节点该当根', () => {
+    const d = decideRootNormalize('PEIS 体检管理系统', 'PEIS 体检信息系统', [
+      child('a', '登录与主框架界面'),
+      child('b', '体检业务表单与采集'),
+      child('c', '数据表格与选择组件'),
+      child('d', '报表阅读与打印导出'),
+      child('e', 'PEIS 体检管理系统'),
+    ]);
+    assert.equal(d.promoteId, 'e', '**最像的那个（10）必须赢过次像的根（6）**：' + d.reason);
+    assert.match(d.reason, /更接近项目名/, '报告要说清"为什么是它"，而不是含糊地说"同源"');
+  });
+
+  it('根本身才是最像的 ⇒ 不动（命名与项目名不完全一致不算错）', () => {
+    const d = decideRootNormalize('PEIS 体检管理系统', 'PEIS 体检管理系统', [
+      child('a', '登录与主框架界面'),
+      child('b', '数据表格'),
+    ]);
+    assert.equal(d.promoteId, null, d.reason);
+  });

@@ -74,8 +74,14 @@ export function reshapeRootToProjectBody(tree: AiTree, projectName: string): Roo
   const rootNode = nodes[0] as AiTreeNode;
 
   /**
-   * 前提 ②：在**旧根的直接子节点**里，找一个与项目名"最像"的。
-   * 并列最像（前缀相同）时**不动** —— 分不出哪个是本体，不动比猜好。
+   * 前提 ②：在"**根本身 + 旧根的直接子节点**"里，找与项目名最像的那一个。
+   *
+   * ⚠️ **必须把根本身也算进来比**（0.3.44 真机 bug）：真机上根叫「PEIS 体检信息系统」
+   * （公共前缀 6）、子节点叫「PEIS 体检管理系统」（前缀 **10**）—— 它才是项目本体。
+   * 我原来先判"根自己够像就不动"、再在子节点里挑，于是最像的那个永远没机会当选，
+   * 用户看到顶层 5 个节点里 3 个是前端技术件，而真本体被埋在中间。
+   *
+   * 现在与 `decideRootNormalize` / `decideRootCollapse` 用**同一个口径**：最像的当根。
    */
   const childIndices: number[] = [];
   for (let index = 1; index < nodes.length; index += 1) {
@@ -83,8 +89,9 @@ export function reshapeRootToProjectBody(tree: AiTree, projectName: string): Roo
   }
   if (childIndices.length === 0) return { tree, reshaped: false };
 
+  const rootPrefix = projectNamePrefixLength(projectName, rootNode.name);
   let best: number | null = null;
-  let bestPrefix = -1;
+  let bestPrefix = rootPrefix;
   let tie = false;
   for (const index of childIndices) {
     const prefix = projectNamePrefixLength(projectName, (nodes[index] as AiTreeNode).name);
@@ -92,11 +99,12 @@ export function reshapeRootToProjectBody(tree: AiTree, projectName: string): Roo
       best = index;
       bestPrefix = prefix;
       tie = false;
-    } else if (prefix === bestPrefix) {
+    } else if (prefix === bestPrefix && best !== null) {
+      /** 与当前最优并列（且最优不是根自己）⇒ 歧义。 */
       tie = true;
     }
   }
-  /** 前提 ③：得有个"像的"。 */
+  /** 前提 ③：得有一个**比根更像**的子节点（否则根本身就是本体，不动）。 */
   if (best === null || bestPrefix < MIN_BODY_PREFIX) return { tree, reshaped: false };
   /** 前提 ④：最像的只能有一个（并列 ⇒ 不动）。 */
   if (tie) return { tree, reshaped: false };

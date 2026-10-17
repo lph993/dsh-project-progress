@@ -117,38 +117,98 @@ export interface RootNormalizeDecision {
  *
  * 纯函数：只吃"项目名 + 根的直接子节点"，不碰图、不碰存储。
  */
+/**
+ * 在"根本身 + 它的直接子节点"里挑出**与项目名最像**的那一个。
+ *
+ * ## 为什么必须是"相对"判据（0.3.44 真机抓到的 bug）
+ *
+ * 我原来用的是**绝对**门槛：只要"根本身与项目名同源"就**直接不动**。真机上这就错了：
+ *
+ * ```
+ * 项目名  PEIS体检管理系统
+ *   根    PEIS体检信息系统    公共前缀 6
+ *   子    PEIS体检管理系统    公共前缀 10   ← 它才是项目本体，却被"根自己已够像"挡住了
+ * ```
+ *
+ * 结果是用户看到的树**顶层 5 个节点里有 3 个是前端技术件**，而真正的项目本体
+ * 「PEIS 体检管理系统」被埋在中间。**同一轮里 `decideRootCollapse` 用的却是"相对最像"**——
+ * 同一个判断两处实现、语义不一致，这是我这轮审查里第二次撞到同一类问题。
+ *
+ * **现在的唯一口径**：把"根 + 直接子节点"放在一起比，**最像的那个当根**；
+ * 根本身最像 ⇒ 不动；子节点最像 ⇒ 它该当根。并列最像 ⇒ 不动（猜错比不动更糟）。
+ */
+function pickMostLikeProject(
+  projectName: string,
+  rootName: string,
+  children: readonly RootNormalizeCandidate[],
+): { winner: RootNormalizeCandidate | 'root' | null; prefix: number; tied: boolean } {
+  const core = coreNameOf(projectName);
+  const score = (name: string): number => {
+    const candidate = coreNameOf(name);
+    const max = Math.min(core.length, candidate.length);
+    let i = 0;
+    while (i < max && core[i] === candidate[i]) i += 1;
+    return i;
+  };
+  const scored: Array<{ ref: RootNormalizeCandidate | 'root'; prefix: number }> = [
+    { ref: 'root', prefix: score(rootName) },
+    ...children.map((child) => ({ ref: child, prefix: score(child.name) })),
+  ];
+  let best = scored[0] as { ref: RootNormalizeCandidate | 'root'; prefix: number };
+  let tied = false;
+  for (const entry of scored) {
+    if (entry.prefix > best.prefix) {
+      best = entry;
+      tied = false;
+    } else if (entry.prefix === best.prefix) {
+      tied = true;
+    }
+  }
+  return { winner: best.ref, prefix: best.prefix, tied };
+}
+
 export function decideRootNormalize(
   projectName: string,
   rootName: string,
   children: readonly RootNormalizeCandidate[],
 ): RootNormalizeDecision {
   const projectCore = coreNameOf(projectName);
-  /** 核心串太短（如项目名就叫「系统」）时不做判断 —— 包含关系会到处命中。 */
+  /** 核心串太短（如项目名就叫「系统」）时不做判断 —— 比较会到处命中。 */
   const MIN_CORE = 4;
   if (projectCore.length < MIN_CORE) {
     return { promoteId: null, reason: `项目名核心串过短（"${projectCore}"），不做归位判断`, projectCore };
   }
-  const hits = children.filter((child) => isSameOrigin(projectCore, coreNameOf(child.name)));
-  if (hits.length === 0) {
-    return { promoteId: null, reason: '根的直接子节点里没有与项目名同源的节点', projectCore };
-  }
-  if (hits.length > 1) {
+  /** "最像项目名"至少要有这么多公共前缀，才认得出本体（挡住"没一个像"）。 */
+  const MIN_BODY_PREFIX = 4;
+  const pick = pickMostLikeProject(projectName, rootName, children);
+  if (pick.prefix < MIN_BODY_PREFIX) {
     return {
       promoteId: null,
-      reason: `有 ${hits.length} 个子节点都与项目名同源（${hits.map((h) => h.name).join('、')}），歧义 ⇒ 不动`,
+      reason: `根与它的 ${children.length} 个子节点里，没有一个与项目名「${projectCore}」有足够公共前缀（最多 ${pick.prefix} 字符）`,
       projectCore,
     };
   }
-  const hit = hits[0] as RootNormalizeCandidate;
-  /** 根自己就是项目本体（命名不同不算错）⇒ 不动。 */
-  if (isSameOrigin(projectCore, coreNameOf(rootName))) {
-    return { promoteId: null, reason: `根「${rootName}」本身与项目名同源，无需归位`, projectCore };
+  if (pick.tied) {
+    return {
+      promoteId: null,
+      reason: `有多个节点与项目名同等相似（公共前缀都是 ${pick.prefix}），分不出本体 ⇒ 不动`,
+      projectCore,
+    };
   }
+  /** 最像的**就是根本身** ⇒ 不动（命名与项目名不完全一致不算错）。 */
+  if (pick.winner === 'root') {
+    return {
+      promoteId: null,
+      reason: `根「${rootName}」是与项目名最接近的节点（公共前缀 ${pick.prefix}），无需归位`,
+      projectCore,
+    };
+  }
+  const hit = pick.winner as RootNormalizeCandidate;
   return {
     promoteId: hit.id,
     reason:
-      `根是「${rootName}」（某个端/模块），而「${hit.name}」才是项目本体 ` +
-      `⇒ 把它提升为根、原根的其余子节点并入它（判据：与项目名核心串「${projectCore}」同源）`,
+      `「${hit.name}」比当前根「${rootName}」更接近项目名（公共前缀 ${pick.prefix}）` +
+      ` ⇒ 它才是项目本体，应提升为根、原根的其余子节点并入它`,
     projectCore,
   };
 }
