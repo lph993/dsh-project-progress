@@ -200,7 +200,12 @@ import { callTreeBuilder, llmStreamOf, readTextDelta, type BuildTreeCallInput, t
 import { AI_REPAIR_SYSTEM_PROMPT, buildRepairPrompt, type RepairNodeView } from './ai/repair.ts';
 import { parseRepairPlan, type RepairParseResult } from './ai/repair-parse.ts';
 import { planConsolidation, type ConsolidateNode, type ConsolidatePlan } from './domain/consolidate.ts';
-import { decideRootNormalize, looksLikeEndpointName } from './domain/root-normalize.ts';
+import {
+  coreNameOf,
+  decideRootNormalize,
+  looksLikeEndpointName,
+  projectNamePrefixLength,
+} from './domain/root-normalize.ts';
 import { analyzeTreeHealth, summarizeHealth, type HealthNode, type HealthReport } from './domain/tree-health.ts';
 import { reshapeRootToProjectBody } from './ai/root-reshape.ts';
 import {
@@ -6917,6 +6922,16 @@ export class ProjectService {
     let calls = 0;
     let okShards = 0;
     let projectName = input.projectName;
+    /**
+     * **项目名是否已由某一"片"决定**（0.3.50）。
+     *
+     * 不能靠 `projectName === ''` 判断：它的初值是 `input.projectName`（从目录名/package.json 猜的，
+     * 真机上那就是 `"PEIS"`）⇒ 永远不为空 ⇒ 判断形同虚设。
+     *
+     * 用显式标志：**第一片报的非空项目名胜出**，后面的片一律不覆盖 ——
+     * 否则最后一片偶然报个退化名（真机报的是 `"PEIS"`），会把整棵树的根判定与整形全带偏。
+     */
+    let projectNameDecided = false;
     const failures: Array<{ name: string; reason: string }> = [];
     const notes: string[] = [
       `单次建树失败后改为**按顶层目录分批**（共 ${shards.length} 片），逐片建树并直接落库` +
@@ -7025,6 +7040,11 @@ export class ProjectService {
         // ② 每片都是**局部**视图 ⇒ 不许做"本轮没再提到"这类全局判断（否则片 N 会
         //    把其余片刚建的节点全标成 stale —— 真机 52 个节点里 48 个被标）
         partialView: true,
+        /**
+         * **第 2 片起不许再写项目名**（0.3.50）：否则最后一片说了算，真机把项目名退化成 `"PEIS"`。
+         * 项目名由第一片（或 `projectName` 的初值）定下来。
+         */
+        skipProjectNameWrite: index > 0,
         ...(input.agent !== undefined ? { agent: input.agent } : {}),
         ...(input.callId !== undefined ? { callId: input.callId } : {}),
       });
@@ -7033,7 +7053,22 @@ export class ProjectService {
       updated += applied.updated;
       removed += applied.removed;
       proposed += call.parsed.value.nodes.length;
-      if (applied.projectName !== '') projectName = applied.projectName;
+      /**
+       * **只有第一片能决定项目名**（0.3.50 真机教训）。
+       *
+       * 原来写的是 `projectName = applied.projectName` —— **最后一片覆盖前面的**。
+       * 23 片各报各的名字，最后一片恰好报了 `"PEIS"` ⇒ 项目名从
+       * `「PEIS 体检管理系统」` 退化成 `"PEIS"`，**连带把根判定与整形全带偏**：
+       *
+       * - `root-not-project` 拿 `"PEIS"` 比根名「Web 与 API 站点宿主」⇒ 公共前缀 0 ⇒ 报 error；
+       * - `decideRootNormalize` / `root-reshape` 也拿 `"PEIS"` 找项目本体 ⇒ 找不到 ⇒ 整形不生效。
+       *
+       * 现在：**第一个非空的说了算**，后面的不覆盖（项目名该由用户决定，不该被某一片偶然覆盖）。
+       */
+      if (!projectNameDecided && applied.projectName.trim() !== '') {
+        projectName = applied.projectName;
+        projectNameDecided = true;
+      }
       failures.push(...applied.failures);
       await this.recordAiUsage({
         at: this.deps.clock.now(),
@@ -7278,6 +7313,17 @@ export class ProjectService {
        * "回来了就撤销 stale"那半段仍然保留 —— 它只看本片用到的 id，是安全的。
        */
       partialView?: boolean;
+      /**
+       * **不写项目名到 meta**（0.3.50）。
+       *
+       * 分批时每片都会调一次 `applyAiTree`，而它内部会把 `tree.projectName` 直接写进 meta ——
+       * 于是**最后一片说了算**：真机上最后一片报了 `"PEIS"`，把项目名从
+       * 「PEIS 体检管理系统」退化掉了，连带让根判定与整形都失效
+       * （拿 `"PEIS"` 去比根名「Web 与 API 站点宿主」⇒ 公共前缀 0）。
+       *
+       * 分批路径因此传 `true`（第 2 片起），项目名由调用方在第一片时定下来。
+       */
+      skipProjectNameWrite?: boolean;
     },
   ): Promise<{
     projectName: string;
@@ -7721,8 +7767,56 @@ export class ProjectService {
        * （parentId 保持 null，于是在 `existing` 查找里命中既有根 → 记 updated，而不是又建一个）。
        * 少了这一步，重复建树会把根挂到自己下面，凭空多出同名节点（实测：e2e "重复建树不得再新建节点" 立刻红）。
        */
+      const existingRootName = rootId !== undefined ? (workingGraph.nodes[rootId]?.name ?? '') : '';
+      /**
+       * **片根"跟现有根同源" ⇒ 直接并到那个根上，不再新建节点**（0.3.50 真机教训）。
+       *
+       * ## 现场
+       *
+       * 分批时各片报的"项目根"名字会略有出入：
+       *
+       * ```
+       * 片1 的根「PEIS 体检管理系统」  ← 建出了根
+       * 片2 的根「PEIS 体检信息系统」  ← 名字不同 ⇒ 原来当成一个新子节点建出来
+       * 片N 的根「PEIS」              ← 同上
+       * ```
+       *
+       * 真机结果：树上多出「PEIS 体检信息系统」（**14 个孩子**）与「PEIS」（**8 个孩子**）
+       * 两个**包装层** —— 正是用户明确要消掉的东西；项目名还被写成了 `"PEIS"`。
+       *
+       * ## 为什么不能只把 parentId 设成 null
+       *
+       * 那会**试图造第二个根**（`C13` 直接拒绝），而它下面的孩子会连带全失败。
+       *
+       * ## 所以：别名到既有根
+       *
+       * 把这一片的"项目名根"**映射到既有根**（`idByIndex[index] = rootId`）然后跳过创建 ——
+       * 于是这一片的所有子节点**直接挂到根下**，等于把那层包装扁平化掉。
+       * 判据用"同源"（公共前缀够长，与 `root-normalize` 同一口径），名字有出入也认得出。
+       */
+      const sameOriginRootAlias =
+        node.parent === null &&
+        rootId !== undefined &&
+        existingRootName !== '' &&
+        node.name.trim() !== existingRootName.trim() &&
+        projectNamePrefixLength(existingRootName, node.name) >= 4 &&
+        projectNamePrefixLength(existingRootName, node.name) * 2 >=
+          Math.min(coreNameOf(existingRootName).length, coreNameOf(node.name).length);
+      if (sameOriginRootAlias) {
+        idByIndex[index] = rootId;
+        usedIds.add(rootId);
+        notes.push(
+          `「${node.name}」与项目根「${existingRootName}」同源（都是项目本体）⇒ **并到根上**，` +
+            '不再另起一个节点（这一支的子节点直接挂根下）',
+        );
+        continue;
+      }
       const isExistingRootItself =
-        node.parent === null && rootId !== undefined && !usedRootAsItself && node.name === workingGraph.nodes[rootId]?.name;
+        node.parent === null &&
+        rootId !== undefined &&
+        !usedRootAsItself &&
+        /** 同源不同名的情形已在上面**别名到根**（`sameOriginRootAlias`），这里只认完全同名。 */
+        node.name === existingRootName;
       if (isExistingRootItself) usedRootAsItself = true;
       const parentId =
         node.parent !== null
@@ -8171,7 +8265,7 @@ export class ProjectService {
       }
     }
 
-    if (tree.projectName !== undefined && tree.projectName.trim() !== '') {
+    if (tree.projectName !== undefined && tree.projectName.trim() !== '' && options?.skipProjectNameWrite !== true) {
       const meta = await this.port.getMeta(this.projectId);
       if (meta) {
         await this.port.putMeta({

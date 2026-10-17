@@ -154,10 +154,24 @@ export function mergeShards<T extends ShardEntry>(
   const base = Number.isFinite(maxShards) && maxShards >= 1 ? Math.floor(maxShards) : SHARD_MAX_COUNT;
   if (shards.length === 0) return [];
   /**
-   * 目录多到"每片上限"装不下时，**必须多切几片**：
-   * 否则要么超限、要么又退回"一片吞几十个目录"的老毛病。
+   * **片数上限就是 `base`，不许因为"目录多"而膨胀**（0.3.50 真机教训）。
+   *
+   * 我上一版写的是 `max(base, ⌈片数 / 每片上限⌉)` —— 想法是"目录太多就多切几片，否则怎么分都超限"。
+   * 真机上它直接炸了，因为**"片数"根本不等于"顶层目录数"**：大目录会被 `splitByTopDir`
+   * **再按二级目录切开**：
+   *
+   * ```
+   * 顶层 31 个目录，但 Modules / Mobile / PEIS.Web 这些大目录各自又切成几十片
+   *   ⇒ shards.length ≈ 138
+   *   ⇒ limit = max(6, ⌈138 / 6⌉) = 23    ← 一次建树从 6 次调用变成 **23 次**
+   * ```
+   *
+   * 真机代价实测：**13 分钟**，单请求被浏览器/代理断开 ⇒ 面板只看到 `Failed to fetch`。
+   *
+   * **所以只用 `base`。** 控制"一片混了几个不相关目录"靠下面的**均衡装桶**，不靠加片数：
+   * 6 个桶把 138 个子片摊开，每桶里通常只有 1~2 个顶层目录的份额。
    */
-  const limit = Math.max(base, Math.ceil(shards.length / SHARD_MAX_GROUPS_PER_SHARD));
+  const limit = base;
   if (shards.length <= limit) return shards;
 
   const filesOf = (shard: Shard<T>): number => shard.entries.filter((entry) => entry.kind === 'file').length;
