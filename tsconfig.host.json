@@ -1,6 +1,24 @@
 {
+  "_note": [
+    "⚠ 本环境跑不起来：只要 include 到 import cordis 的代码，tsc 就 JS heap OOM。",
+    " 实测：tsconfig.host.json 原样 → OOM；窄到只 src/index.ts → OOM；--max-old-space-size=8192 → OOM（机器 18.5GB 空闲）。",
+    " 根因：框架 Context 的类型增强（每个 @deepseek-ai/dsh-* 往 Context 叠一个服务交叉类型）造成的类型爆炸，加内存不解决。",
+    " 替代：`npm run typecheck:pure`（ai/domain/shared 三层真检查，0 错误）",
+    "      + `node scripts/verify-source-syntax.mjs`（语法级，查不出未定义标识符）",
+    "      + 跑得起来的测试（唯一能抓 collected 那类作用域错误的手段）。",
+    " 详见 docs/开发须知.md §0.3 ④。保留本文件是因为它在**别的机器/环境**上可能跑得动。"
+  ],
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
+  "_note": [
+    "⚠ 本环境跑不起来：只要 include 到 import cordis 的代码，tsc 就 JS heap OOM。",
+    " 实测：tsconfig.host.json 原样 → OOM；窄到只 src/index.ts → OOM；--max-old-space-size=8192 → OOM（机器 18.5GB 空闲）。",
+    " 根因：框架 Context 的类型增强（每个 @deepseek-ai/dsh-* 往 Context 叠一个服务交叉类型）造成的类型爆炸，加内存不解决。",
+    " 替代：`npm run typecheck:pure`（ai/domain/shared 三层真检查，0 错误）",
+    "      + `node scripts/verify-source-syntax.mjs`（语法级，查不出未定义标识符）",
+    "      + 跑得起来的测试（唯一能抓 collected 那类作用域错误的手段）。",
+    " 详见 docs/开发须知.md §0.3 ④。保留本文件是因为它在**别的机器/环境**上可能跑得动。"
+  ],
     "types": ["node"]
   },
   "include": [

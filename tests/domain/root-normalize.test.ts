@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { coreNameOf, decideRootNormalize } from '../../src/domain/root-normalize.ts';
+import { coreNameOf, decideRootNormalize, looksLikeEndpointName } from '../../src/domain/root-normalize.ts';
 
 const child = (id: string, name: string) => ({ id, name });
 
@@ -113,3 +113,34 @@ describe('根节点归位：判据只看"同一个东西被建成了两个节点
     ]);
     assert.equal(d.promoteId, null, d.reason);
   });
+/**
+ * `looksLikeEndpointName` 的**直接测试**（0.3.49 补）。
+ *
+ * 它现在被**两处共用**：`applyAiTree`（建树后提醒根名可疑）与 `domain/tree-health.ts`
+ * （`root-not-project` 判据）。而它此前 **0 条测试** —— 共用判据没测试等于两份都没测。
+ *
+ * 特别钉住那条**已知的窄匹配代价**：词表里的 `Web` 会让「PEIS.Web」这种真名也命中。
+ * 所以它只能当"可疑信号"用，不能单凭它下结论 —— 这条限制必须写在测试里，
+ * 否则下一个人会把它当绝对判据。
+ */
+describe('looksLikeEndpointName：什么算"像某个端"', () => {
+  it('常见端/层命名 ⇒ 命中', () => {
+    for (const name of ['移动端外出登记', 'Web 服务端', '前端界面', '后端服务', 'Android 客户端', 'H5 页面']) {
+      assert.equal(looksLikeEndpointName(name), true, `「${name}」应当被判为像某个端`);
+    }
+  });
+
+  it('项目本体命名 ⇒ 不命中', () => {
+    for (const name of ['PEIS 体检管理系统', '体检业务办理', '职业健康模块', '项目进度看板']) {
+      assert.equal(looksLikeEndpointName(name), false, `「${name}」是项目本体/功能名，不该被判成端`);
+    }
+  });
+
+  it('**已知的窄匹配代价**：`Web` 会让「PEIS.Web」这种真名也命中', () => {
+    assert.equal(
+      looksLikeEndpointName('PEIS.Web'),
+      true,
+      '词表含 Web ⇒ 命中的。这不是 bug 而是取舍：所以调用方**不能**单凭它下结论',
+    );
+  });
+});

@@ -4557,6 +4557,12 @@ test('同一次建树里"引用相同"的提案必须并进同一个节点（认
    * 这条测试把那个场景原样复刻：一次建树里给出三个同引用的兄弟分支 + 两条同引用的叶子。
    */
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-claim-'));
+  /**
+   * **把 refs 指向的路径真建出来**（0.3.49）：建树现在会丢弃"指向不存在路径"的 refs，
+   * 而这条测试要验的正是"同引用提案要并成一个" ⇒ 路径必须真实存在，否则身份键被清空、测不到去重。
+   */
+  mkdirSync(join(workspace, 'src', 'ai'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'ai', 'prompt.ts'), 'export const x = 1;\n');
   const ctx = createFakeContext({ workspace });
   ctx.services.set('agentDefaultModel', {
     currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
@@ -4641,6 +4647,15 @@ test('同父下已有 {a,b} 的枝，再提 {a} ⇒ 必须复用而不是新建�
    * —— 不写一条只有死代码能过的测试（那种测试只会给人"这层受保护"的错觉）。
    */
   const workspace = mkdtempSync(join(tmpdir(), 'pm-e2e-sibling-copy-'));
+  /**
+   * **把 refs 指向的路径真建出来**（0.3.49）。
+   *
+   * 建树现在会丢弃"指向不存在路径"的 refs，而这条测试要验的是"子集提案要复用"
+   * ⇒ 路径必须真实存在，否则身份键被清空、根本测不到复用。
+   */
+  mkdirSync(join(workspace, 'src', 'adapter'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'adapter', 'workspace.ts'), 'export const a = 1;\n');
+  writeFileSync(join(workspace, 'src', 'adapter', 'snapshots.ts'), 'export const b = 1;\n');
   const ctx = createFakeContext({ workspace });
   ctx.services.set('agentDefaultModel', {
     currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),

@@ -286,7 +286,7 @@ function subscriptionRiskOf(
   ).length;
   return { subscriptionRisk: top, ...(waiting > 0 ? { subscriptionWaiting: waiting } : {}) };
 }
-import type { AiTree } from './ai/parse.ts';
+import type { AiRefType, AiTree, AiTreeNode } from './ai/parse.ts';
 import { parseTreeResponse, treeFromCached, type ParseOutcome } from './ai/parse.ts';
 import { KvStoragePort, newProjectId } from './storage/kv-port.ts';
 import { openFileStorage, PM_DIR } from './storage/file-port.ts';
@@ -7653,8 +7653,43 @@ export class ProjectService {
       if (key !== undefined && !identityIndex.has(key)) identityIndex.set(key, candidate);
     }
 
+    /**
+     * **丢弃指向不存在路径的 refs**（0.3.49，用户口径："**丢弃吧**"）。
+     *
+     * ## 为什么建树路径要丢，而工具路径只告警
+     *
+     * `refs` 是**身份键**的输入（`identityKeyOf({ name, refs })`）——
+     * 路径写错，下次建树就按错路径认节点 ⇒ **同一个功能点被认成两个**，树越建越乱。
+     *
+     * 两处策略**故意不同**：
+     * - **建树（批量）**：模型一次性给出几十上百条，没人会去逐条校对 ⇒ **假路径必须丢掉**，
+     *   否则它们会长期污染身份键；
+     * - **工具 `pm_progress` / `patchNode`（人工）**：那里"先声明后创建"是**真需求**
+     *   （人会先写路径再写代码），所以只告警、照写。
+     *
+     * ## 拿不到工作区根时**不丢**
+     *
+     * 没有根就没法判"存在不存在" —— 宁可保留，也不要在没有依据时把真路径删掉。
+     */
+    const discardRoot = this.boundRoot;
+    const droppedRefs: Array<{ node: string; target: string }> = [];
+    const effectiveRefsOf = (node: AiTreeNode): Array<{ type: AiRefType; target: string }> => {
+      const refs = node.refs ?? [];
+      if (discardRoot === undefined || discardRoot === '') return [...refs];
+      const kept = refs.filter((ref) => existsSync(join(discardRoot, ref.target)));
+      if (kept.length !== refs.length) {
+        const keptTargets = new Set(kept.map((ref) => ref.target));
+        for (const ref of refs) {
+          if (!keptTargets.has(ref.target)) droppedRefs.push({ node: node.name, target: ref.target });
+        }
+      }
+      return kept;
+    };
+
     for (const [index, node] of tree.nodes.entries()) {
-      const reuseKey = identityKeyOf({ name: node.name, refs: node.refs });
+      /** 过滤后的 refs —— 本循环里**一律用它**，不许再用 `node.refs`。 */
+      const effectiveRefs = effectiveRefsOf(node);
+      const reuseKey = identityKeyOf({ name: node.name, refs: effectiveRefs });
       /**
        * **同一轮里"引用相同"的提案必须并进同一个节点**（FR-158 ⑤，本条是"重复分支"的真凶修法）。
        *
@@ -7733,7 +7768,7 @@ export class ProjectService {
       }
       const match = findReusableNode({
         name: node.name,
-        ...(node.refs !== undefined ? { refs: node.refs } : {}),
+        ...(effectiveRefs.length > 0 ? { refs: effectiveRefs } : {}),
         existingById,
         claimedIds: usedIds,
         identityOf: identityOfNode,
@@ -7912,7 +7947,7 @@ export class ProjectService {
           by: 'user',
           // 新节点一开始就带稳定身份键（FR-158）：下次建树按 `refs` 认它，模型换名字也不会再建一个
           identity: reuseKey,
-          ...(node.refs.length > 0 ? { refs: node.refs } : {}),
+          ...(effectiveRefs.length > 0 ? { refs: effectiveRefs } : {}),
           /**
            * **AI 给的描述直接写进 `description`**（用户诉求："AI 建树/修剪树/同步树时直接补充描述信息"）。
            *
@@ -8159,6 +8194,24 @@ export class ProjectService {
       notes: [
         ...progressNotes,
         ...rootNotes,
+        ...(droppedRefs.length > 0
+          ? [
+              /**
+               * **丢弃了指向不存在路径的 refs**（0.3.49，用户口径："丢弃吧"）。
+               *
+               * 为什么必须丢（而不是像工具路径那样"只告警、照写"）：
+               * refs 是**身份键**的输入 —— 路径写错，下次建树就按错路径认节点，
+               * 于是"同一个功能点"被认成两个，树越建越乱。
+               * 建树是**批量**写入，留着一批假路径没人会去逐条校对；工具路径是**人工**写入，
+               * 那种场合"先声明后创建"是真需求，所以两处策略不同，这是刻意的。
+               */
+              `**丢弃了 ${droppedRefs.length} 条指向不存在路径的 refs**` +
+                `（如「${droppedRefs[0]?.node ?? ''}」的 ${droppedRefs
+                  .slice(0, 2)
+                  .map((entry) => entry.target)
+                  .join('、')}）—— 这类路径会让身份键算错，下次建树把同一个功能点认成两个`,
+            ]
+          : []),
         ...(reused > 0
           ? [
               `有 ${reused} 个节点与已有节点同名（${reusedNames.slice(0, 5).join('、')}${
