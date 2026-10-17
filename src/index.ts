@@ -8,6 +8,7 @@
 import z from '@deepseek-ai/schemastery';
 import type { Context } from '@deepseek-ai/cordis';
 
+import { bindSettings } from './adapter/settings-compat.ts';
 import { capabilityProbe, effectiveSandboxMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
 import { execViewOf, sessionOfAgent, touchedPathsOf } from './adapter/exec-view.ts';
 import { crossProjectVerdict, describeReviewVerdict } from './domain/review-gate.ts';
@@ -302,34 +303,54 @@ async function applyInner(ctx: Context, config: Config): Promise<void> {
   //    不需要重启宿主）。改不了的是"已经发出去的调用"，如实写在设置页的说明里。
   let disposeSettingsWatch: (() => void) | undefined;
   let settingsScope: SettingsScopeLike | undefined;
-  try {
-    const scope = ctx.settings.register(SETTINGS_NAMESPACE, Config, { applies: 'live' });
-    settingsScope = scope as unknown as SettingsScopeLike;
-    const applyPatch = (next: Config, prev: Config): void => {
-      const patch: Partial<Config> = {};
-      for (const key of Object.keys(next) as Array<keyof Config>) {
-        if (next[key] !== prev[key]) (patch as Record<string, unknown>)[key] = next[key];
+  /**
+   * ⚠️ **宿主 API 换过一轮**（0.3.55，真机报错驱动）。
+   *
+   * 老宿主：`ctx.settings.register(ns, schema, {applies})` → scope（带 `watch`，能实时应用）。
+   * 现在的 `@deepseek-ai/dsh-settings` 是 `SettingsForms`：**根本没有 `register`**，
+   * 页面由宿主按插件导出的 `Config` 自动生成，读写走 `describe/update/replace`，**没有 watch**。
+   *
+   * 原来直接调 `ctx.settings.register` ⇒ 真机每次都报
+   * `ctx.settings.register is not a function`，且 `settingsScope` 恒为 undefined
+   * ⇒ `POST /pm/settings` 一律 **409 `settings-unavailable`**（设置页存不了东西）。
+   *
+   * `bindSettings` 探测两种形态并适配；都适配不了才如实说，且**降成 info**
+   * （"页面由宿主自动生成"不是错误，报 warn 只会误导）。
+   */
+  const binding = bindSettings(ctx.settings, [SETTINGS_NAMESPACE, PACKAGE_ID, name], [Config, { applies: 'live' }]);
+  if (binding.kind === 'none') {
+    debugBus.warn('settings', `设置通路不可用（只能改 cordis.patch.yml 后重启宿主）：${binding.detail}`);
+  } else {
+    settingsScope = binding.scope as unknown as SettingsScopeLike;
+    debugBus.info('settings', binding.detail);
+    /**
+     * **只有老宿主能订阅变更**。新宿主没有 `watch` —— 变更由宿主把新配置重新注入，
+     * 所以这里如实标 `liveApply: false`，不假装订阅上了。
+     */
+    if (binding.kind === 'native') {
+      const nativeScope = binding.scope as unknown as {
+        watch?: (cb: (next: Config, prev: Config) => void) => () => void;
+      };
+      if (typeof nativeScope.watch === 'function') {
+        const applyPatch = (next: Config, prev: Config): void => {
+          const patch: Partial<Config> = {};
+          for (const key of Object.keys(next) as Array<keyof Config>) {
+            if (next[key] !== prev[key]) (patch as Record<string, unknown>)[key] = next[key];
+          }
+          if (Object.keys(patch).length === 0) return;
+          service.applyConfig(patch);
+          debugBus.info('settings', `设置变更已生效：${Object.keys(patch).join(', ')}`);
+        };
+        disposeSettingsWatch = nativeScope.watch((next, prev) => {
+          try {
+            applyPatch(next, prev);
+          } catch (error) {
+            debugBus.error('settings', '套用设置变更失败', error);
+          }
+        });
+        ctx.effect(() => () => disposeSettingsWatch?.(), 'project-manager: settings watch');
       }
-      if (Object.keys(patch).length === 0) return;
-      service.applyConfig(patch);
-      debugBus.info('settings', `设置变更已生效：${Object.keys(patch).join(', ')}`);
-    };
-    disposeSettingsWatch = scope.watch((next, prev) => {
-      try {
-        applyPatch(next, prev);
-      } catch (error) {
-        debugBus.error('settings', '套用设置变更失败', error);
-      }
-    });
-    ctx.effect(() => () => disposeSettingsWatch?.(), 'project-manager: settings watch');
-    debugBus.info('settings', `已注册设置命名空间 ${SETTINGS_NAMESPACE}（applies=live，已订阅变更）`);
-  } catch (error) {
-    debugBus.warn(
-      'settings',
-      `设置命名空间注册失败（将使用组合配置默认值）：${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    }
   }
 
   // 6) 面板数据通路与诊断路由

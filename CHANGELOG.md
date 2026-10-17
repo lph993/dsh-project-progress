@@ -5,6 +5,62 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.3.55] — 用户报的"有报错"：**设置服务 API 换代了，我们调的是不存在的函数**
+
+> 用户："**有报错**"。
+
+### 一、报错是什么
+
+```
+09:53:20 [warn][settings] 设置命名空间注册失败（将使用组合配置默认值）：ctx.settings.register is not a function
+```
+
+真机重启后每次加载都报这一条。**它不是噪声，是真故障**：
+
+- 宿主现在给的是 `@deepseek-ai/dsh-settings` 的 **`SettingsForms`**，方法叫 `describe/update/replace/configure`，
+  **根本没有 `register`**；
+- 我们直接调 `ctx.settings.register` ⇒ 抛错 ⇒ `settingsScope` 恒为 `undefined`；
+- 于是 `GET /pm/settings` 报 `configurable: false`，**`POST /pm/settings` 一律 409 `settings-unavailable`**
+  ⇒ **设置页存不了任何东西**。
+
+### 二、两代 API 的差别（这次得记下来）
+
+| | 老宿主 | 现在 |
+|---|---|---|
+| 顶层类型 | `Context.settings: SettingsScope` | `Context.settings: SettingsForms` |
+| 注册 | `register(ns, schema, {applies})` → scope | **没有**（页面由宿主按插件导出的 `Config` **自动生成**） |
+| 读写 | `scope.get()/update()/replace()/watch()` | `describe()` / `update(ns,patch,rev)` / `replace(ns,section,rev)` / `mutate()` |
+| 变更通知 | `scope.watch(cb)` | **没有 watch**（`applies: 'live'`，由宿主把新配置重新注入） |
+
+### 三、修法：新增 `src/adapter/settings-compat.ts`（纯函数、可单测）
+
+`bindSettings(settings, namespaces, registerArgs)` 探测宿主形态：
+
+| 形态 | 结果 |
+|---|---|
+| 有 `register` | `kind: 'native'`（原生 scope，`liveApply: true`） |
+| 有 `describe/update/replace` | `kind: 'forms'`（用三者拼一个等价 scope，`liveApply: false` —— **不谎称实时**） |
+| 都没有 | `kind: 'none'`，**如实报 warn 并列出宿主实际字段**（别让人猜） |
+
+两条关键纪律：
+
+1. **`describe()` 里找不到"自己那一条"时，写操作直接抛错** —— 宁可报错，也**不许**去改别人的配置
+   （宿主条目 id 是"配置条目 id"，可能是包名 `dsh-project-progress` 而不是内部的 `project-manager`，
+   所以候选名是**一组**：内部名 + 包名 + 插件名）；
+2. `register` 抛错 / 返回的不是 scope ⇒ `kind: 'none'`，**不把异常冒到插件加载路径上**。
+
+### 四、测试（+7 条，共 **677/677**）
+
+`tests/adapter/settings-compat.test.ts`：
+
+- 老宿主 ⇒ `native`，`register` 收到正确的命名空间；
+- 新宿主 ⇒ `forms`，`update` **打到我们自己的条目**且带上 `revision`（宿主靠它做乐观锁）；
+- `describe()` 里没有我们 ⇒ **明确抛错、一次写都不发**；
+- **候选名兜底**：条目 id 是包名 `dsh-project-progress` 时也要认得出来（真机风险）；
+- `register` 返回半成品 / 抛错 ⇒ 如实 `none`，并说出原因。
+
+**注入验证**：关掉 `forms` 分支 ⇒ `fail=3`；还原 ⇒ `fail=0`、无残留。
+
 ## [0.3.54] — 回填生效了，但它把**根撑到 15 个分支**
 
 > 用户重启（0.3.53）后重建：6 片、72 节点、183 refs。
