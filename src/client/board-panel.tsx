@@ -1722,8 +1722,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 style: styles.headerButton,
                 'data-pm-normalize-root': '1',
                 title:
-                  '检查根节点是不是"某个端"：若是，把项目本体那支提升为根、其余子节点并入它。' +
-                  '只改父子关系，不调模型、不花钱；判据不成立时什么都不会动',
+                  '检查根节点是不是「某个端」。' +
+                  '⚠️ 若判定需要归位，现行领域模型下**改不动**（提根会造第二个根、降级旧根会成环），它会如实说明原因 —— 这种情况只能重建。不调模型、不花钱。',
                 onClick: () => {
                   void postNormalizeRoot()
                     .then((outcome) => {

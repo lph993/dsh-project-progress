@@ -7286,7 +7286,7 @@ export class ProjectService {
         `⚠ **根节点「${rootNodes[0]!.name}」看起来是"某个端/子应用"，不像项目本体**：` +
           '若这个项目是多端工程（Web + 客户端 + 移动端…），把它当根会让**其余各端全挂到它下面**，' +
           '层级方向整个反掉。建议重建成「' +
-          `${collected.projectName}」为根、各端作为**并列**的大功能。` +
+          `${tree.projectName}」为根、各端作为**并列**的大功能。` +
           `（本轮共 ${others.length} 个节点挂在这个根之下——是真的项目名叫这个，可以忽略本条。）`,
       );
     }
@@ -8297,51 +8297,62 @@ export class ProjectService {
 
       const promoteId = decision.promoteId;
       /**
-       * ① 把项目本体那支提到根（`parentId: null`）。
+       * **让项目本体成为唯一的根**。
+       *
+       * ## 领域层有一条不变量挡住了"直接提根"
+       *
+       * 真机取证的原文（0.3.38 补的诊断信息直接把它指出来了）：
+       *
+       * ```
+       * 根节点归位失败（提根）：C13：项目根唯一：已存在顶级节点「Web 服务端」
+       * ```
+       *
+       * `mutateReparent` 的检查表里写着：「**提升为根时已有活根 ⇒ `C13`**（单根不变量）」。
+       * 也就是说 —— **只要根已经存在，"把某节点提为根"这条路永远走不通**，
+       * 跟那个节点是枝还是光杆无关（我一开始按"枝能动、光杆不能"去分情况，是判断错了）。
+       *
+       * ## 所以：先试提根，失败就**降级旧根**
+       *
+       * - **提根**：项目本体搬上去当根 —— 只在"原本没有活根"时才可能成功；
+       * - **降级旧根**（退路）：把**当前根整枝**挂到项目本体下面 ⇒ 项目本体自然成为唯一根。
+       *   这一步是"把非根节点挂到别的节点下"，**根数从 1 变 1**，不触发 C13；
+       *   而且**一个节点都不丢**。
+       *
+       * 降级之后「Web 服务端」变成项目本体的一个**子**节点（名字保留）——
+       * 语义上仍然成立（它本来就是"这个项目里的一个端"）。
        *
        * ⚠️ **刻意不传 `sessionId`**：`reparentNode` 内部第一件事是 `bindForCall(sessionId)`，
        * 而具名会话会**按它自己的 cwd 重新解析根** ⇒ 把上面刚绑好的项目又拨走，
        * 搬动就会打到另一个项目上（真机就是 `E_NOT_FOUND`）。
-       * 这里传 `undefined` ⇒ `bindForCall` 走"匿名"分支，认的就是上面绑定的那棵树。
+       * 传 `undefined` ⇒ `bindForCall` 走"匿名"分支，认的就是上面绑定的那棵树。
        */
-      const first = await this.reparentNode({
-        nodeId: promoteId,
-        parentId: null,
-        reason: decision.reason,
-      });
-      if (first.status !== 'ok') {
-        /**
-         * ⚠️ **必须把 `code` / `message` 带上**（0.3.38 的教训）。
-         *
-         * 我原先只记 `first.status`（`"denied"`），真机上看到的就是
-         * `{"ok":true,"moved":0,"reason":"归位失败（提根）：denied"}` ——
-         * **一个"denied"什么也说明不了**（领域层好几种 reject 都映射成它）。
-         * 补上 code/message 后一眼能分清是"节点不存在（读错了项目）"还是"成环"。
-         */
-        const detail =
-          'code' in first && typeof first.code === 'string'
-            ? `${first.code}${'message' in first && typeof first.message === 'string' ? `：${first.message}` : ''}`
-            : first.status;
-        debugBus.warn('ai', `根节点归位失败（提根）：${detail}`);
-        return { moved: 0, reason: `归位失败（提根）：${detail}` };
-      }
+      /** 把归位结果里的 `code：message` 如实带出来（0.3.38 的教训：只记 status 等于没记）。 */
+      const describeReject = (result: Awaited<ReturnType<typeof this.reparentNode>>): string =>
+        'code' in result && typeof result.code === 'string'
+          ? `${result.code}${'message' in result && typeof result.message === 'string' ? `：${result.message}` : ''}`
+          : result.status;
+
       /**
-       * ② 原根的其余子节点并入它下面 —— 顺序上**先提根再搬孩子**：
-       * 反过来会把孩子挂到"即将失去根地位"的节点上，中间态更乱。
+       * ## 结论：**现行领域模型下做不到**（0.3.40 实测）
+       *
+       * 两条路都被封死，而且都是**领域层的正确约束**，不是 bug：
+       *
+       * | 做法 | 结果 | 为什么 |
+       * |---|---|---|
+       * | 把项目本体**提为根**（`parentId: null`） | `C13：项目根唯一` | 单根不变量不许造第二个根 |
+       * | 把旧根**降级**到项目本体下 | `E_CYCLE：不能挂到自己的子孙下面` | **旧根正是项目本体的父** —— 父挂到子下必然成环 |
+       *
+       * `E_CYCLE` 这条是**树的基本性质**：只要模型把"项目本体"建成了根的**子节点**，
+       * 就不可能靠"改父子关系"把根换过来（要么造第二个根，要么成环）。
+       * 我先前以为"提根失败就降级"能绕过去 —— **判断错了**。
+       *
+       * 所以这里不再假装能修：**如实报告，不搬任何节点**。
+       * 真正的出路在**建树侧**（别让模型把根选成某个端），那是提示词与判据的活；
+       * 已经建错的树只能**重建**。
        */
-      let moved = 1;
-      for (const childId of children) {
-        if (childId === promoteId || !alive(childId)) continue;
-        const movedOne = await this.reparentNode({
-          nodeId: childId,
-          parentId: promoteId,
-          reason: '根节点归位：原根的其余子节点并入项目本体',
-          // 同理不传 sessionId：见上面"提根"那段说明
-        });
-        if (movedOne.status === 'ok') moved += 1;
-      }
-      debugBus.info('ai', `根节点归位：提根 1 个、并入 ${moved - 1} 个。${decision.reason}`);
-      return { moved, reason: decision.reason };
+      const detail = `${decision.reason}；但现行领域模型下无法执行：提根会被单根不变量（C13）挡下，降级旧根会成环（E_CYCLE）—— 旧根正是项目本体的父节点`;
+      debugBus.warn('ai', `根节点归位：判定要归位但无法执行。${detail}`);
+      return { moved: 0, reason: detail };
     } catch (error) {
       /**
        * 归位只是整理：**它失败不该让建树整体失败**（树已经落库了）。
@@ -9212,11 +9223,6 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
-
-
-
-
-
 
 
 
