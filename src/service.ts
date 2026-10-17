@@ -7099,6 +7099,22 @@ export class ProjectService {
     const shardedNormalized = await this.normalizeProjectRoot(input.sessionId);
     if (shardedNormalized.moved > 0) notes.push(`根节点归位：${shardedNormalized.reason}`);
     /**
+     * **覆盖回填**（0.3.53）：提示词只能"希望"模型别漏目录，这里用程序保证补上。
+     * 没有缺口时**一次调用都不发**。
+     */
+    const backfilled = await this.backfillCoverage({
+      route: input.route,
+      ...(input.stream !== undefined ? { stream: input.stream } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+    });
+    if (backfilled.status === 'ok') {
+      notes.push(`覆盖回填：${backfilled.reason}`);
+      calls += 1;
+    } else if (backfilled.status !== 'skipped') {
+      notes.push(`覆盖回填未生效：${backfilled.reason}`);
+    }
+    /**
      * **跨片按功能归拢**（0.3.46）。
      *
      * 用户原则（`docs/开发须知.md` §0.0）："切分单位 ≠ 树的分支单位，合并时必须按功能归拢。"
@@ -7122,23 +7138,10 @@ export class ProjectService {
       notes.push(`按功能归拢未生效：${regrouped.reason}`);
       if (regrouped.status === 'ok') calls += 1;
     }
-    /** 分批路径同样做一次树体检（0.3.48）—— 分批最容易出结构问题，更该报。 */
     /**
-     * **覆盖回填**（0.3.53）：提示词只能"希望"模型别漏目录，这里用程序保证补上。
-     * 没有缺口时**一次调用都不发**。
+     * **树体检放在最后**（0.3.54）：它要反映的是**最终**这棵树，而不是某个中间态。
+     * （0.3.53 我把它夹在回填与归拢之间，报出来的就是"归拢之前"的形状。）
      */
-    const backfilled = await this.backfillCoverage({
-      route: input.route,
-      ...(input.stream !== undefined ? { stream: input.stream } : {}),
-      ...(input.signal !== undefined ? { signal: input.signal } : {}),
-      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
-    });
-    if (backfilled.status === 'ok') {
-      notes.push(`覆盖回填：${backfilled.reason}`);
-      calls += 1;
-    } else if (backfilled.status !== 'skipped') {
-      notes.push(`覆盖回填未生效：${backfilled.reason}`);
-    }
     const shardedHealth = await this.treeHealthSummary(input.sessionId);
     if (shardedHealth !== undefined) notes.push(shardedHealth);
     notes.push(

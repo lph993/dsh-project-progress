@@ -111,6 +111,14 @@ export const NON_CODE_ARTIFACT_EXCLUDE: readonly string[] = [
   '**/.gradle',
   // ── 运行期输出（不是功能）────────────────────────────────
   '**/logs',
+  /**
+   * **EF Core 迁移备份目录**（0.3.54，真机 PEIS 现场）。
+   *
+   * MigrationBackup/ 是 dotnet ef 在 -o 覆盖前自动留的旧迁移快照 ——
+   * 它**是产物不是代码**，真机上却被当成一个真实功能区建了节点（「读卡插件迁移备份」）。
+   * 这一类目录在任何 .NET 仓库里都是同一回事，所以收进通用排除表。
+   */
+  '**/MigrationBackup',
 ];
 
 /**

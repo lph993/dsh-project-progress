@@ -194,3 +194,116 @@ test('覆盖回填：没有缺口时**一次调用都不发**（这条路径平�
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+
+test('顺序：**先回填、再归拢**（否则回填会把根下分支撑爆）—— 0.3.54', async () => {
+  /**
+   * 真机 0.3.53 现场：回填把 9 个原本没覆盖的目录各建了节点、**全挂在根下**
+   * ⇒ 根的直接子节点从 6 涨到 **15**（`too-many-children`）。
+   * 覆盖补上了，形状却被它破坏了。
+   *
+   * 归拢的职责本来就是"根下分支太多 ⇒ 按功能并成几组"，所以顺序必须是
+   * **先回填（补内容）→ 再归拢（收形状）**。
+   *
+   * 这条用例用一个"5 个目录、全部没覆盖"的小仓验证：
+   * 回填必须发生在归拢**之前**（用调用顺序断言），且最终根下分支数受控。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-order-'));
+  const tops = ['d1', 'd2', 'd3', 'd4', 'd5'];
+  for (const top of tops) {
+    mkdirSync(join(workspace, top, 'src'), { recursive: true });
+    writeFileSync(join(workspace, top, 'src', 'a.ts'), 'export const a = 1;\n');
+  }
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', { currentSelection: () => ({ provider: 'p', model: 'm' }) });
+  ctx.services.set('llm', { stream: () => { throw new Error('用注入的假流'); } });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string; parentId: string | null; refs?: Array<{ target: string }> }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const order: string[] = [];
+  let calls = 0;
+  const built = await service.aiBuildTree({
+    confirm: true,
+    stream: {
+      stream: (options: { messages?: unknown[] }) => {
+        const prompt = JSON.stringify(options.messages ?? []);
+        calls += 1;
+        if (calls === 1) return streamOf('');
+
+        /** 覆盖回填：为**每个缺的目录**给一个节点（真机就是这样把根撑爆的）。 */
+        if (prompt.includes('补漏')) {
+          order.push('backfill');
+          const dirs = [...prompt.matchAll(/- (d[1-5])/g)].map((m) => m[1]);
+          const unique = [...new Set(dirs)];
+          return streamOf(
+            JSON.stringify({
+              projectName: '顺序演示',
+              nodes: unique.map((dir) => ({
+                name: `${dir} 的功能`,
+                kind: 'feature',
+                parent: null,
+                description: `${dir} 的区域`,
+                refs: [{ type: 'dir', target: dir }],
+              })),
+            }),
+          );
+        }
+
+        /** 归拢：把这些分支并成 2 组。 */
+        if (prompt.includes('branchIds')) {
+          order.push('regroup');
+          const pairs = [...prompt.matchAll(/- id=([0-9a-f-]{8,})\s+「([^」]+)」/g)].map((m) => ({ id: m[1], name: m[2] }));
+          const half = Math.floor(pairs.length / 2);
+          return streamOf(
+            JSON.stringify({
+              summary: '并成两组',
+              groups: [
+                { name: '甲组', description: '前半', branchIds: pairs.slice(0, half).map((p) => p.id) },
+                { name: '乙组', description: '后半', branchIds: pairs.slice(half).map((p) => p.id) },
+              ].filter((group) => group.branchIds.length >= 2),
+            }),
+          );
+        }
+
+        /** 常规分片：只给根，一个 refs 都不给（制造覆盖缺口）。 */
+        order.push('shard');
+        return streamOf(
+          JSON.stringify({
+            projectName: '顺序演示',
+            nodes: [{ name: '顺序演示', kind: 'feature', parent: null, description: '本体' }],
+          }),
+        );
+      },
+    },
+  });
+
+  assert.equal(built['status'], 'ok', `建树应当成功：${JSON.stringify(built).slice(0, 300)}`);
+  const firstBackfill = order.indexOf('backfill');
+  const firstRegroup = order.indexOf('regroup');
+  assert.ok(firstBackfill >= 0, `必须发生覆盖回填（order=${order.join(',')}）`);
+  assert.ok(firstRegroup >= 0, `必须发生按功能归拢（order=${order.join(',')}）`);
+  assert.ok(
+    firstBackfill < firstRegroup,
+    `**回填必须在归拢之前**（实际顺序 ${order.join(' → ')}）—— 反了就没人收拾被撑爆的根`,
+  );
+
+  const board = await service.board();
+  const roots = board.nodes.filter((n) => n.parentId === null);
+  assert.equal(roots.length, 1, '只能有一个根');
+  const rootKids = board.nodes.filter((n) => n.parentId === roots[0]?.id);
+  assert.ok(
+    rootKids.length <= 6,
+    `根的直接子节点必须受控（≤6），实际 ${rootKids.length}：${JSON.stringify(rootKids.map((n) => n.name))}`,
+  );
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
