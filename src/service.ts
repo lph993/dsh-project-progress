@@ -9,7 +9,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 // 纯类型导入：加载 DSH 的服务接口增补（`ctx.fs` / `ctx.storageDomain` / `ctx.settings`）。
 // 这些增补写在各自包的 `.d.ts` 里，只有该模块进入编译图时才会生效。
@@ -68,6 +68,7 @@ import { nextTaskOf, type TaskCandidate } from './domain/next-task.ts';
 import {
   DEFAULT_SCAN_OPTIONS,
   NON_CODE_ARTIFACT_EXCLUDE,
+  matchesGlob,
 } from './domain/scanner.ts';
 
 /**
@@ -8736,12 +8737,33 @@ export class ProjectService {
       });
     }
     const root = this.boundRoot;
+    /**
+     * **算出"应当被覆盖的顶层目录"**（0.3.52）：仓库根下的一级目录，**去掉扫描排除项**。
+     *
+     * 排除项必须复用同一份（`DEFAULT_SCAN_EXCLUDE` + `AI_BUILD_EXCLUDE` + 用户 `scanExclude`），
+     * 否则 `tmp` / `out` / `packages` / `TestResults` 这些产物目录会被当成"没覆盖"永远报出来 ——
+     * **判据一旦与建树口径不一致，报出来的就是噪声**。
+     */
+    let knownTopDirs: string[] | undefined;
+    if (root !== undefined && root !== '') {
+      try {
+        const excluded = [...DEFAULT_SCAN_EXCLUDE, ...AI_BUILD_EXCLUDE, ...(this.deps.config.scanExclude ?? [])];
+        knownTopDirs = readdirSync(root, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+          .map((entry) => entry.name)
+          .filter((name) => !excluded.some((glob) => matchesGlob(name, glob)));
+      } catch {
+        /** 读不到仓库根就不做覆盖检查 —— 宁可不说。 */
+        knownTopDirs = undefined;
+      }
+    }
     return analyzeTreeHealth({
       projectName: graph.projectName,
       nodes,
       ...(root !== undefined && root !== ''
         ? { refExists: (target: string) => existsSync(join(root, target)) }
         : {}),
+      ...(knownTopDirs !== undefined ? { knownTopDirs } : {}),
       looksLikeEndpointName,
     });
   }

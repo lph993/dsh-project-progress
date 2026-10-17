@@ -51,6 +51,8 @@ export interface HealthIssue {
     | 'too-deep'
     | 'name-is-directory'
     | 'refs-missing-target'
+    | 'refs-too-broad'
+    | 'coverage-gap'
     | 'duplicate-identity'
     | 'no-refs'
     | 'no-description'
@@ -96,6 +98,17 @@ export interface HealthInput {
   refExists?: (target: string) => boolean;
   /** 一条命名是否"像某个端/模块"（复用根归位那套判据，别在这里重写）。 */
   looksLikeEndpointName?: (name: string) => boolean;
+  /**
+   * **仓库里"应当被树覆盖"的顶层目录**（0.3.52，审查 PEIS 时发现的角度）。
+   *
+   * 由调用方算好（它知道扫描排除项，纯函数不碰 fs）：产物目录（`tmp` / `out` /
+   * `packages` / `TestResults`…）不该算进来，否则永远报"没覆盖"。
+   *
+   * 真机教训：34 个顶层目录里 19 个没有任何 refs 覆盖 —— 其中 `Mobile`（791 项）、
+   * `PEIS.FormsOut`（183 项）、`PEIS.DataBase`、`DataR`、`InterfaceAdapter`…
+   * **12 个真实源码目录整个没进树**。结构再漂亮，漏掉一整端也谈不上健康。
+   */
+  knownTopDirs?: readonly string[];
 }
 
 /** 大功能上限（与提示词同一条口径）。 */
@@ -283,6 +296,110 @@ export function analyzeTreeHealth(input: HealthInput): HealthReport {
           `（如「${missingByNode[0]?.node.name}」的 ${missingByNode[0]?.missing.slice(0, 2).join('、')}）` +
           '—— 身份键按这些路径算，写错会让下次建树认错节点',
         nodeIds: missingByNode.map((entry) => entry.node.id),
+      });
+    }
+  }
+
+  /**
+   * ⑦b **refs 太宽**：一个节点的目录 refs **把别的节点的范围整个包进去了**（0.3.52）。
+   *
+   * ## 真机现场（审 PEIS 树时发现）
+   *
+   * 「体检业务服务」的 refs 是 `PEIS.Web, PEIS.WebApi, PEIS.Service, TimerServer,
+   * PEIS.Register, PEIS.FormReg` —— 其中 **`PEIS.Web` 是整个 Web 工程**。
+   * 它一条 refs 就覆盖了**另外 26 个节点**的范围（那些节点的 refs 都在 `PEIS.Web/` 之下）。
+   *
+   * 这不是"父子粗细不同"（父子关系的重叠是正常的：父描述整块、子描述其中一部分），
+   * 而是**平级/跨枝的两处都在声称覆盖同一片代码** —— 语义上说不通，而且会让身份键互相干扰。
+   *
+   * ## 判据（可核对）
+   *
+   * 两个节点**互不为祖先/后代**，且 A 的某条 ref 是 B 某条 ref 的**前缀目录** ⇒ A 太宽。
+   * 反过来（B 是 A 的前缀）同理。
+   */
+  const relations = new Map<string, ReadonlySet<string>>();
+  for (const node of alive) {
+    const ancestors = new Set<string>();
+    let cursor = node.parentId;
+    const seen = new Set<string>();
+    while (cursor !== null && !seen.has(cursor)) {
+      seen.add(cursor);
+      ancestors.add(cursor);
+      cursor = byId.get(cursor)?.parentId ?? null;
+    }
+    relations.set(node.id, ancestors);
+  }
+  const related = (a: HealthNode, b: HealthNode): boolean =>
+    relations.get(a.id)?.has(b.id) === true || relations.get(b.id)?.has(a.id) === true;
+  const normalizeRef = (ref: string): string => String(ref).replace(/\\/g, '/').replace(/\/+$/, '');
+
+  /** 每个节点"包住了多少个平级节点"（用于挑出最宽的那几个）。 */
+  const broadness = new Map<string, string[]>();
+  const withRefs = alive.filter((node) => node.refs.length > 0);
+  for (let i = 0; i < withRefs.length; i += 1) {
+    for (let j = i + 1; j < withRefs.length; j += 1) {
+      const a = withRefs[i] as HealthNode;
+      const b = withRefs[j] as HealthNode;
+      if (related(a, b)) continue;
+      const aCoversB = a.refs.some((ra) => {
+        const base = normalizeRef(ra);
+        return base !== '' && b.refs.some((rb) => normalizeRef(rb).startsWith(`${base}/`));
+      });
+      const bCoversA = b.refs.some((rb) => {
+        const base = normalizeRef(rb);
+        return base !== '' && a.refs.some((ra) => normalizeRef(ra).startsWith(`${base}/`));
+      });
+      if (aCoversB) {
+        const arr = broadness.get(a.id) ?? [];
+        arr.push(b.name);
+        broadness.set(a.id, arr);
+      }
+      if (bCoversA) {
+        const arr = broadness.get(b.id) ?? [];
+        arr.push(a.name);
+        broadness.set(b.id, arr);
+      }
+    }
+  }
+  const broadNodes = [...broadness.entries()]
+    .map(([id, covered]) => ({ id, name: byId.get(id)?.name ?? id, covered }))
+    .sort((a, b) => b.covered.length - a.covered.length)
+    .slice(0, 5);
+  if (broadNodes.length > 0) {
+    const top = broadNodes[0] as { id: string; name: string; covered: string[] };
+    issues.push({
+      code: 'refs-too-broad',
+      severity: 'warn',
+      message:
+        `${broadNodes.length} 个节点的 refs **把别的节点的范围整个包了进去**：` +
+        `最宽的是「${top.name}」（它的目录 refs 覆盖了另外 ${top.covered.length} 个节点：` +
+        `${top.covered.slice(0, 4).join('、')}${top.covered.length > 4 ? '…' : ''}）。` +
+        '这类"一条 refs 指整个工程"的节点应当收窄到它真正负责的那部分',
+      nodeIds: broadNodes.map((entry) => entry.id),
+    });
+  }
+
+  /**
+   * ⑦c **覆盖缺口**：仓库里有顶层目录**一条 refs 都没提到**（0.3.52）。
+   *
+   * 结构再漂亮，漏掉一整端也不叫健康 —— 真机漏掉的是 `Mobile`（791 项）等 12 个真实源码目录。
+   * 调用方传进来的 `knownTopDirs` 已排除产物目录（`tmp` / `out` / `packages`…），
+   * 所以这里报出来的每一条都值得看。
+   */
+  if (input.knownTopDirs !== undefined && input.knownTopDirs.length > 0) {
+    const allRefs = alive.flatMap((node) => node.refs.map(normalizeRef));
+    const uncovered = input.knownTopDirs.filter(
+      (dir) => !allRefs.some((ref) => ref === dir || ref.startsWith(`${dir}/`)),
+    );
+    if (uncovered.length > 0) {
+      issues.push({
+        code: 'coverage-gap',
+        severity: 'warn',
+        message:
+          `仓库里有 **${uncovered.length}/${input.knownTopDirs.length} 个顶层目录没有任何 refs 覆盖**：` +
+          `${uncovered.slice(0, 8).join('、')}${uncovered.length > 8 ? ' 等' : ''}` +
+          ' —— 这些区域对树来说等于不存在（多半是骨架没把它们送进模型，或模型忽略了）',
+        nodeIds: [],
       });
     }
   }

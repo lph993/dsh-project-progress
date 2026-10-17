@@ -241,6 +241,24 @@ export function renderSkeleton(input: PromptInput): string {
         `${scope.total - 1} 片各自建自己那部分；所有片**共用一个根**（根名用项目名），` +
         '你不要为这一片另起一个叫项目名的子节点。',
     );
+    /**
+     * **每个目录都必须有节点覆盖**（0.3.52，审 PEIS 树时量出来的）。
+     *
+     * 真机：28 个应当被覆盖的顶层目录里 **13 个一条 refs 都没有**
+     * （`Mobile` / `PEIS.DataBase` / `PEIS.Base` / `DataR` / `InterfaceAdapter` / `GSON.NET` …）。
+     * 树的形状可以很漂亮，但**漏掉一整端（移动端）就不叫健康**。
+     *
+     * 成因是每片只分摊到十几个节点预算，模型就挑"看着重要"的目录、把其余整块跳过。
+     * 所以把要求写死：**宁可某个目录只给 1 个粗节点，也不许整块不出现**。
+     */
+    if (scope.groups.length > 0) {
+      lines.push(
+        `**覆盖面要求（硬规则）**：这一片的 ${scope.groups.length} 个目录，` +
+          '**每一个都必须至少有一个节点覆盖**（节点名不必照抄目录名，但 refs 必须指到它下面）。' +
+          '节点预算不够时，**宁可给某个目录 1 个粗节点，也不许整块跳过** —— ' +
+          '漏掉的区域对用户来说等于不存在。',
+      );
+    }
     lines.push('');
   }
   lines.push(`项目名建议：${input.projectName}`);

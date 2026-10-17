@@ -83,4 +83,17 @@ describe('分批提示词：必须交代"只看得到这一片"', () => {
     assert.ok(!text.includes('分批建树'), '单次路径不该出现分批话术');
     assert.match(text, /项目名建议：X/, '原有内容照旧');
   });
+
+  it('**覆盖面要求**：每个目录都必须有节点覆盖（0.3.52 真机漏掉 13/28 个目录）', () => {
+    const text = renderSkeleton({
+      projectName: 'PEIS',
+      skeleton,
+      maxNodes: 10,
+      shardScope: { index: 2, total: 6, label: 'A 等 4 个目录', groups: ['Modules', 'Mobile', 'DataR'] },
+    });
+    assert.match(text, /覆盖面要求（硬规则）/, '必须把覆盖面写成硬规则');
+    assert.match(text, /每一个都必须至少有一个节点覆盖/, '要求可核对');
+    assert.match(text, /宁可给某个目录 1 个粗节点/, '节点预算不够时的取舍也要说清（否则模型就整块跳）');
+    assert.match(text, /漏掉的区域对用户来说等于不存在/, '给出理由，模型才更容易遵守');
+  });
 });

@@ -267,3 +267,78 @@ describe('树健康：no-refs 不许误报"聚合节点"（0.3.51 真机）', ()
     assert.ok(!issue?.nodeIds.includes('r'), '根自己有 refs，不该被报');
   });
 });
+
+describe('树健康：refs 太宽（0.3.52 审 PEIS 树发现）', () => {
+  it('平级的节点把别人的范围整个包进去 ⇒ warn（真机「体检业务服务」案例）', () => {
+    /**
+     * 真机现场：「体检业务服务」的 refs = `PEIS.Web, PEIS.WebApi, PEIS.Service, TimerServer…`
+     * 而 **`PEIS.Web` 是整个 Web 工程** —— 它一条 refs 覆盖了另外 26 个节点。
+     */
+    const nodes = [
+      node('r', 'PEIS 体检信息系统', null, { refs: ['README.md'], description: '本体', progress: 0.3 }),
+      node('g1', '体检业务办理', 'r', { description: '业务', progress: 0.6 }),
+      node('g2', '技术底座', 'r', { description: '底座', progress: 0.5 }),
+      node('a', '体检登记', 'g1', { refs: ['PEIS.Web/Areas/CheckUpManage'], description: '登记', progress: 0.7 }),
+      /** 太宽：指整个 PEIS.Web，把 g1 那一支的范围也包了进去。 */
+      node('b', '体检业务服务', 'g2', { refs: ['PEIS.Web', 'PEIS.Service'], description: '服务宿主', progress: 0.6 }),
+    ];
+    const report = analyzeTreeHealth({ projectName: 'PEIS 体检信息系统', nodes });
+    const issue = report.issues.find((i) => i.code === 'refs-too-broad');
+    assert.ok(issue, `必须报出"refs 太宽"：${JSON.stringify(report.issues)}`);
+    assert.match(issue?.message ?? '', /包了进去/);
+    assert.ok(issue?.nodeIds.includes('b'), '要指出是哪个节点太宽');
+  });
+
+  it('**父子之间的重叠不算**（父描述整块、子描述其中一部分，这是正常的）', () => {
+    const nodes = [
+      node('r', 'PEIS 体检信息系统', null, { refs: ['README.md'], description: '本体', progress: 0.3 }),
+      node('a', '体检业务办理', 'r', { refs: ['PEIS.Web/Areas'], description: '业务', progress: 0.5 }),
+      node('a1', '体检登记', 'a', { refs: ['PEIS.Web/Areas/CheckUpManage'], description: '登记', progress: 0.7 }),
+    ];
+    const report = analyzeTreeHealth({ projectName: 'PEIS 体检信息系统', nodes });
+    assert.ok(
+      !codesOf(report.issues).includes('refs-too-broad'),
+      `父子关系的粗细重叠是正常的，不许报：${JSON.stringify(report.issues)}`,
+    );
+  });
+});
+
+describe('树健康：覆盖缺口（0.3.52）', () => {
+  it('仓库顶层目录一条 refs 都没提到 ⇒ warn', () => {
+    const nodes = [
+      node('r', 'PEIS 体检信息系统', null, { refs: ['PEIS.Web'], description: '本体', progress: 0.3 }),
+      node('a', '体检业务办理', 'r', { refs: ['PEIS.Web/Areas'], description: '业务', progress: 0.6 }),
+    ];
+    const report = analyzeTreeHealth({
+      projectName: 'PEIS 体检信息系统',
+      nodes,
+      /** 调用方已排除产物目录，所以这里只列真实源码目录。 */
+      knownTopDirs: ['PEIS.Web', 'Mobile', 'PEIS.DataBase'],
+    });
+    const issue = report.issues.find((i) => i.code === 'coverage-gap');
+    assert.ok(issue, '必须报出覆盖缺口');
+    assert.match(issue?.message ?? '', /2\/3 个顶层目录/);
+    assert.ok(issue?.message.includes('Mobile'), '要点名缺了哪些');
+  });
+
+  it('全都有覆盖 ⇒ 不报', () => {
+    const nodes = [
+      node('r', 'PEIS 体检信息系统', null, { refs: ['PEIS.Web', 'Mobile/app'], description: '本体', progress: 0.3 }),
+      node('a', '移动端', 'r', { refs: ['Mobile'], description: '移动端', progress: 0.5 }),
+    ];
+    const report = analyzeTreeHealth({
+      projectName: 'PEIS 体检信息系统',
+      nodes,
+      knownTopDirs: ['PEIS.Web', 'Mobile'],
+    });
+    assert.ok(!codesOf(report.issues).includes('coverage-gap'));
+  });
+
+  it('不传 knownTopDirs ⇒ 不做这项检查（拿不到仓库时宁可不说）', () => {
+    const report = analyzeTreeHealth({
+      projectName: 'PEIS 体检信息系统',
+      nodes: [node('r', 'PEIS 体检信息系统', null, { refs: ['a'], description: 'x', progress: 0.3 })],
+    });
+    assert.ok(!codesOf(report.issues).includes('coverage-gap'));
+  });
+});
