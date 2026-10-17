@@ -4283,7 +4283,15 @@ test('分批触发看"失败 + 能否切"，不看文件数（范围收窄后的
         const prompt = JSON.stringify(options.messages ?? []);
         const top = prompt.includes('one/') ? 'one' : 'two';
         return streamOf(
-          JSON.stringify({ projectName: '小仓演示', nodes: [{ name: `模块 ${top}`, kind: 'feature', parent: null }] }),
+          JSON.stringify({
+            projectName: '小仓演示',
+            /**
+             * **必须带 refs**（0.3.53）：不带的话"这个目录一条 refs 都没有" ⇒ 覆盖回填会多一次调用，
+             * 把这条测试的调用计数断言（1 次整仓失败 + 2 片 = 3 次）打乱。
+             * 这条测试验的是"能不能切开"，不是覆盖，所以让它没有缺口。
+             */
+            nodes: [{ name: `模块 ${top}`, kind: 'feature', parent: null, refs: [{ type: 'dir', target: top }] }],
+          }),
         );
       },
     },
@@ -4983,7 +4991,10 @@ test('大项目分批建树：单次空返回后按顶层目录分批重试，�
       return streamOf(
         JSON.stringify({
           projectName: '分批演示',
-          nodes: [{ name: `模块 ${top}`, kind: 'feature', parent: null, weight: 4, priority: 5 }],
+          /** 带 refs ⇒ 没有覆盖缺口 ⇒ 覆盖回填不会插一次调用（0.3.53）。 */
+          nodes: [
+            { name: `模块 ${top}`, kind: 'feature', parent: null, weight: 4, priority: 5, refs: [{ type: 'dir', target: top }] },
+          ],
         }),
       );
     },
@@ -5781,6 +5792,8 @@ test('骨架被截断：直接分批（不先发整仓），且分批不许把�
               priority: 5,
               // 带 progress ⇒ 这个节点"被推进过"，够格被后来的片标成遗留（正是要防的）
               progress: 0.5,
+              /** 带 refs ⇒ 没有覆盖缺口 ⇒ 覆盖回填不会插一次调用（0.3.53）。 */
+              refs: [{ type: 'dir', target: top }],
             },
           ],
         }),

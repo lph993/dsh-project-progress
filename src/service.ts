@@ -190,6 +190,7 @@ import { AI_BUILD_EXCLUDE } from './ai/scope.ts';
 import {
   AI_TREE_SYSTEM_PROMPT,
   DEFAULT_AI_MAX_OUTPUT_TOKENS,
+  buildCoveragePrompt,
   buildTreePrompt,
   describeEstimate,
   estimateAiBuild,
@@ -7122,6 +7123,22 @@ export class ProjectService {
       if (regrouped.status === 'ok') calls += 1;
     }
     /** 分批路径同样做一次树体检（0.3.48）—— 分批最容易出结构问题，更该报。 */
+    /**
+     * **覆盖回填**（0.3.53）：提示词只能"希望"模型别漏目录，这里用程序保证补上。
+     * 没有缺口时**一次调用都不发**。
+     */
+    const backfilled = await this.backfillCoverage({
+      route: input.route,
+      ...(input.stream !== undefined ? { stream: input.stream } : {}),
+      ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+    });
+    if (backfilled.status === 'ok') {
+      notes.push(`覆盖回填：${backfilled.reason}`);
+      calls += 1;
+    } else if (backfilled.status !== 'skipped') {
+      notes.push(`覆盖回填未生效：${backfilled.reason}`);
+    }
     const shardedHealth = await this.treeHealthSummary(input.sessionId);
     if (shardedHealth !== undefined) notes.push(shardedHealth);
     notes.push(
@@ -8737,26 +8754,7 @@ export class ProjectService {
       });
     }
     const root = this.boundRoot;
-    /**
-     * **算出"应当被覆盖的顶层目录"**（0.3.52）：仓库根下的一级目录，**去掉扫描排除项**。
-     *
-     * 排除项必须复用同一份（`DEFAULT_SCAN_EXCLUDE` + `AI_BUILD_EXCLUDE` + 用户 `scanExclude`），
-     * 否则 `tmp` / `out` / `packages` / `TestResults` 这些产物目录会被当成"没覆盖"永远报出来 ——
-     * **判据一旦与建树口径不一致，报出来的就是噪声**。
-     */
-    let knownTopDirs: string[] | undefined;
-    if (root !== undefined && root !== '') {
-      try {
-        const excluded = [...DEFAULT_SCAN_EXCLUDE, ...AI_BUILD_EXCLUDE, ...(this.deps.config.scanExclude ?? [])];
-        knownTopDirs = readdirSync(root, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-          .map((entry) => entry.name)
-          .filter((name) => !excluded.some((glob) => matchesGlob(name, glob)));
-      } catch {
-        /** 读不到仓库根就不做覆盖检查 —— 宁可不说。 */
-        knownTopDirs = undefined;
-      }
-    }
+    const knownTopDirs = root !== undefined && root !== '' ? this.scannableTopDirs(root) : undefined;
     return analyzeTreeHealth({
       projectName: graph.projectName,
       nodes,
@@ -8769,6 +8767,27 @@ export class ProjectService {
   }
 
   /**
+   * **仓库里"应当被覆盖"的顶层目录**（0.3.53）：根下一级目录，**去掉扫描排除项**。
+   *
+   * 排除项必须复用同一份（`DEFAULT_SCAN_EXCLUDE` + `AI_BUILD_EXCLUDE` + 用户 `scanExclude`），
+   * 否则 `tmp` / `out` / `packages` / `TestResults` 这些产物目录会被当成"没覆盖"永远报出来 ——
+   * **判据一旦与建树口径不一致，报出来的就是噪声**。
+   *
+   * 体检与覆盖回填**共用这一份**：两处各算一次迟早分叉（这轮的教训反复在这上面）。
+   */
+  private scannableTopDirs(root: string): string[] | undefined {
+    try {
+      const excluded = [...DEFAULT_SCAN_EXCLUDE, ...AI_BUILD_EXCLUDE, ...(this.deps.config.scanExclude ?? [])];
+      return readdirSync(root, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+        .map((entry) => entry.name)
+        .filter((name) => !excluded.some((glob) => matchesGlob(name, glob)));
+    } catch {
+      /** 读不到仓库根就不做覆盖检查 —— 宁可不说。 */
+      return undefined;
+    }
+  }
+  /**
    * 树体检的一行摘要（进建树说明用）。**拿不到图就返回 `undefined`** —— 不编。
    */
   private async treeHealthSummary(sessionId?: string): Promise<string | undefined> {
@@ -8778,6 +8797,149 @@ export class ProjectService {
     } catch (error) {
       debugBus.warn('tree', `树体检没跑成（不影响建树结果）：${error instanceof Error ? error.message : String(error)}`);
       return undefined;
+    }
+  }
+
+  /**
+   * **覆盖回填**（0.3.53）：有顶层目录完全没被覆盖时，补一次调用把那些目录建出来。
+   *
+   * ## 为什么必须有它（0.3.52 的提示词规则不够）
+   *
+   * 0.3.52 在分批话术里写了硬规则"这一片的每个目录都必须至少有一个节点覆盖"，
+   * 真机上覆盖缺口从 **13 个降到 8 个** —— 有效，但**不可靠**：
+   * `Mobile`（791 项、整个移动端）仍然一条 refs 都没有。
+   *
+   * 原因很实在：每片分摊到的**节点预算**是有限的（`shardMaxNodes` 按文件占比分摊），
+   * 模型在预算紧张时就会挑"看着重要"的目录、把其余整块跳过。**提示词只能希望，程序才能保证。**
+   *
+   * ## 做法（确定性、只补缺口）
+   *
+   * 1. 算出"应当被覆盖、但树里一条 refs 都没有"的顶层目录（与体检**同一份**判据 `scannableTopDirs`）；
+   * 2. **只把缺的那几个目录**的骨架喂给模型，要求每个目录 1~3 个节点；
+   * 3. 按普通分片落库（`partialView`），节点挂到既有根/分支下；
+   * 4. **再算一次覆盖**，把"补了几个、还剩几个"如实写进结果。
+   *
+   * **没有缺口就一次调用都不发** —— 这条路径平时不花钱。
+   */
+  async backfillCoverage(input: {
+    route: AiRoute;
+    stream?: LlmStreamLike;
+    signal?: AbortSignal;
+    sessionId?: string;
+  }): Promise<
+    | { status: 'ok'; targetDirs: number; stillMissing: number; created: number; reason: string }
+    | { status: 'skipped'; reason: string }
+    | { status: 'error'; reason: string }
+  > {
+    try {
+      const root = this.boundRoot;
+      if (root === undefined || root === '') return { status: 'skipped', reason: '拿不到工作区根，不做覆盖回填' };
+      const topDirs = this.scannableTopDirs(root);
+      if (topDirs === undefined || topDirs.length === 0) {
+        return { status: 'skipped', reason: '读不到仓库顶层目录，不做覆盖回填' };
+      }
+
+      const { graph, derived } = await this.derive(input.sessionId);
+      const refsOfAlive = Object.values(graph.nodes)
+        .filter((node) => {
+          const state = derived.nodes.get(node.id);
+          return state !== undefined && state.derivedState !== 'removed';
+        })
+        .flatMap((node) => (node.refs ?? []).map((ref) => String(ref.target).replace(/\\/g, '/').replace(/\/+$/, '')));
+      const uncovered = topDirs.filter(
+        (dir) => !refsOfAlive.some((ref) => ref === dir || ref.startsWith(`${dir}/`)),
+      );
+      if (uncovered.length === 0) return { status: 'skipped', reason: '没有覆盖缺口（一个顶层目录都不缺）' };
+
+      /**
+       * **上限保护**：一次只补前这么多个目录。
+       * 缺口特别多说明这一轮建树整体偏了，硬补十几个会把成本和时间拉爆 ——
+       * 宁可如实说"补了一部分、还剩多少"，也不要闷头跑十几分钟。
+       */
+      const MAX_DIRS = 10;
+      const targets = uncovered.slice(0, MAX_DIRS);
+
+      /**
+       * 只遍历仓库、再筛出目标目录的条目：**不另写一套遍历**。
+       * 扫描本身在 0.3.30 修过排除项之后是几百毫秒级（真机 579ms），不值得为它加一条旁路。
+       */
+      const walked = await scanWorkspaceEntries({
+        root,
+        maxDepth: DEFAULT_SCAN_OPTIONS.maxDepth,
+        exclude: [...DEFAULT_SCAN_EXCLUDE, ...AI_BUILD_EXCLUDE, ...(this.deps.config.scanExclude ?? [])],
+        countLines: false,
+      });
+      const entries = walked.entries.filter((entry) =>
+        targets.some((dir) => entry.path === dir || entry.path.startsWith(`${dir}/`)),
+      );
+      if (entries.length === 0) {
+        return { status: 'skipped', reason: `缺口目录扫出来 0 条条目（${targets.join('、')}）` };
+      }
+      const collected = await collectSkeleton({ root, entries: entries.map((entry) => ({ ...entry })) });
+
+      const prompt = buildCoveragePrompt({
+        projectName: graph.projectName,
+        dirs: targets,
+        skeleton: collected.skeleton,
+      });
+      const call = await this.callTreeBuilderWithProgress(
+        {
+          ctx: this.ctx,
+          route: input.route,
+          system: AI_TREE_SYSTEM_PROMPT,
+          user: prompt,
+          ...(input.stream !== undefined ? { stream: input.stream } : {}),
+          ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        },
+        { mode: 'shard', shardIndex: 1, shardTotal: 1 },
+      );
+      if (!call.ok) {
+        return { status: 'error', reason: `覆盖回填调用没成功：${call.reason}` };
+      }
+
+      const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
+        partialView: true,
+        skipProjectNameWrite: true,
+        /**
+         * ⚠️ **必须显式传 `false`**（0.3.53 自己踩到的坑）。
+         *
+         * `applyAiTree` 里判的是 `options?.replaceAutoDraft !== false` —— 也就是
+         * **不传等于 true**，它会清掉"没人动过的自动节点"。而刚建完的树里，节点全是这种状态。
+         *
+         * 我第一版没传，结果 e2e 里 `board()` 返回 **0 个节点**：回填那次把整棵树清空了。
+         * 这要是上了真机，就是"点一次重建、树没了"。
+         */
+        replaceAutoDraft: false,
+      });
+
+      /** 再算一次：还剩几个目录没覆盖。 */
+      const after = await this.derive(input.sessionId);
+      const refsAfter = Object.values(after.graph.nodes)
+        .filter((node) => {
+          const state = after.derived.nodes.get(node.id);
+          return state !== undefined && state.derivedState !== 'removed';
+        })
+        .flatMap((node) => (node.refs ?? []).map((ref) => String(ref.target).replace(/\\/g, '/').replace(/\/+$/, '')));
+      const stillMissing = topDirs.filter(
+        (dir) => !refsAfter.some((ref) => ref === dir || ref.startsWith(`${dir}/`)),
+      ).length;
+
+      return {
+        status: 'ok',
+        targetDirs: targets.length,
+        stillMissing,
+        created: applied.created,
+        reason:
+          `有 ${uncovered.length} 个顶层目录一条 refs 都没有，已按 ${targets.length} 个补建 ` +
+          `（新建 ${applied.created} 个节点）` +
+          (uncovered.length > targets.length ? `；另有 ${uncovered.length - targets.length} 个超出单次上限未补` : '') +
+          `；补完后仍缺 ${stillMissing} 个`,
+      };
+    } catch (error) {
+      return {
+        status: 'error',
+        reason: `覆盖回填出错：${error instanceof Error ? error.message : String(error)}`,
+      };
     }
   }
 
@@ -9825,4 +9987,3 @@ function readWorkspaceRootFromEnv(): string | undefined {
   if (!env) return undefined;
   return env['DSH_WORKSPACE'] ?? env['PWD'] ?? env['INIT_CWD'] ?? undefined;
 }
-

@@ -212,6 +212,47 @@ export const AI_TREE_SYSTEM_PROMPT = [
 ].join('\n');
 
 /** 渲染骨架文本（只有路径/大小/关键文件签名，不含整文件内容）。 */
+/**
+ * **覆盖回填的提示词**（0.3.53）。
+ *
+ * 用于"有顶层目录完全没被覆盖"时补一次调用 —— 每个目录只要 1~3 个节点，
+ * **目标不是把树建细，而是把漏掉的区域补上一个可跟踪的落点**。
+ *
+ * 为什么单独一个提示词：这一轮的输入只有"缺的那几个目录"，和常规建树（整仓/整片）
+ * 是两种任务。混用同一个提示词，模型会以为又要建一整棵大树、把节点的粒度搞乱。
+ */
+export function buildCoveragePrompt(input: {
+  projectName: string;
+  dirs: readonly string[];
+  skeleton: readonly SkeletonEntry[];
+}): string {
+  const lines: string[] = [];
+  lines.push('⚠ **这不是一次完整的建树，是一次"补漏"。**');
+  lines.push('');
+  lines.push(
+    `项目「${input.projectName}」的树已经建好了，但下面这 ${input.dirs.length} 个顶层目录` +
+      '**在当前树里一条 refs 都没有** —— 等于这些区域对用户不存在：',
+  );
+  for (const dir of input.dirs) lines.push(`- ${dir}`);
+  lines.push('');
+  lines.push('请**只为这几个目录**各给 1~3 个节点，把这几个区域补上：');
+  lines.push(
+    '- 每个目录**至少 1 个节点**，`refs` 必须指到该目录下面（不要照抄目录名当节点名）；',
+    '- **不要再建根**、不要再给整个项目分层 —— 只需要这几块；',
+    '- 节点名要能回答"这块要做什么"，不要用目录名/技术分层名；',
+    '- `description` 每个节点都要给，20~60 字。',
+  );
+  lines.push('');
+  lines.push('下面是这些目录的骨架（路径 / 大小 / 关键文件签名）：');
+  lines.push('');
+  /** 复用同一套骨架渲染（目录 + 关键文件签名），只是把"项目名建议"那行换掉。 */
+  const rendered = renderSkeleton({ projectName: input.projectName, skeleton: input.skeleton, maxNodes: 30 });
+  lines.push(rendered);
+  lines.push('');
+  lines.push('输出仍然是**一个 JSON 对象**：`{ "projectName": "…", "nodes": [...] }`，`parent` 用下标或 null。');
+  return lines.join('\n');
+}
+
 export function renderSkeleton(input: PromptInput): string {
   const lines: string[] = [];
   const dirs = input.skeleton.filter((entry) => entry.kind === 'dir');
