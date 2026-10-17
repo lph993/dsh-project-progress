@@ -223,6 +223,18 @@ export async function postMergeRoots(
   return postJson<MergeRootsOutcome>('/roots/merge', {}, signal);
 }
 
+/**
+ * **只做根节点归位，不重建树**（0.3.36）。
+ *
+ * 用途：树已经建好、但根选成了"某个端"（项目本体成了它的子节点）时，
+ * **不必**花几万 token 重建一次 —— 归位是纯结构操作。
+ */
+export async function postNormalizeRoot(
+  signal?: AbortSignal,
+): Promise<FetchOutcome<{ ok: boolean; moved: number; reason: string }>> {
+  return postJson<{ ok: boolean; moved: number; reason: string }>('/roots/normalize', {}, signal);
+}
+
 /** AI 建树的成本预估（不调模型）。 */
 export interface AiEstimateView {
   entries: number;

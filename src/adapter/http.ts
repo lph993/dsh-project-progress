@@ -399,6 +399,22 @@ export function registerRoutes(
             sendJson(res, 200, { ok: true, ...outcome });
             return;
           }
+          case 'POST /pm/roots/normalize': {
+            /**
+             * **只做根节点归位，不重建树**（0.3.36）。
+             *
+             * 为什么需要单独一个入口：归位原本只在建树流程里跑，于是"已经建好的树
+             * 层级放反了"就只能整个重建一次 —— 那要花几万 token，只为挪一层。
+             * 这个路由让归位**单独触发**（判据仍是同一个纯函数，只提议→按判据搬）。
+             *
+             * **面板意图**：目标是用户在看的那棵树（与 `roots/merge` 同一口径）。
+             */
+            const outcome = await service.runPanelIntent(undefined, () =>
+              service.normalizeProjectRoot(undefined),
+            );
+            sendJson(res, 200, { ok: true, ...outcome });
+            return;
+          }
           case 'POST /pm/node/action': {
             // 面板右键菜单的动作分发（FR-50–58b 的面板路径）。
             // 需要二次确认的动作在 `confirm!==true` 时只回影响范围。

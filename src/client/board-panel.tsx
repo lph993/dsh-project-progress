@@ -16,6 +16,7 @@ import {
   postNodeAction,
   postRemoveBranch,
   postMergeRoots,
+  postNormalizeRoot,
   deleteProject,
   postRollback,
   fetchSnapshots,
@@ -1680,6 +1681,49 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 },
               },
               `整理为单一根（${liveRootCount}）`,
+            )
+          : null,
+        /**
+         * 「根节点归位」——**只归位、不重建**（0.3.36）。
+         *
+         * 为什么需要它：AI 建树反复把"项目本体"建成某个端的子节点（真机三次重建、
+         * 三次不同的错法），而归位原本只在建树流程里跑 ⇒ 已经建好的树要修一层层级
+         * 就得整个重建（几万 token）。这条按钮让那件事变成一次**不花钱**的结构操作。
+         *
+         * 判据在服务端（纯函数，只看"同一个东西被建成了两个节点"）；
+         * 这里只负责触发与如实回报"动没动、为什么"。
+         */
+        liveRootCount === 1
+          ? React.createElement(
+              'button',
+              {
+                type: 'button',
+                style: styles.headerButton,
+                'data-pm-normalize-root': '1',
+                title:
+                  '检查根节点是不是"某个端"：若是，把项目本体那支提升为根、其余子节点并入它。' +
+                  '只改父子关系，不调模型、不花钱；判据不成立时什么都不会动',
+                onClick: () => {
+                  void postNormalizeRoot()
+                    .then((outcome) => {
+                      const value = outcome.value;
+                      if (outcome.ok && value !== undefined) {
+                        setRootNotice(
+                          value.moved > 0
+                            ? `根节点已归位（搬动 ${value.moved} 个节点）：${value.reason}`
+                            : `根节点无需归位：${value.reason}`,
+                        );
+                      } else {
+                        setRootNotice(`归位失败：${outcome.error ?? '未知原因'}`);
+                      }
+                      refresh();
+                    })
+                    .catch((error: unknown) =>
+                      setRootNotice(`归位失败：${error instanceof Error ? error.message : String(error)}`),
+                    );
+                },
+              },
+              '根节点归位',
             )
           : null,
         /*

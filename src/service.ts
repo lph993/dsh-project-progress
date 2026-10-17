@@ -826,6 +826,18 @@ export class ProjectService {
    */
   private aiRunProgress: AiRunProgress | null = null;
   /**
+   * **这一轮建树是为哪个项目跑的**（0.3.36）。
+   *
+   * 为什么必须有：`aiRunProgress` 是**服务级全局**（一轮建树就是一轮，与"当前绑定"无关），
+   * 而分批建树的**每一片落库都会切换绑定** ⇒ 面板此时请求到的 board 可能属于另一个项目，
+   * 于是 `aiRun` 读到 `null`：**进度条凭空消失，用户以为跑完了**
+   * （真机现场：35 次调用、27 万 token 还在涨，面板却什么都没显示）。
+   *
+   * 有了它就能**只在"这一轮真正在建的那个项目"的看板上**给出进度；
+   * 别的项目如实回 `null`（不把自己没在干的事说成在干）。
+   */
+  private aiRunProjectId: string | null = null;
+  /**
    * **正在跑的建树调用的中止句柄**（FR-168）；没有在跑时为 `null`。
    *
    * 为什么要显式通道而不是"连接断了就中止"：后者是**推断**（宿主/代理/浏览器任何一环都可能
@@ -5536,7 +5548,7 @@ export class ProjectService {
       }),
       confirmChannel: this.confirm?.describeChannel() ?? '确认路由未装配',
       // FR-167：正在跑的建树进度（没在跑就是 null，面板据此隐藏那一行）
-      aiRun: this.aiRunProgress ?? null,
+      aiRun: this.aiRunProgress !== null && this.aiRunProjectId === this.projectId ? this.aiRunProgress : null,
       document: {
         path: this.deps.config.documentPath,
         exists: doc.exists,
@@ -6695,6 +6707,14 @@ export class ProjectService {
        * 混成一个字段的话，"跟随宿主"就没法既省略参数又显示数字。
        */
       displayLimit?: number | undefined;
+      /**
+       * **这一片之后还有没有片**（0.3.36 修"面板显示已完成、其实还在跑"）。
+       *
+       * `phase: 'done'` 的语义必须是"**整轮**建树结束了"，而不是"这一片结束了"。
+       * 原先每片结束都标 `done` —— 于是第一片一跑完，面板就打出"已完成 / 100%"，
+       * 而后面还有几十片在跑（真机现场：35 次调用、27 万 token 还在涨，面板却说完成）。
+       */
+      moreShardsPending?: boolean;
     },
   ): Promise<BuildTreeCallResult> {
     const startedAt = this.deps.clock.now();
@@ -6702,7 +6722,11 @@ export class ProjectService {
      * 每片都从"第 1 片"开始计数（单次调用也是 1）⇒ 这里正好是**一轮建树的开端**，
      * 用它把"本轮实际用量"清零；否则上一轮的数字会被累加进这一轮。
      */
-    if (meta.shardIndex === 1) this.aiRunActual = undefined;
+    if (meta.shardIndex === 1) {
+      this.aiRunActual = undefined;
+      /** 记下"这一轮在建哪个项目"，供 board 按项目过滤（见 `aiRunProjectId` 的注释）。 */
+      this.aiRunProjectId = this.projectId;
+    }
     const limit = meta.displayLimit ?? input.maxTokens ?? 0;
     let lastChars = 0;
     const snapshot = (outputChars: number, truncated = false, phase?: 'running' | 'done' | 'error'): AiRunProgress =>
@@ -6765,8 +6789,16 @@ export class ProjectService {
        * **结束也留着这一份快照**（用户口径："生成后，进度条保留，保持 100%"）：
        * 清掉它，用户就看不到"刚刚花了多少 token" —— 而那正是他要看的东西。
        * 下一次建树开始时会被新的第 1 片覆盖。
+       *
+       * ⚠️ 但**分批时只有最后一片才算 `done`**（0.3.36）：否则"已完成"会提前几十片出现。
+       * 还有片没跑 ⇒ 标 `running`，让面板继续显示"进行中"。
        */
-      this.aiRunProgress = snapshot(lastChars, !result.ok && result.reason === 'truncated', result.ok ? 'done' : 'error');
+      const finished = result.ok && meta.moreShardsPending !== true;
+      this.aiRunProgress = snapshot(
+        lastChars,
+        !result.ok && result.reason === 'truncated',
+        result.ok ? (finished ? 'done' : 'running') : 'error',
+      );
       return result;
     } catch (error) {
       // 理论上 `callTreeBuilder` 不抛（它把失败都转成结构化结果），但这层不能因此挂着"进行中"
@@ -6926,6 +6958,8 @@ export class ProjectService {
           mode: 'shard',
           shardIndex: index + 1,
           shardTotal: shards.length,
+          /** 还有片没跑 ⇒ 不许标 done（否则面板会在第一片就显示"已完成"）。 */
+          moreShardsPending: index + 1 < shards.length,
           ...(input.displayLimit !== undefined ? { displayLimit: input.displayLimit } : {}),
         },
       );
@@ -8201,8 +8235,12 @@ export class ProjectService {
    * - **不在部分视图下做**（分批路径的每片是局部树，根的概念不存在于单片里）；
    * - 用 `reparentNode` 搬（成环保护 + 审计 + 可回滚），不直接改图；
    * - **失败不影响建树结果**：归位是"整理"，整理不成不该把整次建树判失败。
+   *
+   * **公开方法**（`public`）：建树流程会自动调它，但**也要能单独触发** ——
+   * 已经建好的树不该为了修一层层级而整个重建一次（那要花几万 token）。
+   * 见 HTTP `POST /pm/roots/normalize`。
    */
-  private async normalizeProjectRoot(
+  async normalizeProjectRoot(
     sessionId: string | undefined,
   ): Promise<{ moved: number; reason: string }> {
     try {
@@ -8210,7 +8248,17 @@ export class ProjectService {
       const alive = (id: string): boolean =>
         graph.nodes[id] !== undefined && derived.nodes.get(id)?.derivedState !== 'removed';
       const roots = graph.rootIds.filter((id) => alive(id));
-      if (roots.length !== 1) return { moved: 0, reason: '顶级节点不是恰好 1 个，跳过归位' };
+      if (roots.length !== 1) {
+        /**
+         * ⚠️ **"没动"也必须留痕**（0.3.36）。
+         *
+         * 真机教训：我先只写了"成功搬动"的日志，结果归位**悄悄什么都没做**时，
+         * 日志里一条都没有 ⇒ 我无法判断是"没跑到"还是"跑了但判据没命中"，
+         * 只能靠猜。**判定类逻辑的默认分支必须说话。**
+         */
+        debugBus.info('ai', `根节点归位：顶级节点 ${roots.length} 个（不是 1），跳过`);
+        return { moved: 0, reason: '顶级节点不是恰好 1 个，跳过归位' };
+      }
       const rootId = roots[0] as string;
       const children = derived.index.childrenOf.get(rootId) ?? [];
       const decision = decideRootNormalize(
@@ -8220,7 +8268,14 @@ export class ProjectService {
           .filter((id) => alive(id))
           .map((id) => ({ id, name: graph.nodes[id]?.name ?? '' })),
       );
-      if (decision.promoteId === null) return { moved: 0, reason: decision.reason };
+      if (decision.promoteId === null) {
+        debugBus.info(
+          'ai',
+          `根节点归位：不动（项目名「${graph.projectName}」核心串「${decision.projectCore}」，` +
+            `根「${graph.nodes[rootId]?.name ?? ''}」，子节点 ${children.length} 个）。${decision.reason}`,
+        );
+        return { moved: 0, reason: decision.reason };
+      }
 
       const promoteId = decision.promoteId;
       /** ① 把项目本体那支提到根（`parentId: null`）。 */
