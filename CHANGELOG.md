@@ -5,6 +5,76 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.3.58] — 建树深审：找到 2026-10-21 串仓库事故的**真根因**
+
+> 用户："**再审查，尤其建树那块**"。
+
+### 一、真根因：核对之后**还夹着一次重新绑定**
+
+0.3.56/0.3.57 我在 `applyAiTree` 入口加了 `ensureLanding(expectRoot)`。**它没用**，因为紧接着这一行：
+
+```
+applyAiTree:
+  1. ensureLanding(expectRoot)   ← 纠正落点
+  2. await this.derive()          ← **derive 第一行就是 bindForCall(undefined)**
+  3. 开始写节点
+```
+
+而 `derive()` 的 `bindForCall(undefined)` 走 `operationRoot()`，匿名读那条分支是：
+
+```ts
+if (anonymous && this.boundRootSession !== undefined) {
+  const anonymousOwned = this.lastSessionBound?.root ?? this.lastAnonymousBound?.root;
+  if (… !isSameRoot(anonymousOwned, this.boundRoot)) {
+    return { root: anonymousOwned, … };   // ← 回落到**另一个会话最近读过的根**
+  }
+}
+```
+
+⇒ **刚纠正完的落点，被下一行立刻改回去**。核对成了摆设。
+
+**为什么真机上的表现是"读插件仓库、写 PEIS 项目"**：绑定在流程中间被别人改过，
+而当时**整个建树期间没有任何锁**——每个 `derive()` 都是一次重新投票。
+
+### 二、修法：用既有的"操作期锁"包住整段建树
+
+`bindForCall` 的第一条判据本来就是 **"已经在一次操作执行期内 ⇒ 不重绑"**（为这类场景准备的）。
+所以建树一开始就绑对一次并上锁，中途所有 `derive/bindForCall` 都会被挡住：
+
+```
+aiBuildTree:
+  buildRoot = resolveRoot(sessionId)        ← 面板意图已由 withPanelIntent 建立
+  inFlightProject = undefined               ← 先清陈旧锁
+  await bindProjectToRoot(buildRoot, …)     ← 绑到"这次要读的仓库"
+  releaseLanding = enterOperation()         ← **整个建树期间钉住**
+  try { …原有的 630 行… } finally { releaseLanding() }
+```
+
+顺带修掉 `ensureLanding` 与锁的冲突：它改绑前必须临时清锁（否则被锁挡住），
+**改完要把锁钉到纠正后的项目上**（否则锁还指着旧项目，等于把事故重新打开）。
+
+### 三、测试（+1 条，共 **683/683**）
+
+`tests/e2e/build-pin.test.ts` —— **在模型调用进行中**采样 `debugBinding().inFlightProject`：
+
+| 断言 | 意义 |
+|---|---|
+| 建树期间 `inFlightProject` **必须是项目 id** | 没锁 ⇒ 中途会被改绑（事故原因） |
+| 锁钉在**本次建树的那个项目**上 | 不是别的项目 |
+| 建树结束后 `inFlightProject === undefined` | 忘了解锁会把后续操作钉在旧项目上 |
+
+**注入验证**：把 `enterOperation()` 换成空函数 ⇒ **`fail=1`**；还原 ⇒ 全绿、无残留。
+
+### 四、这一轮为什么前两次都没修到点上
+
+| 版本 | 我以为的问题 | 实际 |
+|---|---|---|
+| 0.3.56 | 落点没核对 | 核对了，但**紧接着被 derive 改回去** |
+| 0.3.57 | 只有一条写入路径没核对 | 补齐了四条，但**四条都建立在"核对有效"这个错误前提上** |
+
+教训：**修"读 A 写 B"这类问题时，必须盯住"最后一次能改变绑定的是谁"** ——
+不是"有没有核对"，而是"核对之后还有没有人能改"。这次是靠读 `derive()` 的第一行才发现的。
+
 ## [0.3.57] — 代码审查：0.3.56 的落点防护**只覆盖了一条写入路径**
 
 > 用户："**代码审查**"。

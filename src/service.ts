@@ -1397,9 +1397,21 @@ export class ProjectService {
     const decision = decideLandingRebind(currentRoot, expectedRoot);
     if (!decision.rebind) return { rebound: false };
     debugBus.warn('project', `AI 建树${decision.reason}`);
-    /** 陈旧锁会让 `bindProjectToRoot` 拒绝改绑 —— 这正是事故的直接原因。 */
+    /**
+     * ⚠️ **改绑期间必须临时清锁，改完要把锁还给新项目**（0.3.58）。
+     *
+     * 不清锁：`bindProjectToRoot` 会被"操作期内不许改绑"那道判据挡住 ⇒ 纠正无效。
+     * 不还锁：`enterOperation()` 建立的**建树期锁**会一直指向旧项目 ⇒ 后续写入又被拨回去，
+     * 等于把刚修好的事故重新打开一次。
+     */
+    const pinnedBefore = this.inFlightProject;
     this.inFlightProject = undefined;
-    await this.bindProjectToRoot(expectedRoot);
+    try {
+      await this.bindProjectToRoot(expectedRoot);
+    } finally {
+      /** 原本有锁 ⇒ 把锁重新钉到**纠正后**的项目上。 */
+      if (pinnedBefore !== undefined) this.inFlightProject = this.projectId;
+    }
     return { rebound: true, note: `落点已纠正：${decision.reason}` };
   }
 
@@ -6384,10 +6396,42 @@ export class ProjectService {
      * 用 `withPanelIntent` 把显式的面板意图提升为上下文，工具调用路径不受影响。
      */
     return await this.withPanelIntent(input.sessionId, async () => {
-    const root = this.resolveRoot(input.sessionId).root;
-    if (root === undefined) {
+    const buildRoot = this.resolveRoot(input.sessionId).root;
+    if (buildRoot === undefined) {
       return { status: 'denied', reason: 'no-workspace-root', hint: '工作区根丢失，请刷新后重试。' };
     }
+    /**
+     * **整个建树期间钉住落点**（0.3.58 —— 2026-10-21 串仓库事故的**真根因**）。
+     *
+     * ## 为什么"每次写入前核对"不够（0.3.56 / 0.3.57 的补丁为什么没挡住）
+     *
+     * `applyAiTree` 里我先调 `ensureLanding(expectRoot)` 纠正落点，**紧接着**就 `await this.derive()`；
+     * 而 `derive()` 第一行就是 `bindForCall(undefined)` ⇒ `operationRoot()`。匿名读那条分支里：
+     *
+     * ```ts
+     * if (anonymous && this.boundRootSession !== undefined) {
+     *   const anonymousOwned = this.lastSessionBound?.root ?? this.lastAnonymousBound?.root;
+     *   if (… !isSameRoot(anonymousOwned, this.boundRoot)) return { root: anonymousOwned, … };
+     * }
+     * ```
+     *
+     * ⇒ 它可能回落到**另一个会话最近读过的那个根**，于是**刚纠正完的落点立刻被改回去**。
+     * 核对变成了摆设 —— 这也是为什么真机上照样混：**纠正与写之间还夹着一次重新绑定**。
+     *
+     * ## 修法：用既有的"操作期锁"包住整段
+     *
+     * `enterOperation()` 把 `this.inFlightProject` 钉成当前项目；而 `bindForCall` 的第一条判据是
+     * **"已经在一次操作执行期内 ⇒ 不重绑"**（`bindForCall` 里那段注释写得很清楚，它本来就是为
+     * 这类场景准备的）。所以只要在**建树开始**绑对一次并上锁，中途所有 `derive/bindForCall`
+     * 都会被锁挡住，落点在整个建树期间不可能再变。
+     *
+     * 这也解释了真机那次"读插件仓库、写 PEIS 项目"：**绑定在流程中间被改过**，而当时没有任何锁。
+     */
+    this.inFlightProject = undefined;
+    await this.bindProjectToRoot(buildRoot, input.sessionId);
+    const releaseLanding = this.enterOperation();
+    try {
+    const root = buildRoot;
     const route = resolveAiRoute({
       ctx: this.ctx,
       configProvider: this.deps.config.aiProvider,
@@ -6746,6 +6790,10 @@ export class ProjectService {
         changedPaths: cache.diff ? changedSummary(cache.diff) : { added: [], removed: [], changed: [] },
       },
     };
+    } finally {
+      /** 建树结束（正常/异常/取消）都必须松锁，否则后续别的操作会被钉在旧项目上。 */
+      releaseLanding();
+    }
     });
   }
 
