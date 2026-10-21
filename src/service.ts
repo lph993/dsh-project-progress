@@ -1059,6 +1059,17 @@ export class ProjectService {
    * 结果节点写进了 B 的项目（A 的项目里什么都没多）。
    */
   private inFlightProject: string | undefined;
+  /**
+   * **落点锁的嵌套深度**（0.3.59）。
+   *
+   * 没有它的时候 `enterOperation()` **不可重入**：建树在外层加了锁，随后 `addNode`/`patchNode`
+   * 各自又加一次锁（`pinned` 相同 ⇒ 收尾时判据 `inFlightProject === pinned` 成立 ⇒ **直接清掉**）。
+   * 也就是说 **0.3.58 那个"整轮钉住落点"在第一次写入之后就失效了**，
+   * 后面任何一次别的会话绑定都能把落点带走 —— 事故链条原样还在。
+   *
+   * 计数语义：外层 `enterOperation` 置 1；内层 +1；每层释放 -1；**减到 0 才真的松锁**。
+   */
+  private inFlightDepth = 0;
 
   /**
    * 记下"最近一次明确指定的工作区根"。
@@ -1338,9 +1349,24 @@ export class ProjectService {
    */
   private enterOperation(): () => void {
     const pinned = this.projectId;
-    this.inFlightProject = pinned;
+    /**
+     * **嵌套计数**（0.3.59）：外层建树加锁后，内层 `addNode`/`patchNode` 还会各自加一次。
+     * 老实现里内层收尾时 `inFlightProject === pinned` 成立 ⇒ 直接把锁清了 ⇒
+     * **外层"整轮钉住落点"在第一次写入之后就失效**。
+     */
+    if (this.inFlightProject === undefined) {
+      this.inFlightProject = pinned;
+      this.inFlightDepth = 1;
+    } else {
+      this.inFlightDepth += 1;
+    }
+    let released = false;
     return () => {
-      if (this.inFlightProject === pinned) this.inFlightProject = undefined;
+      /** 幂等：同一个收尾函数被调两次不许把深度减成负数。 */
+      if (released) return;
+      released = true;
+      this.inFlightDepth = Math.max(0, this.inFlightDepth - 1);
+      if (this.inFlightDepth === 0) this.inFlightProject = undefined;
     };
   }
 
@@ -1405,12 +1431,17 @@ export class ProjectService {
      * 等于把刚修好的事故重新打开一次。
      */
     const pinnedBefore = this.inFlightProject;
+    const depthBefore = this.inFlightDepth;
     this.inFlightProject = undefined;
+    this.inFlightDepth = 0;
     try {
       await this.bindProjectToRoot(expectedRoot);
     } finally {
       /** 原本有锁 ⇒ 把锁重新钉到**纠正后**的项目上。 */
-      if (pinnedBefore !== undefined) this.inFlightProject = this.projectId;
+      if (pinnedBefore !== undefined) {
+        this.inFlightProject = this.projectId;
+        this.inFlightDepth = Math.max(1, depthBefore);
+      }
     }
     return { rebound: true, note: `落点已纠正：${decision.reason}` };
   }
@@ -2093,6 +2124,22 @@ export class ProjectService {
      * 这样"删了再建"一步到位，而且不会跑到别的工作区去。
      */
     let reboundProjectId: string | undefined;
+    /**
+     * **建树期锁若指着这个被删的项目，必须先松锁**（0.3.58 深审发现）。
+     *
+     * `enterOperation()` 建立的锁会在 `bindForCall` 里**强制**把 `projectId` 拨回锁里的值。
+     * 如果锁钉的正是刚被删掉的项目（用户在建树过程中点了"删除此项目"），
+     * 那么自愈那一步建出来的新项目会被下一次 `bindForCall` **再拨回死 id** ——
+     * 之后所有写入都落在一个不存在的项目上（读图返回 undefined，表现为"树突然空了"）。
+     */
+    if (this.inFlightProject !== undefined && this.inFlightProject === input.projectId) {
+      debugBus.warn(
+        'project',
+        `被删的项目 ${input.projectId} 正被一次执行中的操作钉住落点 ⇒ 先松锁，改由该工作区根重新解析`,
+      );
+      this.inFlightProject = undefined;
+      this.inFlightDepth = 0;
+    }
     if (wasBound && boundRoot !== undefined) {
       this.boundRoot = undefined;
       this.snapshots = undefined;
@@ -6428,6 +6475,7 @@ export class ProjectService {
      * 这也解释了真机那次"读插件仓库、写 PEIS 项目"：**绑定在流程中间被改过**，而当时没有任何锁。
      */
     this.inFlightProject = undefined;
+    this.inFlightDepth = 0;
     await this.bindProjectToRoot(buildRoot, input.sessionId);
     const releaseLanding = this.enterOperation();
     try {
@@ -8775,6 +8823,32 @@ export class ProjectService {
         `（${decision.reason}）`;
 
       if (otherRoots.length > 0) {
+        /**
+         * ⚠️ **这里其实只可能是"单根 + 本体是它的子节点"**（0.3.59 深审发现）。
+         *
+         * 上面那道 `if (roots.length !== 1) return` 已经把**真正的多根**提前挡掉了，
+         * 所以走到这里时 `roots.length` 恒为 1、`otherRoots` 恒为 `[rootId]`，
+         * 而 `promoteId` 是 `rootId` 的**子节点**。于是下面那步"降级"等于
+         * `reparentNode(rootId → promoteId)` —— **必然 `E_CYCLE`**（promoteId 的祖先里就有 rootId）。
+         *
+         * 也就是说这个功能**从来没有真正搬动过任何节点**（`moved` 永远 0），
+         * 用户看到的就是"点了没变化"。真机日志里那条 `归位失败（降级旧根）：E_CYCLE`
+         * 不是"这次刚好分不出本体"，而是**这条死路**。
+         *
+         * 所以这里**不再去试**：如实说清形状为什么改不了，并给出唯一有效的出路。
+         * 真要支持多根，得先把上面那道 guard 放开，按 `decideRootCollapse` 收缩（另开工单）。
+         */
+        if (roots.length === 1) {
+          const detail = describeReject(promoteFirst);
+          const reason =
+            `根节点归位做不到：当前形状是"单根 + 项目本体是它的子节点"` +
+            `（根「${graph.nodes[rootId]?.name ?? ''}」→ 本体「${bodyName}」）。` +
+            '把根挂到自己子孙下面必然成环（`E_CYCLE`），提根又会变成两个根（`C13`）——' +
+            '**这个形状在事后改不了**。有效做法是**重建一次**：建树阶段的整形会在落库前把方向扶正。' +
+            (detail !== 'ok' ? `（提根尝试：${detail}）` : '');
+          debugBus.info('ai', reason);
+          return { moved: 0, reason };
+        }
         /**
          * **多个根**（分批建树每片各自成根）：直接按判据把"端"降级到本体下 ——
          * 根数 N → N-1，不触发 C13、不成环（被搬的是根）。

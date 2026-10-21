@@ -83,6 +83,24 @@ export function parseRepairPlan(text: string, knownIds: readonly string[]): Repa
   result.summary = isNonEmptyString(obj['summary']) ? obj['summary'] : '';
 
   const known = new Set(knownIds);
+  /**
+   * **id 归一**（0.3.59，子代理审查发现）。
+   *
+   * 提示词把节点渲染成 `- 名字 [#pm_xxx]` 并明写「`#id` 是动作里必须原样引用的 id」，
+   * 但这里原来只收**裸 id** —— 模型照提示词写成 `"#pm_xxx"`（或 `"[#pm_xxx]"`）时，
+   * 全部动作会以「nodeId 不在清单里（不许编）」被拒 ⇒ 面板说"AI 提了但都在编"，
+   * 而真相是**我们的提示词和解析器各说各话**。修复方案只有这一个执行入口，
+   * 一条都过不去时整个功能等于失效。
+   *
+   * 只剥**包装**（`#`、`[` `]`），不做模糊匹配 —— 真正的编造 id 照样要被拒。
+   */
+  const stripIdWrapping = (value: string): string =>
+    value
+      .trim()
+      .replace(/^\[/, '')
+      .replace(/^#/, '')
+      .replace(/\]$/, '')
+      .trim();
   const actions = Array.isArray(obj['actions']) ? obj['actions'] : [];
   for (const raw of actions) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -95,16 +113,18 @@ export function parseRepairPlan(text: string, knownIds: readonly string[]): Repa
       result.rejected.push({ reason: `非法的动作类型：${String(kind)}`, raw });
       continue;
     }
-    const nodeId = action['nodeId'];
+    const rawNodeId = action['nodeId'];
+    const nodeId = isNonEmptyString(rawNodeId) ? stripIdWrapping(rawNodeId) : rawNodeId;
     if (!isNonEmptyString(nodeId) || !known.has(nodeId)) {
-      result.rejected.push({ reason: `nodeId 不在清单里（不许编）：${String(nodeId)}`, raw });
+      result.rejected.push({ reason: `nodeId 不在清单里（不许编）：${String(rawNodeId)}`, raw });
       continue;
     }
     const reason = isNonEmptyString(action['reason']) ? action['reason'] : '(模型未给理由)';
     if (kind === 'merge') {
-      const into = action['intoNodeId'];
+      const rawInto = action['intoNodeId'];
+      const into = isNonEmptyString(rawInto) ? stripIdWrapping(rawInto) : rawInto;
       if (!isNonEmptyString(into) || !known.has(into)) {
-        result.rejected.push({ reason: `merge 的目标不在清单里：${String(into)}`, raw });
+        result.rejected.push({ reason: `merge 的目标不在清单里：${String(rawInto)}`, raw });
         continue;
       }
       if (into === nodeId) {
@@ -115,9 +135,10 @@ export function parseRepairPlan(text: string, knownIds: readonly string[]): Repa
       continue;
     }
     if (kind === 'move') {
-      const to = action['toParentId'];
+      const rawTo = action['toParentId'];
+      const to = isNonEmptyString(rawTo) ? stripIdWrapping(rawTo) : rawTo;
       if (!isNonEmptyString(to) || !known.has(to)) {
-        result.rejected.push({ reason: `move 的目标父不在清单里：${String(to)}`, raw });
+        result.rejected.push({ reason: `move 的目标父不在清单里：${String(rawTo)}`, raw });
         continue;
       }
       if (to === nodeId) {

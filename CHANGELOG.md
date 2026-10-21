@@ -5,6 +5,83 @@
 > **`0.1.0` 从未公开发布。** 它只是本仓库早期在 `dsh-project-manager` 这个名字下的内部版本号，
 > npm 上没有它的任何发布记录。因此本文件从 **`0.2.0`（首个公开版本）** 起记录。
 
+## [0.3.59] — 深审续：**0.3.58 那个锁在第一次写入之后就被清掉了**
+
+> 用户："**再审查，尤其建树那块**"。这轮我逐段读了建树链，并派了两个只读审查员分别过
+> `src/ai/**` 与落库路径，回来后**逐条核实**（下面标了「已核实」的都是我自己读过原文的）。
+
+### 一、已核实并**已修**：`enterOperation()` 不可重入（high）
+
+```ts
+private enterOperation(): () => void {
+  const pinned = this.projectId;
+  this.inFlightProject = pinned;
+  return () => { if (this.inFlightProject === pinned) this.inFlightProject = undefined; };
+}
+```
+
+建树在外层加锁（0.3.58），但 `addNode` / `patchNode` **自己也加一次** —— 内层收尾时
+`inFlightProject === pinned` **成立** ⇒ **直接把外层的锁清掉**。
+
+> 也就是说 **0.3.58 那个"整轮钉住落点"在第一次写入之后就失效了**，后面任何一次别的会话绑定
+> 都能把落点带走 —— 事故链条原样还在。**我上一版发版时没发现。**
+
+**修法**：加嵌套计数 `inFlightDepth`，减到 0 才真的松锁；`ensureLanding` / `deleteProject` /
+建树入口那三处"直接清锁"也补上深度归零（否则深度残留、锁永远松不掉）。
+
+### 二、已核实并**已修**：AI 修复方案的 id 写法与解析器**对不上**（medium）
+
+提示词把节点渲染成 `- 名字 [#pm_xxx]`，并明写「`#id` 是动作里必须原样引用的 id」；
+而 `repair-parse.ts` 只收**裸 id** ⇒ 模型照提示词写 `"#pm_xxx"` 时**全部动作**被判
+「nodeId 不在清单里（不许编）」⇒ 面板说"AI 提了但都在编"。
+
+**这不是模型在编，是我们的提示词和解析器各说各话** —— 而这是修复方案唯一的执行入口，
+一条都过不去时整个功能等于失效。
+
+**修法**：解析时只剥**包装**（`#`、`[` `]`），`nodeId` / `intoNodeId` / `toParentId` / `uncertain.nodeIds`
+四处都过一遍；**真正的编造 id 照样被拒**（有测试钉住）。
+
+### 三、已核实并**改成如实报告**：「根节点归位」**从来没搬动过任何节点**（high）
+
+```ts
+const roots = graph.rootIds.filter((id) => alive(id));
+if (roots.length !== 1) { …return { moved: 0, reason: '顶级节点不是恰好 1 个，跳过归位' }; }
+…
+const otherRoots = roots.filter((id) => id !== promoteId);   // roots.length === 1 ⇒ 恒为 [rootId]
+if (otherRoots.length > 0) { … decideRootCollapse([rootId, promoteId]) … }
+```
+
+- **真正的多根**被上面那道 guard 提前挡掉（永远走不到"降级"那支）；
+- 能走到的是"**单根 + 本体是它的子节点**"，而这时 `promoteId` 是 `rootId` 的**子节点** ⇒
+  那步"降级"等于把根挂到自己子孙下面 ⇒ **必然 `E_CYCLE`**。
+
+⇒ `moved` 永远 0。真机日志里那条 `归位失败（降级旧根）：E_CYCLE` **不是"这次刚好分不出本体"，
+而是这条死路** —— 也正是用户当初说"点了没变化"的原因。
+
+**这一版只做诚实化**：单根形状**不再去试那条必死的路**，直接说清"这个形状事后改不了，
+有效做法是重建（建树阶段整形在落库前扶正）"。
+**真要支持多根，得放开上面那道 guard 按 `decideRootCollapse` 收缩** —— 那是独立改动，没在这版做。
+
+### 四、核实过但**本版未改**（记录在案）
+
+| 级别 | 发现 | 为什么没现在改 |
+|---|---|---|
+| high | `bindForCall` 纠正时**只改 `projectId`、不改 `boundRoot`** ⇒ `applyAiTree` 的 refs 存在性过滤 / 回填入口用的是**别的仓库的根**，会把真实 refs 当假路径丢掉 | 有了建树期锁之后这条路径不该再被触发；改它要动 `boundRoot` 的不变量，风险大于收益 |
+| medium | `resume` 复用"半份输出"时**没按局部视图落库**（未传 `partialView`）⇒ 其余节点被标 `stale`、草稿被当"本轮没提到"清掉 | 需要先确认 partial 缓存的实际形态 |
+| medium | `applyAiTree` 清完草稿只刷新 `workingGraph`，`graph`/`derived` 仍是旧快照 ⇒ 复用层可能认领**刚删掉的 id** | 影响面要靠构造用例量，未在本轮动 |
+| medium | `tree-builder` **成功路径不检查 `finish.kind`** ⇒ 取消被当成 `truncated`（还会触发分批重试）；`error` finish 的原文被丢，超窗学习学不到 | 涉及各 provider 的 finish 语义，需逐个对齐 |
+| medium | `finish=max-tokens` 但已吐出**配平 JSON** ⇒ 判成功，半棵树直接落库 | 同上 |
+| medium | 归拢提示词第 6 条允许"单分支单列一组"，校验器却把任何单分支组判违规并**整份作废** | 提示词与校验器要一起改，且现有测试正钉着旧行为 |
+
+### 五、测试（+3 条，共 **686/686**）
+
+- `build-pin.test.ts` 增**嵌套锁**用例：外层加锁后写一个节点，断言外层锁**仍然在**；
+- `repair-id-normalize.test.ts` 两条：`#id` / `[#id]` 必须被接受；编造 id 仍须被拒。
+- **注入验证**：把 `enterOperation` 退回单字段实现 ⇒ `fail=1`；还原 ⇒ 全绿、无残留。
+
+> **一条纪律**：注入脚本做多行替换时**必须按 CRLF 归一**，否则 `replace` 静默不生效、
+> 注入根本没打进去（我这轮第一次就白跑了一次，误以为"测试不敏感"）。
+
 ## [0.3.58] — 建树深审：找到 2026-10-21 串仓库事故的**真根因**
 
 > 用户："**再审查，尤其建树那块**"。

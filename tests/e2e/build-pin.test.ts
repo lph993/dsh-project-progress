@@ -98,3 +98,58 @@ test('建树期间 inFlightProject 必须是锁上的，结束后必须释放（
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+
+test('嵌套操作不许把外层的落点锁清掉（0.3.59，子代理审查挖出的缺陷）', async () => {
+  /**
+   * `enterOperation()` 原来只有一个 `inFlightProject` 字段、**没有嵌套计数**：
+   *
+   * ```ts
+   * const pinned = this.projectId;
+   * this.inFlightProject = pinned;
+   * return () => { if (this.inFlightProject === pinned) this.inFlightProject = undefined; };
+   * ```
+   *
+   * 于是外层（整轮建树）加锁后，内层 `addNode` 的收尾判据 `inFlightProject === pinned` **成立** ⇒
+   * **直接把外层的锁清掉**。也就是说 0.3.58 那个"整轮钉住落点"在第一次写入之后就失效了。
+   */
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-nest-'));
+  mkdirSync(join(workspace, 'web'), { recursive: true });
+  writeFileSync(join(workspace, 'web', 'index.ts'), 'export const a = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', { currentSelection: () => ({ provider: 'p', model: 'm' }) });
+  ctx.services.set('llm', { stream: () => { throw new Error('用注入的假流'); } });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    board(): Promise<{ nodes: Array<{ id: string; name: string; parentId: string | null }> }>;
+    debugBinding(): { projectId: string; inFlightProject: string | undefined };
+    addNode(input: Record<string, unknown>): Promise<{ status: string; nodeId?: string }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+  await service.board();
+  const pinned = service.debugBinding().projectId;
+
+  /** 模拟外层操作（建树/AI 建树）先上锁。 */
+  const release = (service as unknown as { enterOperation(): () => void }).enterOperation();
+  assert.equal(service.debugBinding().inFlightProject, pinned, '外层加锁后应当处于锁定状态');
+
+  /** 内层写一个节点：它自己也会 enterOperation/释放一次。 */
+  const added = await service.addNode({ name: '内层节点', kind: 'feature', parentId: null, by: 'session' });
+  assert.equal(added.status, 'ok', `内层写入应当成功：${JSON.stringify(added)}`);
+
+  assert.equal(
+    service.debugBinding().inFlightProject,
+    pinned,
+    '**内层释放不许把外层的锁清掉**（没有嵌套计数 ⇒ 这里会变成 undefined，事故链条就恢复了）',
+  );
+
+  release();
+  assert.equal(service.debugBinding().inFlightProject, undefined, '最外层释放后必须松锁');
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
