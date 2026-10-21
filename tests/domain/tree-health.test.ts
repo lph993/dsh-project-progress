@@ -87,8 +87,34 @@ describe('树健康：逐条判据', () => {
     assert.match(report.issues.find((i) => i.code === 'multi-root')?.message ?? '', /2 个顶级节点/);
   });
 
-  it('根不是项目本体 ⇒ error（这是层级方向反了的根源）', () => {
+  /**
+   * **断连的节点必须报出来**（0.3.61）。
+   *
+   * 深度只从根往下走（`depthOf`），走不到的节点原先被**静默跳过**：照样算进
+   * `alive` / `leaves` / `refsTotal`，却既不算深度、也不报任何问题。审查探针实测：
+   * 一棵 6 个活节点、1 个根、另有 `x↔y` 环 + 一个父不存在的孤儿的树，结论是 `healthy: true`。
+   *
+   * 真实成因：父节点被删/不存在、历史数据成环、或曾经"删完父又按旧快照复用 id"的并发 bug。
+   */
+  it('从根走不到的节点（父不存在 / 成环）⇒ error（不许静默计入统计）', () => {
     const report = analyzeTreeHealth({
+      projectName: 'PEIS 体检管理系统',
+      nodes: [
+        ...HEALTHY,
+        node('x', '环 A', 'y', { refs: ['src/x'], description: '环里的节点', progress: 0.12 }),
+        node('y', '环 B', 'x', { refs: ['src/y'], description: '环里的节点', progress: 0.13 }),
+        node('orphan', '孤儿', 'ghost', { refs: ['src/z'], description: '父节点不存在', progress: 0.14 }),
+      ],
+    });
+    assert.equal(report.healthy, false, '有节点从根走不到，不能算健康');
+    const issue = report.issues.find((i) => i.code === 'orphan-node');
+    assert.ok(issue, `必须报出断连节点：${JSON.stringify(codesOf(report.issues))}`);
+    assert.deepEqual([...issue.nodeIds].sort(), ['orphan', 'x', 'y'], '三个走不到的节点都要点名');
+    assert.match(issue.message, /从根走不到/);
+    assert.match(issue.message, /父节点 id 在树里根本不存在/, '要区分"父不存在"这种成因');
+  });
+
+  it('根不是项目本体 ⇒ error（这是层级方向反了的根源）', () => {    const report = analyzeTreeHealth({
       projectName: 'PEIS 体检管理系统',
       nodes: [
         node('r', 'Web 服务端', null, { refs: ['src/web'], description: '网站' }),

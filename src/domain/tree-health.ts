@@ -46,6 +46,7 @@ export interface HealthIssue {
     | 'no-root'
     | 'multi-root'
     | 'root-not-project'
+    | 'orphan-node'
     | 'too-many-children'
     | 'single-child-chain'
     | 'too-deep'
@@ -160,6 +161,42 @@ export function analyzeTreeHealth(input: HealthInput): HealthReport {
   }
 
   const issues: HealthIssue[] = [];
+
+  /**
+   * **①b 连通性：从根走不到的节点 = 树已经断了**（0.3.61）。
+   *
+   * ## 为什么必须报
+   *
+   * 上面的深度只从根往下走，走不到的节点就被**静默跳过**了：
+   * 它们照样算进 `alive`/`leaves`/`refsTotal`，却既不算深度、也不报任何问题。
+   * 审查探针实测：一棵 6 个活节点、1 个根、另有 `x↔y` 环 + 一个父不存在的孤儿的树，
+   * 体检结论是 **`healthy: true`**（只报了根名、单子链之类）。
+   *
+   * 这类断点的真实成因有两种：**父节点被删/不存在**，或**父子成环**（历史数据、
+   * 手改存储、曾经那条"删完父又按旧快照复用 id"的并发 bug）。它们都属于
+   * "看板上还在、但已经不属于这棵树" —— 不报出来，用户会拿它当正常进度看。
+   *
+   * 没有根时（`no-root`）不重复报：所有节点都不可达，那条 error 已经说清了。
+   */
+  if (roots.length > 0) {
+    const unreachable = alive.filter((node) => !depthOf.has(node.id));
+    if (unreachable.length > 0) {
+      const missingParent = unreachable.filter((node) => node.parentId !== null && !byId.has(node.parentId));
+      issues.push({
+        code: 'orphan-node',
+        severity: 'error',
+        message:
+          `有 ${unreachable.length} 个节点**从根走不到**（父节点不存在或父子成环）：` +
+          `${unreachable.slice(0, 5).map((node) => `「${node.name}」`).join('、')}` +
+          `${unreachable.length > 5 ? ' 等' : ''}` +
+          (missingParent.length > 0
+            ? `；其中 ${missingParent.length} 个的父节点 id 在树里根本不存在`
+            : '') +
+          ' —— 它们仍被计入统计，但已经不属于这棵树，需要修复父子关系或删掉',
+        nodeIds: unreachable.map((node) => node.id),
+      });
+    }
+  }
 
   /** ① 根：有且只有一个，而且它就是项目本体。 */
   if (roots.length === 0) {

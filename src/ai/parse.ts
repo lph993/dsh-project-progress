@@ -16,6 +16,7 @@
  */
 
 import type { NodeKind } from '../shared/types.ts';
+import { MAX_NODE_NAME_LENGTH, sanitizeNodeName } from '../shared/name.ts';
 import { isNonCodeArtifact } from './scope.ts';
 
 /** 归一后的引用类型（与 `Ref` 的类型子集一致）。 */
@@ -106,7 +107,12 @@ export function extractJsonObject(text: string): string | undefined {
  * 每个上限都必须**如实记进 notes**（丢弃本身可以，静默丢弃不行）。
  */
 export const MAX_NODES_PER_RESPONSE = 400;
-export const MAX_NAME_LENGTH = 120;
+/**
+ * 名字上限**不再是这里私有的数字**（0.3.61）：真值在 `shared/name.ts`，
+ * 因为领域层（`mutateAdd`/`mutatePatch`）也要用同一份约束。
+ * 这里保留导出只是为了让既有测试/调用方继续可用。
+ */
+export const MAX_NAME_LENGTH = MAX_NODE_NAME_LENGTH;
 export const MAX_REFS_PER_NODE = 12;
 export const MAX_REF_TARGET_LENGTH = 400;
 
@@ -404,10 +410,13 @@ export function parseTreeResponse(text: string): ParseOutcome {
     }
     const record = raw as Record<string, unknown>;
     const rawName = typeof record['name'] === 'string' ? record['name'] : '';
-    /** 名字要挡控制字符：它会破坏提示词里的缩进层级、也会污染项目文档。 */
-    const cleaned = rawName.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
-    let name = cleaned;
-    if (name.length > MAX_NAME_LENGTH) {
+    /**
+     * 名字要挡控制字符：它会破坏提示词里的缩进层级、也会污染项目文档。
+     * 规则本身在 `shared/name.ts`（领域层同用一份），这里只负责**把改动说出来**。
+     */
+    const cleaned = sanitizeNodeName(rawName);
+    let name = cleaned.name;
+    if (cleaned.truncated) {
       name = name.slice(0, MAX_NAME_LENGTH);
       notes.push(`「${name}…」名字超过 ${MAX_NAME_LENGTH} 字，已截断`);
     }

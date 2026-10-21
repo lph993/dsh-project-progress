@@ -18,6 +18,7 @@ import type {
   WriteAttempt,
   WriteBlock,
 } from '../shared/types.ts';
+import { sanitizeNodeName } from '../shared/name.ts';
 import {
   buildIndex,
   findSiblingByName,
@@ -200,9 +201,25 @@ export function mutatePatch(
     return { kind: 'reject', code: 'E_NOT_FOUND', message: `节点 ${input.nodeId} 不存在` };
   }
 
-  const escaping = escapingTargets(input.patch.refs);
-  const duplicate = input.patch.name !== undefined
-    ? findSiblingByName(index, node.parentId, input.patch.name, node.id)
+  /**
+   * **名字在这里净化一次**（0.3.61）：控制字符压平、超长截断。
+   *
+   * 原先只有 `ai/parse.ts` 做这件事，于是"跨片归拢"与"AI 修复 rename"这两条
+   * 都能把带换行的名字写进存储（审查探针实测：414 字带 `\n` 的组名原样落库）。
+   * 名字里的换行会破坏提示词/文档"一行一个节点"的渲染约定 —— 约束只有落在
+   * **所有写入都必经的地方**才算约束，所以收口到领域内核。
+   */
+  const patch: PatchFields =
+    input.patch.name === undefined
+      ? input.patch
+      : { ...input.patch, name: sanitizeNodeName(input.patch.name).name };
+  if (patch.name !== undefined && patch.name === '') {
+    return { kind: 'reject', code: 'E_NAME', message: '节点名称不能为空' };
+  }
+
+  const escaping = escapingTargets(patch.refs);
+  const duplicate = patch.name !== undefined
+    ? findSiblingByName(index, node.parentId, patch.name, node.id)
     : undefined;
 
   const validateCtx: ValidateContext = {
@@ -231,7 +248,7 @@ export function mutatePatch(
       ...(input.force !== undefined ? { force: input.force } : {}),
       ...(input.restore !== undefined ? { restore: input.restore } : {}),
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
-      patch: input.patch,
+      patch,
     },
     validateCtx,
   );
@@ -352,7 +369,7 @@ export function mutateAdd(
   },
   ctx: MutationContext,
 ): MutationResult {
-  const name = input.name.trim();
+  const name = sanitizeNodeName(input.name).name;
   if (name === '') {
     return { kind: 'reject', code: 'E_NAME', message: '节点名称不能为空' };
   }

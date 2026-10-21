@@ -92,12 +92,48 @@ export function llmStreamOf(ctx: Context): LlmStreamLike | undefined {
   }
 }
 
+/** `callModelText` 的失败原因（`truncated` 不在其中：那是"文本完整性"的判断，由各调用方按自己的处置决定）。 */
+export type ModelTextFailReason = 'llm-unavailable' | 'call-failed' | 'empty-output' | 'aborted';
+
+export interface ModelTextOk {
+  ok: true;
+  text: string;
+  /** 终止原因（已从 finish 块里挖出来；**没读到就是 undefined，不编**）。 */
+  finishReason?: string;
+  usage?: TokenUsageLike;
+}
+
+export interface ModelTextFail {
+  ok: false;
+  reason: ModelTextFailReason;
+  message: string;
+  /** 失败/取消时**已经收到的文本**（续跑缓存靠它；空就不给）。 */
+  text?: string;
+  usage?: TokenUsageLike;
+}
+
+export type ModelTextResult = ModelTextOk | ModelTextFail;
+
 /**
- * 调一次模型并解析成树。
+ * **只调一次模型、把文本与终止原因交出来**（0.3.61 抽出）。
  *
- * @returns 成功时返回解析结果；失败时返回**结构化原因**（绝不抛给路由层）
+ * ## 为什么必须抽出来（这是"只修一条路"的又一处）
+ *
+ * 0.3.60 把"终止原因必须先看"修进了建树路径，但**修复（`aiPlanRepair`）与归拢
+ * （`regroupShardedBranches`）各自手写了一模一样的 for-await 循环**，两边都：
+ * 只累 `text-delta`、不读 `finish` ⇒
+ *
+ * - `finish=aborted`（用户取消）⇒ 半份输出被当成正常完成；
+ * - `finish=error`（超窗/配额）⇒ provider 的原话丢失；
+ * - `finish=max-tokens` 但已吐出的 JSON 恰好配平 ⇒ **半份方案被当成完整方案**，
+ *   而归拢是**自动应用**的（不弹确认），等于按半套分组搬节点。
+ *
+ * 所以把"调一次、收文本、判终止"收口到这里一处。三个调用方各自只决定
+ * **"撞上限时算不算失败"**：
+ * - 建树：撞上限 ⇒ `truncated`（会走分批重试）；
+ * - 修复/归拢：撞上限 ⇒ 直接失败（半份方案不许应用）。
  */
-export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildTreeCallResult> {
+export async function callModelText(input: BuildTreeCallInput): Promise<ModelTextResult> {
   const llm = input.stream ?? llmStreamOf(input.ctx);
   if (llm === undefined) {
     return {
@@ -182,7 +218,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       message: aborted
         ? 'AI 建树已取消。'
         : `模型调用失败：${error instanceof Error ? error.message : String(error)}`,
-      ...(text.trim() !== '' ? { rawText: text } : {}),
+      ...(text.trim() !== '' ? { text } : {}),
       ...(usage !== undefined ? { usage } : {}),
     };
   }
@@ -208,7 +244,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       ok: false,
       reason: 'aborted',
       message: 'AI 建树已取消。',
-      ...(text.trim() !== '' ? { rawText: text } : {}),
+      ...(text.trim() !== '' ? { text } : {}),
       ...(usage !== undefined ? { usage } : {}),
     };
   }
@@ -218,7 +254,7 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       reason: 'call-failed',
       /** 把 provider 的原话带出去：超窗/配额/鉴权都靠这句话定位。 */
       message: `模型调用失败（终止原因：${finishReason ?? '未知'}）。${text.trim().slice(0, 200)}`.trim(),
-      ...(text.trim() !== '' ? { rawText: text } : {}),
+      ...(text.trim() !== '' ? { text } : {}),
       ...(usage !== undefined ? { usage } : {}),
     };
   }
@@ -235,6 +271,41 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
     };
   }
 
+  /**
+   * 文本完整性（是否撞上限）**不在这里判**：建树、修复、归拢对"半份输出"的处置不同，
+   * 各自按 `isOutputLimitReason(finishReason)` 决定。这里只交事实。
+   */
+  return {
+    ok: true,
+    text,
+    ...(finishReason !== undefined ? { finishReason } : {}),
+    ...(usage !== undefined ? { usage } : {}),
+  };
+}
+
+/**
+ * 调一次模型并解析成树。
+ *
+ * @returns 成功时返回解析结果；失败时返回**结构化原因**（绝不抛给路由层）
+ */
+export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildTreeCallResult> {
+  const got = await callModelText(input);
+  if (!got.ok) {
+    /**
+     * `got.reason` 与 `BuildTreeCallFail.reason` 的前四项完全一致，**直接透传** ——
+     * 再写一份映射表就是"同一件事两处实现"，迟早多出第三种说法。
+     */
+    return {
+      ok: false,
+      reason: got.reason,
+      message: got.message,
+      ...(got.text !== undefined ? { rawText: got.text } : {}),
+      ...(got.usage !== undefined ? { usage: got.usage } : {}),
+    };
+  }
+  const text = got.text;
+  const finishReason = got.finishReason;
+  const usage = got.usage;
   const parsed = parseTreeResponse(text);
   if (!parsed.ok) {
     /**
