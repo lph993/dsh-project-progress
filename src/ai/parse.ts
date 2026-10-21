@@ -99,6 +99,41 @@ export function extractJsonObject(text: string): string | undefined {
 }
 
 /** 括号是否配平（用于区分"被截断"与"本来就不是 JSON"）。 */
+/**
+ * **对抗性上限**（0.3.60）。
+ *
+ * 一次模型输出不该能把存储或看板拖垮 —— 这些数字是"坏输出不许变成坏树"的硬闸门。
+ * 每个上限都必须**如实记进 notes**（丢弃本身可以，静默丢弃不行）。
+ */
+export const MAX_NODES_PER_RESPONSE = 400;
+export const MAX_NAME_LENGTH = 120;
+export const MAX_REFS_PER_NODE = 12;
+export const MAX_REF_TARGET_LENGTH = 400;
+
+/**
+ * **终止原因归一**（0.3.60，纯函数）。
+ *
+ * `dsh-llm` 用**终止 finish 块**报告取消/失败（`{kind:'aborted'|'error'}`），不是抛异常；
+ * 而原实现只在"解析失败"那条分支里看 `finishReason` ⇒ 正常跑完的路径**从不检查**，
+ * 于是"用户取消"被当成"输出被截断"（还会触发分批重试，白花钱），
+ * provider 报错的原话也被丢掉（`learnContextWindowFrom` 因此学不到窗口）。
+ */
+export type FinishClass = 'normal' | 'aborted' | 'error' | 'limit' | 'unknown';
+
+export function classifyFinish(finishReason: string | undefined): FinishClass {
+  if (finishReason === undefined || finishReason === '') return 'unknown';
+  const key = finishReason.trim().toLowerCase();
+  if (key === 'abort' || key === 'aborted' || key === 'cancelled' || key === 'canceled' || key === 'cancel') {
+    return 'aborted';
+  }
+  if (key === 'error' || key === 'failed' || key === 'failure' || key === 'exception') return 'error';
+  if (key === 'length' || key === 'max-tokens' || key === 'max_tokens' || key === 'max-token') return 'limit';
+  if (key === 'stop' || key === 'end' || key === 'end_turn' || key === 'eos' || key === 'complete') {
+    return 'normal';
+  }
+  return 'unknown';
+}
+
 export function isBalanced(text: string): boolean {
   let depth = 0;
   let inString = false;
@@ -213,7 +248,20 @@ function normalizeRef(
     notes.push(`「${nodeName}」的引用 ${String(target)} 不是工作区相对路径，已丢弃`);
     return undefined;
   }
-  const normalizedTarget = target.replace(/\\/g, '/');
+  /**
+   * **对抗性净化**（0.3.60）：控制字符会破坏提示词/文档投影，超长路径是坏输出的典型症状。
+   * 只丢**这一条引用**并留痕，不因此丢整个节点。
+   */
+  const cleanedTarget = target.replace(/[\u0000-\u001f\u007f]+/g, '').trim();
+  if (cleanedTarget === '') {
+    notes.push(`「${nodeName}」的引用是空白/控制字符，已丢弃`);
+    return undefined;
+  }
+  if (cleanedTarget.length > MAX_REF_TARGET_LENGTH) {
+    notes.push(`「${nodeName}」的引用路径超过 ${MAX_REF_TARGET_LENGTH} 字，已丢弃`);
+    return undefined;
+  }
+  const normalizedTarget = cleanedTarget.replace(/\\/g, '/');
   const mapped = normalizeRefType(rawType);
   const canonical =
     typeof rawType === 'string' && ['dir', 'md', 'code'].includes(rawType.trim().toLowerCase());
@@ -337,13 +385,32 @@ export function parseTreeResponse(text: string): ParseOutcome {
   const originalIndex: number[] = [];
   const seenSibling = new Set<string>();
 
-  picked.nodes.forEach((raw, index) => {
+  /**
+   * **对抗性上限**（0.3.60）：模型（或被提示词注入的仓库内容）可能吐出畸形规模。
+   *
+   * 这里的每一条都是"坏输出不许变成坏树"的硬闸门 —— 宁可丢几条并**如实记进 notes**，
+   * 也不要让一次输出把存储撑爆或把看板卡死。
+   */
+  if (picked.nodes.length > MAX_NODES_PER_RESPONSE) {
+    notes.push(
+      `模型给了 ${picked.nodes.length} 个节点，超过单次上限 ${MAX_NODES_PER_RESPONSE}，` +
+        `只取前 ${MAX_NODES_PER_RESPONSE} 个（其余丢弃；要更全请分批或提高上限）`,
+    );
+  }
+  picked.nodes.slice(0, MAX_NODES_PER_RESPONSE).forEach((raw, index) => {
     if (typeof raw !== 'object' || raw === null) {
       notes.push(`第 ${index + 1} 个节点不是对象，已丢弃`);
       return;
     }
     const record = raw as Record<string, unknown>;
-    const name = typeof record['name'] === 'string' ? record['name'].trim() : '';
+    const rawName = typeof record['name'] === 'string' ? record['name'] : '';
+    /** 名字要挡控制字符：它会破坏提示词里的缩进层级、也会污染项目文档。 */
+    const cleaned = rawName.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+    let name = cleaned;
+    if (name.length > MAX_NAME_LENGTH) {
+      name = name.slice(0, MAX_NAME_LENGTH);
+      notes.push(`「${name}…」名字超过 ${MAX_NAME_LENGTH} 字，已截断`);
+    }
     if (name === '') {
       notes.push(`第 ${index + 1} 个节点没有名称，已丢弃`);
       return;
@@ -396,7 +463,7 @@ export function parseTreeResponse(text: string): ParseOutcome {
         notes.push(`「${name}」的 refs 里 ${ref.target} 是非代码产物（虚拟环境/缓存/构建输出），已丢弃`);
         return false;
       })
-      .slice(0, 12);
+      .slice(0, MAX_REFS_PER_NODE);
 
     const kindDecision = normalizeKind(record['kind'], 'task');
     if (kindDecision.note !== undefined) notes.push(`「${name}」${kindDecision.note}`);

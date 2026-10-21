@@ -14,7 +14,13 @@ import type { Context } from '@deepseek-ai/cordis';
 import { BlockAssembler } from '@deepseek-ai/dsh-llm';
 
 import { pmUserMessage } from '../shared/message.ts';
-import { isTruncatedCompletion, parseTreeResponse, type ParseOutcome } from './parse.ts';
+import {
+  classifyFinish,
+  isOutputLimitReason,
+  isTruncatedCompletion,
+  parseTreeResponse,
+  type ParseOutcome,
+} from './parse.ts';
 import type { AiRoute } from './route.ts';
 import type { TokenUsageLike } from './usage.ts';
 
@@ -182,6 +188,40 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
   }
 
   const usage = readUsage(assembler);
+  /**
+   * **终止原因必须先看，再看文本**（0.3.60，对抗/并发处理）。
+   *
+   * `dsh-llm` 用**终止 finish 块**报告取消与失败（`{kind:'aborted'}` / `{kind:'error', failure:…}`），
+   * **不是抛异常**。原来的实现只在"解析失败"那条分支里读 `finishReason` ⇒ 正常跑完的路径从不检查：
+   *
+   * - **用户取消**（还带着半截文本）⇒ 被当成 `truncated` ⇒ 面板写"可以在设置里提高输出上限"，
+   *   而 `SHARD_RETRY_REASONS` 里包含 `truncated` ⇒ **还会继续分批重试**（白花钱）；
+   * - **provider 报错**（超窗/配额/鉴权）⇒ 文本为空 ⇒ 变 `empty-output`，
+   *   真实原话（含 `maximum context length is N tokens`）被丢掉 ⇒
+   *   `learnContextWindowFrom` 学不到窗口 ⇒ 同一个超窗错误会重复发生。
+   *
+   * 所以这里先分类：**取消就是取消、报错就是报错**，都不许被伪装成"输出被截断"。
+   */
+  const finishClass = classifyFinish(finishReason);
+  if (finishClass === 'aborted' || input.signal?.aborted === true) {
+    return {
+      ok: false,
+      reason: 'aborted',
+      message: 'AI 建树已取消。',
+      ...(text.trim() !== '' ? { rawText: text } : {}),
+      ...(usage !== undefined ? { usage } : {}),
+    };
+  }
+  if (finishClass === 'error') {
+    return {
+      ok: false,
+      reason: 'call-failed',
+      /** 把 provider 的原话带出去：超窗/配额/鉴权都靠这句话定位。 */
+      message: `模型调用失败（终止原因：${finishReason ?? '未知'}）。${text.trim().slice(0, 200)}`.trim(),
+      ...(text.trim() !== '' ? { rawText: text } : {}),
+      ...(usage !== undefined ? { usage } : {}),
+    };
+  }
   if (text.trim() === '') {
     return {
       ok: false,
@@ -233,6 +273,24 @@ export async function callTreeBuilder(input: BuildTreeCallInput): Promise<BuildT
       message: `模型输出不符合要求：${parsed.error} ${hint}`,
       // 交给调用方**完整文本**（它会存成 partial 缓存供续跑）；
       // 展示层自己截断（UI 只显示前 300 字），别在这里先把续跑的可能性砍掉
+      rawText: text,
+      ...(usage !== undefined ? { usage } : {}),
+    };
+  }
+  /**
+   * **被截断就不许当成功**，哪怕模型吐出来的 JSON 恰好括号配平（0.3.60）。
+   *
+   * 现场形状：模型先输出一棵完整的树，后面还想追加第二个对象/说明，被输出上限切断 ——
+   * `extractJsonObject` 取到第一个完整对象并判成功 ⇒ **半棵树直接落库**，
+   * 不触发分批重试、notes 里一句提示都没有，用户以为"这次就是全部"。
+   */
+  if (isOutputLimitReason(finishReason)) {
+    return {
+      ok: false,
+      reason: 'truncated',
+      message:
+        `模型输出撞到上限（终止原因：${finishReason ?? '未知'}）—— 只拿到一部分树，` +
+        '按"不完整"处理（会走分批重试）。可以在设置里提高 AI 输出上限。',
       rawText: text,
       ...(usage !== undefined ? { usage } : {}),
     };

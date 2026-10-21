@@ -865,6 +865,17 @@ export class ProjectService {
   /** 用户是否已经明确要求取消这一轮建树（分批时用来不再发起下一片）。 */
   private aiCancelRequested = false;
   /**
+   * **同一时刻只允许一轮建树**（0.3.60，并发改树处理）。
+   *
+   * 两轮建树并行会互相踩：它们各自读一份图、各自 upsert，`replaceAutoDraft` 还会清掉
+   * 对方刚建的节点；落点锁也会互相覆盖（一个 enterOperation 把另一个的项目拨回去）。
+   * 用户能观察到的现象是"点了两次重建，树变成两次的混合体，节点数对不上"。
+   *
+   * 面板的按钮已经会禁用，但**路由 + 工具 + 两次点击竞态**都可能绕过 UI，
+   * 所以这条闸门必须落在服务层：**第二次调用直接拒绝**，并给一句能照做的提示。
+   */
+  private aiBuildRunning = false;
+  /**
    * **这一轮建树的实际用量**（提供方回报的真实 `usage`，分批时逐片累加）。
    *
    * 单独存一份而不是去账本里现查：账本是**跨轮次**的流水（还混着别的场景），
@@ -6476,6 +6487,22 @@ export class ProjectService {
      */
     this.inFlightProject = undefined;
     this.inFlightDepth = 0;
+    /**
+     * **单飞闸门**（0.3.60，并发改树处理）：两轮建树并行会互相踩 ——
+     * 各自读一份图、各自 upsert，`replaceAutoDraft` 会清掉对方刚建的节点，
+     * 落点锁也会互相覆盖。面板按钮会禁用，但**路由 / 工具 / 连点竞态**都可能绕过 UI，
+     * 所以闸门必须落在服务层：第二次调用直接拒绝，并给一句能照做的提示。
+     */
+    if (this.aiBuildRunning) {
+      return {
+        status: 'denied',
+        reason: 'build-in-progress',
+        hint:
+          '**有一轮建树正在跑**。等它结束（或先在面板上点"取消"）再发起新的 —— ' +
+          '两轮并行会互相覆盖，结果是一棵混合的树。',
+      };
+    }
+    this.aiBuildRunning = true;
     await this.bindProjectToRoot(buildRoot, input.sessionId);
     const releaseLanding = this.enterOperation();
     try {
@@ -6610,6 +6637,15 @@ export class ProjectService {
           callId: input.callId,
           /** 落点必须与"这次读的仓库"一致（0.3.56 真机事故：读 A 写 B）。 */
           expectRoot: root,
+          /**
+           * **`resume` 是"半份输出"，必须按局部视图落库**（0.3.60，并发改树处理）。
+           *
+           * `resume` 复用的是上次被中断时存下的部分文本（`partial` 缓存）。不传 `partialView`
+           * 时 `applyAiTree` 按**整棵树**的判据行事：其余自动节点全被标成"本轮没再提到 ⇒ 疑似遗留"，
+           * 没人动过的草稿还会被清掉 —— 用户看到"复用了上次结果、没花钱"，
+           * 实际却是一次**大规模误标/误删**（真机同类事故：52 个节点里 48 个被标 `stale`）。
+           */
+          ...(verdict.kind === 'resume' ? { partialView: true } : {}),
         });
         const kind = verdict.kind;
         const savedTokens = entryTokens ?? preflight.estimate.totalTokens;
@@ -6839,8 +6875,9 @@ export class ProjectService {
       },
     };
     } finally {
-      /** 建树结束（正常/异常/取消）都必须松锁，否则后续别的操作会被钉在旧项目上。 */
+      /** 建树结束（正常/异常/取消）都必须松锁 + 放行单飞闸门，否则下一次永远被拒。 */
       releaseLanding();
+      this.aiBuildRunning = false;
     }
     });
   }
@@ -7562,7 +7599,15 @@ export class ProjectService {
         if (reshaped.note !== undefined) notes.push(reshaped.note);
       }
     }
-    const { graph, derived } = await this.derive();
+    /**
+     * ⚠️ **必须 `let`**（0.3.60，对抗/并发处理）：下面清完自动草稿会刷新 `workingGraph`，
+     * 而下游的 `liveByName` / `liveNodesForStale` / 身份索引 / `existingById` 全都读
+     * `graph` 与 `derived`。若它俩停在**删除前**的快照，复用层就可能认领"刚被删掉的节点 id"
+     * 当复用目标或当父节点 ⇒ 子节点写入被拒（`E_NOT_FOUND` / "父节点未建成"），
+     * 或对已删节点打 `stale` 失败而**静默不计**（`staleMarked` 偏小、无 note）。
+     * 用户看到的是"重建后一堆失败、节点又变少"。
+     */
+    let { graph, derived } = await this.derive();
     const failures: Array<{ name: string; reason: string }> = [];
     /**
      * 本轮会被 AI 覆盖的、**人改过优先级的**节点（循环里收集，循环后一次性审核）。
@@ -7786,6 +7831,13 @@ export class ProjectService {
         );
         const refreshed = await this.derive();
         workingGraph = refreshed.graph;
+        /**
+         * **三份快照必须一起刷**（0.3.60）：`graph`/`derived` 是下游索引
+         * （`liveByName` / `liveNodesForStale` / 身份索引）的数据源，
+         * 只刷 `workingGraph` 会让索引里留着**刚被删掉的节点 id**。
+         */
+        graph = refreshed.graph;
+        derived = refreshed.derived;
       }
     }
 
