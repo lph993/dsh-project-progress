@@ -65,6 +65,7 @@ import {
 import type { RollbackScope, SnapshotReason } from './domain/snapshot.ts';
 import { describeMissingRefTargets, missingRefTargets } from './domain/refs-exists.ts';
 import { nextTaskOf, type TaskCandidate } from './domain/next-task.ts';
+import { decideLandingRebind } from './domain/landing.ts';
 import {
   DEFAULT_SCAN_OPTIONS,
   NON_CODE_ARTIFACT_EXCLUDE,
@@ -6479,6 +6480,8 @@ export class ProjectService {
           replaceAutoDraft: input.replaceAutoDraft !== false,
           agent: input.agent,
           callId: input.callId,
+          /** 落点必须与"这次读的仓库"一致（0.3.56 真机事故：读 A 写 B）。 */
+          expectRoot: root,
         });
         const kind = verdict.kind;
         const savedTokens = entryTokens ?? preflight.estimate.totalTokens;
@@ -6646,6 +6649,8 @@ export class ProjectService {
       replaceAutoDraft: input.replaceAutoDraft !== false,
       agent: input.agent,
       callId: input.callId,
+      /** 落点必须与"这次读的仓库"一致（0.3.56）。 */
+      expectRoot: root,
     });
     // 用量账本：真实用量优先（提供方回的 usage），拿不到才标"粗估"
     const treeCall: AiUsageCall = {
@@ -7038,6 +7043,8 @@ export class ProjectService {
       const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
         // ① 只有第一片清理阶段 A 草稿（见方法头注释）
         replaceAutoDraft: input.replaceAutoDraft && index === 0,
+        /** 落点必须与"这次读的仓库"一致（0.3.56 真机事故：分片里混进了别的仓库）。 */
+        ...(input.root !== undefined ? { expectRoot: input.root } : {}),
         // ② 每片都是**局部**视图 ⇒ 不许做"本轮没再提到"这类全局判断（否则片 N 会
         //    把其余片刚建的节点全标成 stale —— 真机 52 个节点里 48 个被标）
         partialView: true,
@@ -7345,6 +7352,29 @@ export class ProjectService {
        * 分批路径因此传 `true`（第 2 片起），项目名由调用方在第一片时定下来。
        */
       skipProjectNameWrite?: boolean;
+      /**
+       * **本次建树读的是哪个仓库**（0.3.56，真机事故驱动）。
+       *
+       * 落库前会核对"当前绑定项目的 `workspaceRoot`"与它是否一致；不一致就**按它重新绑定**。
+       *
+       * ## 事故现场（2026-10-21 真机）
+       *
+       * 用户重生成了 PEIS 的树，结果树上同时出现了：
+       *
+       * ```
+       * PEIS.Web/Areas/...                          ← PEIS 的
+       * src/ai, src/adapter, docs/开发须知.md, lib   ← **我们自己仓库的**
+       * ```
+       *
+       * 而且 `pm_20a91cfe`（`E:\thirty\dsh-project-progress` 那个项目）**被改名成了「PEIS」**。
+       *
+       * 根因：`aiBuildTree` 只 resolve 了 `root`（这次要读的仓库），但**落点用的是全局
+       * `this.projectId`**（由 `operationRoot()`/陈旧 `inFlightProject` 决定）。两者一旦不同源，就是
+       * "**读 A 仓库、写 B 项目**"—— 骨架来自 A，节点落进 B，项目名也被 B 一起改掉。
+       *
+       * 这道防线把"读"和"写"钉在同一份事实上：**写之前核对，对不上就重新绑定**。
+       */
+      expectRoot?: string;
     },
   ): Promise<{
     projectName: string;
@@ -7359,6 +7389,28 @@ export class ProjectService {
     staleCleared: number;
   }> {
     const notes: string[] = [];
+    /**
+     * **落点核对**（0.3.56）：写之前先确认"当前项目"就是这个仓库的项目。
+     *
+     * 真机事故：读 A 仓库、写 B 项目 ⇒ PEIS 的项目里长出了我们仓库的 `src/ai` 节点，
+     * 而我们仓库那个项目被改名成「PEIS」。
+     *
+     * 核对不上时不硬写：**先清陈旧锁、再按本次仓库重新绑定**，如实记进 notes。
+     * 判定本身是纯函数（`decideLandingRebind`），所以它**能被单测真的测到**
+     * —— 我第一版把整件事写在一体化 e2e 里，注入验证时它不变红，等于没测。
+     */
+    if (options?.expectRoot !== undefined) {
+      const current = await this.port.getMeta(this.projectId);
+      const currentRoot = typeof current?.workspaceRoot === 'string' ? current.workspaceRoot : '';
+      const decision = decideLandingRebind(currentRoot, options.expectRoot);
+      if (decision.rebind) {
+        debugBus.warn('project', `建树${decision.reason}`);
+        /** 陈旧锁会让 `bindProjectToRoot` 拒绝改绑 —— 这正是事故的直接原因。 */
+        this.inFlightProject = undefined;
+        await this.bindProjectToRoot(options.expectRoot);
+        notes.push(`落点已纠正：${decision.reason}`);
+      }
+    }
     /**
      * **落库前先把根扶正**（0.3.41）。
      *
@@ -8903,6 +8955,8 @@ export class ProjectService {
       const applied = await this.applyAiTree(call.parsed.value, call.parsed.notes, {
         partialView: true,
         skipProjectNameWrite: true,
+        /** 回填读的就是 `boundRoot`，落点也必须是它（0.3.56）。 */
+        expectRoot: root,
         /**
          * ⚠️ **必须显式传 `false`**（0.3.53 自己踩到的坑）。
          *
