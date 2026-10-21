@@ -1367,6 +1367,42 @@ export class ProjectService {
     };
   }
 
+  /**
+   * **写之前核对落点**（0.3.57）：AI 建树的**每一条**写入路径都要走这里。
+   *
+   * ## 为什么不能只在 `applyAiTree` 里做
+   *
+   * 0.3.56 只在 `applyAiTree` 入口核对，但一次分批建树还会经由
+   * **`regroupShardedBranches`（addNode + reparentNode 搬分支）** 与
+   * **`normalizeProjectRoot`（reparentNode 提根）** 落库 —— 这两条当时**没有核对**。
+   * 它们的写入走 `bindForCall(undefined)` ⇒ `operationRoot()` ⇒ `pendingRoot`
+   * （**面板最近一次轮询写进去的那个根**）。也就是说：
+   *
+   * > 建树期间只要别的会话的面板轮询过一次，归拢就可能把节点建到**那个会话的仓库**里。
+   *
+   * 这正是 2026-10-21 那次"PEIS 的项目里长出插件仓库节点"的同一类事故，
+   * 只是发生在另一条写入路径上。**修一处不够，得让所有 AI 写入都过同一道门。**
+   *
+   * ## 语义
+   *
+   * - 没声明 `expectedRoot` ⇒ 什么都不做（不猜）；
+   * - 与当前项目根一致（归一后）⇒ 什么都不做；
+   * - 不一致 ⇒ **先清陈旧锁，再按 `expectedRoot` 重新绑定**
+   *   （清锁是关键：陈旧锁会让 `bindProjectToRoot` 拒绝改绑）。
+   */
+  private async ensureLanding(expectedRoot: string | undefined): Promise<{ rebound: boolean; note?: string }> {
+    if (expectedRoot === undefined || expectedRoot.trim() === '') return { rebound: false };
+    const meta = await this.port.getMeta(this.projectId);
+    const currentRoot = typeof meta?.workspaceRoot === 'string' ? meta.workspaceRoot : '';
+    const decision = decideLandingRebind(currentRoot, expectedRoot);
+    if (!decision.rebind) return { rebound: false };
+    debugBus.warn('project', `AI 建树${decision.reason}`);
+    /** 陈旧锁会让 `bindProjectToRoot` 拒绝改绑 —— 这正是事故的直接原因。 */
+    this.inFlightProject = undefined;
+    await this.bindProjectToRoot(expectedRoot);
+    return { rebound: true, note: `落点已纠正：${decision.reason}` };
+  }
+
   /** 工作区根的解析结果（含来源，供诊断页显示"根从哪来"）。 */
   rootResolution(sessionId?: string): WorkspaceRootResolution {
     return this.resolveRoot(sessionId);
@@ -7103,7 +7139,7 @@ export class ProjectService {
      * **分批路径也要归位**（0.3.35）：每片各建一棵局部树，落库后**共用一个根**才是完整的树，
      * 所以归位必须在**全部片落库之后**做一次 —— 放在片循环里做会把"某一片的局部根"当成根。
      */
-    const shardedNormalized = await this.normalizeProjectRoot(input.sessionId);
+    const shardedNormalized = await this.normalizeProjectRoot(input.sessionId, input.root);
     if (shardedNormalized.moved > 0) notes.push(`根节点归位：${shardedNormalized.reason}`);
     /**
      * **覆盖回填**（0.3.53）：提示词只能"希望"模型别漏目录，这里用程序保证补上。
@@ -7136,6 +7172,8 @@ export class ProjectService {
       ...(input.stream !== undefined ? { stream: input.stream } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
       ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+      /** 落点核对（0.3.57）：归拢搬分支走 addNode/reparentNode，不核对就会漂到别的仓库。 */
+      ...(input.root !== undefined ? { expectRoot: input.root } : {}),
     });
     if (regrouped.status === 'ok' && regrouped.createdGroups > 0) {
       notes.push(`按功能归拢：${regrouped.reason}`);
@@ -7400,16 +7438,9 @@ export class ProjectService {
      * —— 我第一版把整件事写在一体化 e2e 里，注入验证时它不变红，等于没测。
      */
     if (options?.expectRoot !== undefined) {
-      const current = await this.port.getMeta(this.projectId);
-      const currentRoot = typeof current?.workspaceRoot === 'string' ? current.workspaceRoot : '';
-      const decision = decideLandingRebind(currentRoot, options.expectRoot);
-      if (decision.rebind) {
-        debugBus.warn('project', `建树${decision.reason}`);
-        /** 陈旧锁会让 `bindProjectToRoot` 拒绝改绑 —— 这正是事故的直接原因。 */
-        this.inFlightProject = undefined;
-        await this.bindProjectToRoot(options.expectRoot);
-        notes.push(`落点已纠正：${decision.reason}`);
-      }
+      /** 统一走 `ensureLanding`（0.3.57）：判据、清锁、重绑只有一处实现。 */
+      const landing = await this.ensureLanding(options.expectRoot);
+      if (landing.note !== undefined) notes.push(landing.note);
     }
     /**
      * **落库前先把根扶正**（0.3.41）。
@@ -8549,8 +8580,16 @@ export class ProjectService {
    */
   async normalizeProjectRoot(
     sessionId: string | undefined,
+    /**
+     * **本次要动的仓库**（0.3.57）：入口先核对落点。
+     * 归位靠 `reparentNode` 落库，它走 `bindForCall(undefined)` ⇒ `pendingRoot`，
+     * 所以不核对就可能把**别的仓库那棵树**的父子关系改掉。
+     */
+    expectedRoot?: string,
   ): Promise<{ moved: number; reason: string }> {
     try {
+      /** 必须在 `derive()` 之前：derive 自己会把绑定拨到 `pendingRoot`。 */
+      await this.ensureLanding(expectedRoot);
       const { graph, derived } = await this.derive(sessionId);
       /**
        * ⚠️ **归位必须作用在"刚才读的那棵树"所属的项目上**（0.3.38 真机取证）。
@@ -8887,6 +8926,12 @@ export class ProjectService {
     | { status: 'error'; reason: string }
   > {
     try {
+      /**
+       * **落点核对放在最前**（0.3.57）：下面 `derive()` 会把绑定拨到 `pendingRoot`，
+       * 而 `boundRoot` 是**上一次绑定**留下的值 —— 两者不同源时，
+       * "算缺口"用的仓库与"落库"用的项目就不是一回事。
+       */
+      await this.ensureLanding(this.boundRoot);
       const root = this.boundRoot;
       if (root === undefined || root === '') return { status: 'skipped', reason: '拿不到工作区根，不做覆盖回填' };
       const topDirs = this.scannableTopDirs(root);
@@ -9005,12 +9050,23 @@ export class ProjectService {
     stream?: LlmStreamLike;
     signal?: AbortSignal;
     sessionId?: string;
+    /**
+     * **本次建树读的仓库**（0.3.57）：入口先核对落点，再动任何节点。
+     *
+     * 归拢用 `addNode` + `reparentNode` 落库，而这两个方法走
+     * `bindForCall(undefined)` ⇒ `operationRoot()` ⇒ **`pendingRoot`
+     * （面板最近一次轮询写进去的根）**。没有这道核对，建树期间别的会话轮询一次，
+     * 归拢就会把节点建到**那个会话的仓库**里 —— 与 2026-10-21 那次事故同一类。
+     */
+    expectRoot?: string;
   }): Promise<
     | { status: 'ok'; createdGroups: number; moved: number; reason: string }
     | { status: 'skipped'; reason: string }
     | { status: 'error'; reason: string }
   > {
     try {
+      /** 落点核对必须在 `derive()` 之前：derive 自己会把绑定拨到 `pendingRoot`。 */
+      await this.ensureLanding(input.expectRoot);
       const { graph, derived } = await this.derive(input.sessionId);
       const alive = (id: string): boolean =>
         graph.nodes[id] !== undefined && derived.nodes.get(id)?.derivedState !== 'removed';
