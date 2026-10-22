@@ -471,8 +471,21 @@ export function parseTreeResponse(text: string): ParseOutcome {
         if (!isNonCodeArtifact(ref.target)) return true;
         notes.push(`「${name}」的 refs 里 ${ref.target} 是非代码产物（虚拟环境/缓存/构建输出），已丢弃`);
         return false;
-      })
-      .slice(0, MAX_REFS_PER_NODE);
+      });
+    /**
+     * **refs 超上限必须留痕，不许静默截断**（0.3.62）。
+     *
+     * 原来这一行是 `.slice(0, MAX_REFS_PER_NODE)` —— 多出来的直接消失，
+     * 与本项目自己定的那条要求（"每个上限都要留痕；丢弃本身可以，静默丢弃不行"）冲突。
+     * 引用被砍掉却不说，用户会以为"这个节点只覆盖这些代码"。
+     */
+    if (refs.length > MAX_REFS_PER_NODE) {
+      notes.push(
+        `「${name}」给了 ${refs.length} 条 refs，超过单节点上限 ${MAX_REFS_PER_NODE}，` +
+          `只保留前 ${MAX_REFS_PER_NODE} 条（其余丢弃）`,
+      );
+      refs.length = MAX_REFS_PER_NODE;
+    }
 
     const kindDecision = normalizeKind(record['kind'], 'task');
     if (kindDecision.note !== undefined) notes.push(`「${name}」${kindDecision.note}`);

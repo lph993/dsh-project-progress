@@ -7375,6 +7375,8 @@ export class ProjectService {
       ...(input.stream !== undefined ? { stream: input.stream } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
       ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
+      /** 落点核对要拿**本次仓库**做基准（0.3.62）：传 `boundRoot` 等于自己校验自己。 */
+      ...(input.root !== undefined ? { expectRoot: input.root } : {}),
     });
     if (backfilled.status === 'ok') {
       notes.push(`覆盖回填：${backfilled.reason}`);
@@ -9290,6 +9292,17 @@ export class ProjectService {
     stream?: LlmStreamLike;
     signal?: AbortSignal;
     sessionId?: string;
+    /**
+     * **本次建树读的仓库**（0.3.62）。
+     *
+     * 这一条原来是 `ensureLanding(this.boundRoot)` —— **拿自己校验自己**：
+     * 落点核对的意义是"项目根 vs 本次仓库"，两个参数都取 `boundRoot` 时永远相等，
+     * 于是这道核对在回填里形同虚设（0.3.61 的交接文档已如实登记）。
+     *
+     * 现在由调用方（`aiBuildTreeSharded`，它知道本次 `root`）传进来；
+     * 拿不到时才退回 `boundRoot`，并**如实记进 notes**，不假装核对过。
+     */
+    expectRoot?: string;
   }): Promise<
     | { status: 'ok'; targetDirs: number; stillMissing: number; created: number; reason: string }
     | { status: 'skipped'; reason: string }
@@ -9300,9 +9313,16 @@ export class ProjectService {
        * **落点核对放在最前**（0.3.57）：下面 `derive()` 会把绑定拨到 `pendingRoot`，
        * 而 `boundRoot` 是**上一次绑定**留下的值 —— 两者不同源时，
        * "算缺口"用的仓库与"落库"用的项目就不是一回事。
+       *
+       * ⚠️ 参数必须是**调用方给的本次仓库**（0.3.62）：传 `this.boundRoot` 就是自证。
        */
-      await this.ensureLanding(this.boundRoot);
-      const root = this.boundRoot;
+      const expectedRoot = input.expectRoot ?? this.boundRoot;
+      const landingNote =
+        input.expectRoot === undefined
+          ? '覆盖回填：调用方没给本次仓库，落点核对退回当前绑定（**等于没核对**）'
+          : undefined;
+      await this.ensureLanding(expectedRoot);
+      const root = expectedRoot;
       if (root === undefined || root === '') return { status: 'skipped', reason: '拿不到工作区根，不做覆盖回填' };
       const topDirs = this.scannableTopDirs(root);
       if (topDirs === undefined || topDirs.length === 0) {
@@ -9405,7 +9425,8 @@ export class ProjectService {
           `有 ${uncovered.length} 个顶层目录一条 refs 都没有，已按 ${targets.length} 个补建 ` +
           `（新建 ${applied.created} 个节点）` +
           (uncovered.length > targets.length ? `；另有 ${uncovered.length - targets.length} 个超出单次上限未补` : '') +
-          `；补完后仍缺 ${stillMissing} 个`,
+          `；补完后仍缺 ${stillMissing} 个` +
+          (landingNote !== undefined ? `。${landingNote}` : ''),
       };
     } catch (error) {
       return {
