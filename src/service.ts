@@ -605,6 +605,21 @@ export interface BoardSnapshot {
    */
   aiRun: AiRunProgress | null;
   /**
+   * **宿主侧此刻是否真的在跑一轮 AI 建树**（0.3.64）。
+   *
+   * 与 `aiRun` 的区别是刻意的，两个都必要：
+   * - `aiRun` 是**进度快照**，完成/失败之后仍然保留（用户要看"刚才花了多少"）；
+   * - 本字段是**事实**：`aiBuildTree` 还在执行（扫描 / 调用模型 / 逐片落库 / 根归位 / 收尾）。
+   *
+   * 为什么需要它：面板原先只用**自己那次 fetch 的存活**当"正在生成"的判据。
+   * 请求一旦被浏览器/代理掐断（真机现场：挂了 11 分 36 秒后 `Failed to fetch`），
+   * 按钮立刻回到空闲态、可**树还在被宿主改** —— 用户原话："生成按钮没变化，树却在变化"。
+   * 面板必须能读宿主的事实，而不是拿自己那条连接去推断。
+   *
+   * **按项目过滤**：只有"这一轮建的那个项目"的看板为 `true`，别的项目如实 `false`。
+   */
+  aiBuildRunning: boolean;
+  /**
    * 工作区根的解析结果（诊断用）。
    *
    * 面板空着的头号原因就是这里为 `none` —— 让它直接可见，省得再猜。
@@ -893,6 +908,17 @@ export class ProjectService {
    * 所以这条闸门必须落在服务层：**第二次调用直接拒绝**，并给一句能照做的提示。
    */
   private aiBuildRunning = false;
+  /**
+   * **这一轮建树落在哪个项目**（0.3.64，用户真机反馈："生成按钮没变化，树却在变化"）。
+   *
+   * 为什么不能只靠 `aiRunProjectId`：那个字段在**第一次模型调用**时才写，
+   * 而"扫描骨架 / 组织提示词 / 落库 / 根归位"同样是这一轮的一部分 ——
+   * 面板需要在这整段里都能说"正在生成"，否则按钮看起来是空闲的、树却在变。
+   *
+   * 为什么也不能只靠全局的 `aiBuildRunning`：别的项目在建树时，本项目的面板
+   * 不该把自己没干的事说成在干（与 `aiRunProjectId` 的同一条口径）。
+   */
+  private aiBuildProjectId: string | null = null;
   /**
    * **这一轮建树的实际用量**（提供方回报的真实 `usage`，分批时逐片累加）。
    *
@@ -5690,6 +5716,11 @@ export class ProjectService {
       confirmChannel: this.confirm?.describeChannel() ?? '确认路由未装配',
       // FR-167：正在跑的建树进度（没在跑就是 null，面板据此隐藏那一行）
       aiRun: this.aiRunProgress !== null && this.aiRunProjectId === this.projectId ? this.aiRunProgress : null,
+      /**
+       * **正在生成**的事实来源（0.3.64）：从扫描到收尾，整段都为 true。
+       * 只对这一轮建的那个项目为 true —— 别的项目不替它认这件事（同 `aiRun` 的口径）。
+       */
+      aiBuildRunning: this.aiBuildRunning && this.aiBuildProjectId === this.projectId,
       document: {
         path: this.deps.config.documentPath,
         exists: doc.exists,
@@ -6546,6 +6577,11 @@ export class ProjectService {
     try {
     await this.bindProjectToRoot(buildRoot, input.sessionId);
     releaseLanding = this.enterOperation();
+    /**
+     * **这一轮落在哪个项目**（0.3.64）：绑定已经完成，就立刻记下来 ——
+     * 面板的"正在生成"从这一刻起就该是真的（而不是等第一次模型调用）。
+     */
+    this.aiBuildProjectId = this.projectId;
     const root = buildRoot;
     const route = resolveAiRoute({
       ctx: this.ctx,
@@ -6644,6 +6680,8 @@ export class ProjectService {
         ...(input.callId !== undefined ? { callId: input.callId } : {}),
         ...(input.stream !== undefined ? { stream: input.stream } : {}),
         ...(input.signal !== undefined ? { signal: input.signal } : {}),
+        /** 0.3.64：分批路径也要带上会话（根归位 / 体检 / 回填 / 归拢都读它）。 */
+        ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
       });
       if (direct.status === 'ok') {
         debugBus.info(
@@ -6810,6 +6848,8 @@ export class ProjectService {
           ...(input.callId !== undefined ? { callId: input.callId } : {}),
           ...(input.stream !== undefined ? { stream: input.stream } : {}),
           ...(input.signal !== undefined ? { signal: input.signal } : {}),
+          /** 0.3.64：同上 —— 分批重试这条路也要带会话。 */
+          ...(input.sessionId !== undefined ? { sessionId: input.sessionId } : {}),
         });
         if (retry.status === 'ok') {
           debugBus.info(
@@ -6915,9 +6955,23 @@ export class ProjectService {
       },
     };
     } finally {
+      /**
+       * **收尾时不许留一条 `running` 的假进度**（0.3.64）。
+       *
+       * 真路径：分批建树时第 N 片成功（还有片没跑 ⇒ 刻意标 `running`），
+       * 用户在第 N 片与第 N+1 片之间点了「停止」⇒ 循环在"调用前先看取消标记"处退出，
+       * **不会再写一份新快照** ⇒ 最后一份仍是 `running`。
+       * 而面板把 `aiRun.phase === 'running'` 当作"正在生成"的退路（旧宿主没有
+       * `aiBuildRunning` 时只能靠它）⇒ 这一轮明明结束了，面板却永远显示"正在生成"、
+       * 停止按钮一点又回"没有正在跑的调用"。所以这里补一笔：还在 running 就是没跑完。
+       */
+      if (this.aiRunProgress?.phase === 'running') {
+        this.aiRunProgress = { ...this.aiRunProgress, phase: 'error' };
+      }
       /** 建树结束（正常/异常/取消）都必须松锁 + 放行单飞闸门，否则下一次永远被拒。 */
       releaseLanding?.();
       this.aiBuildRunning = false;
+      this.aiBuildProjectId = null;
     }
     });
   }
@@ -7112,6 +7166,15 @@ export class ProjectService {
     callId?: string;
     stream?: LlmStreamLike;
     signal?: AbortSignal;
+    /**
+     * **发起这次建树的会话**（0.3.64 补上）。
+     *
+     * 分批路径里的 `normalizeProjectRoot` / `treeHealthSummary` / 覆盖回填 / 按功能归拢
+     * 都会读它 —— 而 `aiBuildTreeSharded` 的这个参数类型此前**没有这个字段**，
+     * 调用方也没传 ⇒ 那几处一直在拿 `undefined`（退化成"按当前绑定"）。
+     * 单次路径一直是带着会话走的，这里补齐只是让两条路径口径一致。
+     */
+    sessionId?: string | undefined;
   }): Promise<
     | { status: 'ok'; shards: number; result: AiBuildTreeOk }
     | { status: 'fail'; shards: number; message: string }

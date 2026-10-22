@@ -216,5 +216,16 @@ export interface BoardSnapshot {
     /** 本轮**实际消耗**（提供方回报；分批时逐片累加）。拿不到就是缺席。 */
     actual?: { inputTokens?: number; outputTokens?: number };
   } | null;
+  /**
+   * **宿主侧此刻是否真的在跑一轮 AI 建树**（0.3.64）。
+   *
+   * 与 `aiRun` 分开：`aiRun` 是进度快照（跑完仍保留），本字段是**事实**。
+   * 面板必须用它来判断"正在生成"，而不是只看**自己那条 fetch 还在不在** ——
+   * 真机现场：请求被掐断后按钮回到空闲、可宿主还在改树（用户原话：
+   * "生成按钮没变化，树却在变化"）。
+   *
+   * 允许缺席：旧宿主不返回该字段 ⇒ 客户端退回 `aiRun.phase === 'running'` 的旧判据。
+   */
+  aiBuildRunning?: boolean;
 }
 

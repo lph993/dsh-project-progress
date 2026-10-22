@@ -27,10 +27,43 @@ test('确认框与结果必须是模态框，且遮罩的关闭判断必须走�
   assert.match(source, /'data-pm-ai-modal': '1'/, '模态框要有自检锚点');
   assert.match(
     source,
-    /if \(dismissibleByBackdrop\(aiBusy\)\)/,
+    /if \(dismissibleByBackdrop\(generating\)\)/,
     '点遮罩必须问一遍"执行中吗" —— 少这一步就等于"点空白也能关掉正在跑的调用"',
   );
   assert.ok(!source.includes('styles.confirmBox'), '内联确认框（红框）应已被模态框取代');
+});
+
+/**
+ * **生成中必须能看到弹窗与停止入口**（0.3.64，用户原话："生成树时没有停止功能"）。
+ *
+ * 真根因：0.3.21 起"点一次直接建"不再先回 `needs-confirm`，而弹窗的渲染条件只看了
+ * `aiPrompt / aiResult / aiError` —— 生成期间三者**全为假** ⇒ 弹窗根本不渲染 ⇒
+ * 里面那个「停止」按钮也就不存在。用户眼前只剩一个变灰的按钮，没有任何停止入口。
+ */
+test('生成中必须渲染弹窗（否则里面的停止入口跟着消失）', () => {
+  const source = panelSource();
+  assert.match(
+    source,
+    /aiPrompt !== undefined \|\| aiResult !== undefined \|\| aiError !== undefined \|\| aiNotice !== undefined \|\| generating/,
+    '弹窗的渲染条件必须包含 `generating` —— 少了它，生成期间连"停止"按钮一起不渲染',
+  );
+  assert.match(source, /'data-pm-ai-busy': generating \? '1' : '0'/, '弹窗要暴露"正在生成"状态（可被测试观察）');
+  /**
+   * **判据必须来自宿主事实**（0.3.64）：只看本面板那次请求（`aiBusy`）时，
+   * 请求一断按钮就恢复空闲、可树还在变 —— 那正是用户报的"按钮没变化，树却在变化"。
+   */
+  assert.match(source, /isAiBuildGenerating\(aiBusy, board\)/, '生成判据要合并"本地请求 + 宿主事实"');
+  assert.match(
+    source,
+    /import \{ isAiBuildGenerating \} from '\.\/build-state\.ts'/,
+    '判据收在纯函数模块里（三个来源的语义由 tests/client/build-state.test.ts 钉住）',
+  );
+  /**
+   * 请求断了、宿主还在跑时，要**明说**是谁在跑 —— 否则用户会以为"点了没反应"，
+   * 甚至以为这次对话/别的会话在乱动树。
+   */
+  assert.match(source, /'data-pm-ai-generating': '1'/, '生成中要有一行说明进度来自哪里');
+  assert.match(source, /宿主侧这一轮还在跑/, '面板请求已断但宿主仍在跑时必须如实说明');
 });
 
 /**
@@ -58,14 +91,29 @@ test('执行中必须给出**显式**中止入口，并且真的调用取消通�
    */
   assert.match(
     source,
-    /!aiBusy && aiPrompt !== undefined/,
+    /!generating && aiPrompt !== undefined/,
     '确认按钮只在"旧宿主两段式、且不在跑"时出现 —— 跑起来还摆一个"确认并开始"会让人以为要再点一次',
   );
   assert.match(
     source,
-    /aiBusy \? '正在生成树…' : '用 AI 建树（直接生成）'/,
-    '按钮文案要如实反映"点了就建"',
+    /generating \? '正在生成树…' : '用 AI 建树（直接生成）'/,
+    '按钮文案要如实反映"点了就建"（判据是 generating，不是本面板那次请求）',
   );
+  /**
+   * **0.3.64**：停止按钮的渲染判据必须是 `generating`（宿主事实），
+   * 而不是 `aiBusy`（只代表"本面板的请求还在"）。否则请求被掐断后就没有停止入口了。
+   */
+  assert.match(
+    source,
+    /generating\s*\?\s*React\.createElement\(\s*'button',\s*\{\s*key: 'stop-run'/,
+    '停止按钮必须在 generating 为真时就渲染',
+  );
+  assert.match(source, /'停止生成'/, '按钮文案直接说"停止生成"（用户原话就是"没有停止功能"）');
+  /**
+   * **直接建树成功后必须留下结果**（0.3.64）：此前的成功分支只写在旧的两段式函数里，
+   * 直接建树走的那条路成功后什么都不设置 ⇒ 弹窗在收尾那一刻直接消失。
+   */
+  assert.match(source, /setAiResult\(aiOkSummary\(value\)\)/, '成功分支必须写结果（否则用户看不到建了多少节点）');
 });
 
 test('「删除此项目」必须是**带取消**的确认弹窗（0.3.24）', () => {

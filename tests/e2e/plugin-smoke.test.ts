@@ -4335,6 +4335,7 @@ test('建树实时进度 + 显式取消（FR-167/168）：进度可见、取消�
     aiBuildEstimate(input?: Record<string, unknown>): Promise<Record<string, unknown>>;
     board(): Promise<{
       aiRun: { outputChars: number; outputTokensEstimate: number; shardTotal: number; outputLimit: number } | null;
+      aiBuildRunning: boolean;
     }>;
   };
   service.noteWorkspaceRoot(workspace);
@@ -4373,6 +4374,15 @@ test('建树实时进度 + 显式取消（FR-167/168）：进度可见、取消�
             shardTotal: snapshot.aiRun?.shardTotal ?? -1,
             limit: snapshot.aiRun?.outputLimit ?? -1,
           });
+          /**
+           * **0.3.64**：流式期间看板必须同时说"宿主正在生成" ——
+           * 这是"请求断了也还能停"的判据（面板不再只看自己那次 fetch）。
+           */
+          assert.equal(
+            snapshot.aiBuildRunning,
+            true,
+            '生成期间看板必须报 aiBuildRunning=true（否则请求一断按钮就骗人说空闲）',
+          );
           // 等测试点"取消"（真实流由宿主在 abort 时中断）
           await new Promise<void>((resolve) => {
             if (options.signal?.aborted === true) resolve();
@@ -4429,9 +4439,15 @@ test('建树实时进度 + 显式取消（FR-167/168）：进度可见、取消�
    * **跑完不清空**（用户口径："生成后，进度条保留，保持 100%，并能看到 token 消耗"）：
    * 留下的是**这一轮**的收尾状态（阶段 + 已生成字符），不是"永远 90% 的假进度条"。
    */
-  const finalRun = (await service.board()).aiRun;
+  const finalBoard = await service.board();
+  const finalRun = finalBoard.aiRun;
   assert.ok(finalRun !== null, '跑完之后要留下这一轮的结果（否则看不到花了多少 token）');
   assert.equal(finalRun?.phase, 'error', '被取消 ⇒ 阶段是"没成功"，不能装成已完成');
+  assert.equal(
+    finalBoard.aiBuildRunning,
+    false,
+    '取消/结束之后必须回到 false —— 否则面板永远显示"正在生成"、停止按钮也永远点不掉',
+  );
 
   // T9：被中止也要把**已经流出来的那部分文本**落盘（否则这一轮就白花了）
   const cacheFile = ctx.fsService.files.get('.pm/ai-cache.json');

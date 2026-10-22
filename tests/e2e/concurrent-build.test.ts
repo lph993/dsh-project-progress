@@ -146,6 +146,76 @@ test('建树中途抛错 ⇒ 闸门也必须释放（否则之后永远被拒）
 });
 
 /**
+ * **看板必须如实报"宿主侧正在生成"**（0.3.64）。
+ *
+ * 真机现场（用户原话）："看着生成按钮没变化（没有处于生成中），树却在变化" ——
+ * 面板原来只拿**自己那次 HTTP 请求的存活**当判据；请求被浏览器/代理掐断后
+ * 按钮立刻回到空闲态，而宿主还在逐片落库。`aiRun` 也救不了：它只是进度快照，
+ * 而且收尾阶段（根归位 / 体检）里可能已经是 `done`。
+ *
+ * 所以服务端在整轮期间（扫描 → 调模型 → 落库 → 收尾）都必须回 `aiBuildRunning: true`，
+ * 结束后立刻回 `false` —— 面板据此显示"正在生成树…"并给出停止入口。
+ */
+test('建树期间看板必须报 aiBuildRunning=true，结束后回到 false（0.3.64）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-build-flag-'));
+  mkdirSync(join(workspace, 'web'), { recursive: true });
+  writeFileSync(join(workspace, 'web', 'index.ts'), 'export const a = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', { currentSelection: () => ({ provider: 'p', model: 'm' }) });
+  ctx.services.set('llm', { stream: () => { throw new Error('用注入的假流'); } });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    aiBuildTree(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ aiBuildRunning: boolean; aiRun: { phase?: string } | null }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  assert.equal((await service.board()).aiBuildRunning, false, '前置条件：还没开始建树');
+
+  let entered = false;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const build = service.aiBuildTree({
+    confirm: true,
+    stream: {
+      stream: () => {
+        entered = true;
+        return (async function* () {
+          await gate;
+          for await (const chunk of streamOf(okTree('生成中演示'))) yield chunk;
+        })();
+      },
+    },
+  });
+  for (let i = 0; i < 200 && !entered; i += 1) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(entered, true, '前置条件：必须已经进入模型调用');
+
+  const during = await service.board();
+  assert.equal(
+    during.aiBuildRunning,
+    true,
+    '建树期间看板必须说"宿主正在生成"（否则请求一断，按钮就骗人说空闲）',
+  );
+
+  release?.();
+  const result = await build;
+  assert.equal(result['status'], 'ok', `这一轮应当成功：${JSON.stringify(result).slice(0, 200)}`);
+
+  const after = await service.board();
+  assert.equal(after.aiBuildRunning, false, '建树结束（含异常/取消）必须回到 false，否则按钮永远卡在"生成中"');
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+/**
  * **取消意图不许被下一次建树请求抹掉**（0.3.61 审查修正）。
  *
  * ## 原来的 bug（这条测试就是它的形状）

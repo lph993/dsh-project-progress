@@ -442,7 +442,31 @@
  * （`apply()` 里的引用、Hook 规则）单元测试、类型检查、产物自检都执行不到** ——
  * 唯一判据是**真浏览器里把面板打开**（`--port` 测试宿主 + Playwright 看 `[data-slot-error]` 与控制台）。
  */
-export const HOST_BATCH = 82;
+/**
+ * ## 批次 83 的用途
+ *
+ * **0.3.64：看板多一个事实字段 `aiBuildRunning`**（宿主侧行为变更 + 客户端新判据）。
+ *
+ * 用户现场（重启后连报两条）：
+ * ① "生成树时没有停止功能" —— 停止按钮一直在，但它渲染在 AI 弹窗里，而 0.3.21 起
+ *    "点一次直接建"之后生成期间 `aiPrompt/aiResult/aiError` 全为假 ⇒ **弹窗不渲染** ⇒
+ *    按钮不存在；
+ * ② "生成按钮没变化，树却在变化" —— 面板只看自己那次 fetch 的存活，连接被掐断后
+ *    按钮恢复空闲，而宿主还在逐片落库。
+ *
+ * 宿主侧改动（所以批次 +1）：
+ * - `board()` 新增 `aiBuildRunning: boolean`，**按项目过滤**（`aiBuildProjectId`），
+ *   整轮（扫描 → 调模型 → 逐片落库 → 根归位/体检）为真，`finally` 复位；
+ * - `aiBuildTreeSharded` 补上 `sessionId` 参数并在两处调用点传入（此前类型里没有该字段、
+ *   调用方也没传 ⇒ 分批路径的根归位 / 体检 / 覆盖回填 / 按功能归拢一直退化成"按当前绑定"）。
+ *
+ * 客户端改动：`generating = isAiBuildGenerating(aiBusy, board)`（三来源取或）；
+ * 生成中强制渲染弹窗并给出「停止生成」；直接建树的成功分支补上（此前成功后什么都不设置）。
+ *
+ * ⚠️ **本批必须重启宿主**才生效；只刷新页面只能拿到客户端那一半（停止按钮会出现，
+ * 但"请求断了宿主还在跑"的判据会退回 `aiRun.phase`）。
+ */
+export const HOST_BATCH = 83;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

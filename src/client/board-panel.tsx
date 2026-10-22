@@ -39,6 +39,7 @@ import {
 import { alertChipOf } from './alerts.ts';
 import { nodeCountLabel } from './labels.ts';
 import { dismissibleByBackdrop } from './modal-dismiss.ts';
+import { isAiBuildGenerating } from './build-state.ts';
 import { legendSections } from './legend.ts';
 import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
 import { NodeInspector } from './node-inspector.tsx';
@@ -958,6 +959,26 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiResult, setAiResult] = useState<string | undefined>(undefined);
   const [aiError, setAiError] = useState<string | undefined>(undefined);
+  /**
+   * **中性提示**（0.3.64）：既不是"成功了"也不是"失败了"的那类事实 ——
+   * 例如"已请求停止"、"面板这边的请求断了，但宿主还在跑"。
+   *
+   * 为什么不借用 `aiError`：红框会让人以为建树坏了（真机现场只有连接被掐断，
+   * 树其实还在正常长），于是最自然的反应变成"再点一次"—— 白花一整轮的钱。
+   */
+  const [aiNotice, setAiNotice] = useState<string | undefined>(undefined);
+  /** 用户是否已经点过「停止生成」（用来把随后的中断/报错说成"已停止"，而不是失败）。 */
+  const stopRequested = useRef(false);
+  /**
+   * **"正在生成"的唯一判据**（0.3.64，真机现场："生成按钮没变化，树却在变化"）。
+   *
+   * 三个来源缺一不可（语义与单测见 `client/build-state.ts`）：
+   * ① `aiBusy`：本面板发出的那次请求还在飞（最直接的证据）；
+   * ② `board.aiBuildRunning`：**宿主的事实** —— 请求被浏览器/代理掐断之后它仍然为真，
+   *    而树还在被改；只看 ① 就会在那一刻把按钮恢复成空闲态，骗人；
+   * ③ `board.aiRun.phase === 'running'`：旧宿主没有 ② 时的退路（分批时两次调用之间也靠它）。
+   */
+  const generating = isAiBuildGenerating(aiBusy, board);
   /** 是否先清掉上次自动建出的草稿（默认是：阶段 B 改写阶段 A 的骨架）。 */
   /**
    * 「先清掉上次自动生成的草稿」。
@@ -1033,18 +1054,46 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   // 因此它必须定义在 `askRemove` 之后 —— 这一块整体放在文件靠下的位置。
 
 
-  /** 第一步：要成本预估（不花 token）。 */
+  /** 成功结果的统一文案（新建多少 / 更新多少 / 清掉多少 / 缓存说明 / 说明）。 */
+  const aiOkSummary = (value: {
+    created: number;
+    updated: number;
+    removed: number;
+    proposed: number;
+    failures: readonly unknown[];
+    notes: readonly string[];
+    cache?: AiCacheView;
+  }): string =>
+    `AI 建树完成：新建 ${value.created} 个、更新 ${value.updated} 个` +
+    (value.removed > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
+    `（模型提出 ${value.proposed} 个节点）` +
+    (value.failures.length > 0 ? `，失败 ${value.failures.length} 个` : '') +
+    // 走缓存时明说：否则用户会以为又花了一次钱（旧宿主不给 cache 就不提）
+    (value.cache?.state === 'hit'
+      ? `\n本次命中缓存，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
+      : value.cache?.state === 'resume'
+        ? `\n本次复用上次被中断的结果，没有调用模型。`
+        : '') +
+    (value.notes.length > 0 ? `\n说明：${value.notes.join('；')}` : '');
+
+  /** 用户点过「停止生成」之后的统一说法（不把它说成失败）。 */
+  const aiStoppedNotice =
+    '已停止生成：这一轮不再继续（已写入的节点会保留，已拿到的输出会存成续跑缓存）。';
+
   /**
-   * 第一步：**直接建树**（0.3.21，用户口径："不再做 token 预算，直接 AI 生成树和修复维护树"）。
+   * **发起一轮建树**（0.3.64 收口）。
    *
-   * 原先这里先发一次 `confirm: false` 只取估价、弹窗让用户确认花费，再发第二次才真建。
-   * 现在**一次调用直接建**，两个开关（清草稿 / 强制重算）改为常显，点击时按当前勾选取值。
-   *
-   * 注意：取消的是**花钱闸门**；`pm_remove` 那类**破坏性操作审批**仍然保留（用户明确要求）。
+   * 原先有两个几乎一样的函数（`askAiBuild` / `confirmAiBuild`）：前者是"点一次直接建"，
+   * 后者是旧宿主两段式的第二步。两者 POST 的是同一份 body，但**成功分支只有后者写了
+   * `aiResult`** —— 于是直接建树成功时弹窗在收尾那一刻直接消失，用户看不到建了多少个节点。
+   * 合成一处，成功/拒绝/报错/待确认四种结果就只有一份实现，不会再漏。
    */
-  const askAiBuild = useCallback(() => {
+  const runAiBuild = useCallback(() => {
     setAiError(undefined);
     setAiResult(undefined);
+    setAiNotice(undefined);
+    setAiPrompt(undefined);
+    stopRequested.current = false;
     setAiBusy(true);
     void postAiBuild({
       // 直接建（服务端 0.3.21 起：不传 confirm 或传 true 都表示"建"）
@@ -1054,7 +1103,28 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
     })
       .then((outcome) => {
-        if (!outcome.ok || !outcome.value) {
+        const stopped = stopRequested.current;
+        stopRequested.current = false;
+        const value = outcome.ok ? outcome.value : undefined;
+        /**
+         * **成功优先**（0.3.64）：用户可能在最后一刻点了停止，而这一轮其实已经建完 ——
+         * 那种情况必须如实报结果，不能把一次成功的建树写成"已停止"。
+         */
+        if (value?.status === 'ok') {
+          setAiResult(aiOkSummary(value));
+          refresh();
+          return;
+        }
+        /**
+         * **是不是用户自己停的**：是 ⇒ 随后的中断/报错都按"已停止"呈现，
+         * 不把一次明确的操作渲染成事故。
+         */
+        if (stopped) {
+          setAiNotice(aiStoppedNotice);
+          refresh();
+          return;
+        }
+        if (value === undefined) {
           /**
            * **连接断了不等于建树失败**（0.3.63，真机现场）。
            *
@@ -1063,14 +1133,14 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
            */
           const raw = outcome.error ?? '未知错误';
           void fetchBoard()
-            .then((board) => {
+            .then((next) => {
               const verdict = describeBuildFetchFailure({
                 error: raw,
-                ...(board.ok && board.value
+                ...(next.ok && next.value
                   ? {
                       board: {
-                        runPhase: board.value.aiRun?.phase,
-                        nodeCount: board.value.nodes.length,
+                        runPhase: next.value.aiRun?.phase,
+                        nodeCount: next.value.nodes.length,
                       },
                     }
                   : {}),
@@ -1080,71 +1150,48 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 refresh();
                 return;
               }
+              /**
+               * **宿主还说它在跑**（0.3.64）：这条只是"面板这边收不到响应"的说明 ——
+               * 说成红色错误会让人以为树坏了，转头又点一次（白花一整轮的钱）。
+               * 进度条与「停止生成」都还在，用户可以继续判断。
+               */
+              if (next.ok && next.value?.aiBuildRunning === true) {
+                setAiNotice(verdict.message);
+                return;
+              }
               setAiError(verdict.message);
             })
             .catch(() => setAiError(describeBuildFetchFailure({ error: raw }).message));
           return;
         }
-        const value = outcome.value;
-        if (value.status === 'denied') setAiError(`${value.hint}（${value.reason}）`);
-        else if (value.status === 'error') setAiError(value.message);
-        /**
-         * 旧宿主仍可能回 `needs-confirm`（它是两段式实现）⇒ 退回"弹窗让用户确认"的老路，
-         * 而不是把这条回复当成意外错误。这样面板在新旧宿主上都能用。
-         */
-        else if (value.status === 'needs-confirm') {
-          setAiPrompt({ description: value.description, route: value.route, cache: value.cache });
-        }
-      })
-      .finally(() => setAiBusy(false));
-  }, [aiForceRebuild, aiReplaceDraft, sessionId]);
-
-  /** 第二步：用户确认后真的调模型。 */
-  const confirmAiBuild = useCallback(() => {
-    setAiBusy(true);
-    setAiError(undefined);
-    void postAiBuild({
-      confirm: true,
-      replaceAutoDraft: aiReplaceDraft,
-      ...(aiForceRebuild ? { forceRebuild: true } : {}),
-      ...(sessionId !== undefined && sessionId !== '' ? { sessionId } : {}),
-    })
-      .then((outcome) => {
-        if (!outcome.ok || !outcome.value) {
-          setAiError(outcome.error ?? '未知错误');
+        if (value.status === 'denied') {
+          setAiError(`${value.hint}（${value.reason}）`);
           return;
         }
-        const value = outcome.value;
-        if (value.status === 'ok') {
-          // **不清 aiPrompt**：模态框要留着显示结果（用户口径：结果用 modal 呈现，点空白关不掉）
-          setAiResult(
-            `AI 建树完成：新建 ${value.created} 个、更新 ${value.updated} 个` +
-              (value.removed > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
-              `（模型提出 ${value.proposed} 个节点）` +
-              (value.failures.length > 0 ? `，失败 ${value.failures.length} 个` : '') +
-              // 走缓存时明说：否则用户会以为又花了一次钱（旧宿主不给 cache 就不提）
-              (value.cache?.state === 'hit'
-                ? `\n本次命中缓存，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
-                : value.cache?.state === 'resume'
-                  ? `\n本次复用上次被中断的结果，没有调用模型。`
-                  : '') +
-              (value.notes.length > 0 ? `\n说明：${value.notes.join('；')}` : ''),
-          );
-          refresh();
-          return;
-        }
-        if (value.status === 'denied') setAiError(`${value.hint}（${value.reason}）`);
-        else if (value.status === 'error') {
+        if (value.status === 'error') {
           // 一并显示模型的原始输出片段：否则"找不到 JSON"这类报错完全看不出原因（实测踩过）
           setAiError(
             value.rawText !== undefined && value.rawText.trim() !== ''
               ? `${value.message}\n模型原始输出片段：${value.rawText.slice(0, 300)}`
               : value.message,
           );
-        } else setAiError('仍在待确认状态：请重新点击。');
+          return;
+        }
+        /**
+         * 旧宿主仍可能回 `needs-confirm`（它是两段式实现）⇒ 退回"弹窗让用户确认"的老路，
+         * 而不是把这条回复当成意外错误。这样面板在新旧宿主上都能用。
+         */
+        setAiPrompt({ description: value.description, route: value.route, cache: value.cache });
       })
       .finally(() => setAiBusy(false));
   }, [aiForceRebuild, aiReplaceDraft, refresh, sessionId]);
+
+  /**
+   * 面板上那个按钮（0.3.21 起点一次就建）与旧宿主确认框的"确认"共用同一条路径 ——
+   * 两个名字都保留：UI 里那两处调用点表达的语义不同，但行为必须**只有一份**。
+   */
+  const askAiBuild = runAiBuild;
+  const confirmAiBuild = runAiBuild;
 
   /**
    * **关闭 AI 模态框**（显式动作）。
@@ -1155,25 +1202,36 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     setAiPrompt(undefined);
     setAiResult(undefined);
     setAiError(undefined);
+    setAiNotice(undefined);
   }, []);
 
   /**
-   * **中止正在跑的那次调用**（FR-168，用户口径："执行中…只能明确点取消或关闭"）。
+   * **中止正在跑的这一轮建树**（FR-168，用户口径："执行中…只能明确点取消或关闭"）。
    *
-   * 走宿主的显式取消通道（`POST /pm/ai/cancel`），**不靠"连接断了"这类推断**。
+   * 走宿主的显式取消通道（`POST /pm/ai/cancel`），**不靠"连接断了"这类推断**；
+   * 判据是宿主的 `aiBuildRunning`，所以**即使面板这边的请求已经断了**，这一下也能停住
+   * （0.3.64 真机现场：按钮看起来空闲、树还在变，用户无从下手）。
    * 已经拿到的输出会被宿主存成续跑缓存 ⇒ 下次能接着用，不白花。
    */
   const cancelAiBuild = useCallback(() => {
+    stopRequested.current = true;
+    setAiNotice('已请求停止：正在等模型侧收尾…');
     void postAiCancel()
       .then((outcome) => {
-        setAiError(
-          outcome.ok && outcome.value?.cancelled === true
-            ? '已请求中止这次调用：正在等模型侧收尾，已拿到的输出会存成续跑缓存。'
-            : '没有正在跑的调用（可能刚结束）。',
-        );
+        if (outcome.ok && outcome.value?.cancelled === true) {
+          setAiNotice('已请求停止这次调用：正在等模型侧收尾，已拿到的输出会存成续跑缓存。');
+          return;
+        }
+        /** 宿主说没有在跑：把"点了没反应"如实说清楚，而不是假装停住了。 */
+        stopRequested.current = false;
+        setAiNotice('没有正在跑的调用（可能刚结束）。');
+        refresh();
       })
-      .catch(() => setAiError('取消请求发送失败（宿主路由不可用）。'));
-  }, []);
+      .catch(() => {
+        stopRequested.current = false;
+        setAiError('停止请求发送失败（宿主路由不可用）。');
+      });
+  }, [refresh]);
 
   /**
    * 选中节点 / **取消选中**（`nodeId === undefined`，由画布"点空白处"触发）。
@@ -1953,11 +2011,15 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             type: 'button',
             style: styles.headerButton,
             onClick: askAiBuild,
-            disabled: aiBusy,
-            title: '让模型读目录骨架与关键文件签名，生成功能点/任务点，并同批给出相对工作量与完成度初判',
+            disabled: generating,
+            title:
+              '让模型读目录骨架与关键文件签名，生成功能点/任务点，并同批给出相对工作量与完成度初判' +
+              '（生成期间可点弹窗里的「停止生成」中途停住）',
           },
           // 0.3.21：不再先估成本（用户口径："不再做 token 预算，直接 AI 生成树"）
-          aiBusy ? '正在生成树…' : '用 AI 建树（直接生成）',
+          // 0.3.64：判据换成 `generating` —— 宿主机在跑时也必须显示"正在生成"，
+          // 否则请求被掐断后按钮回到空闲态、树却还在变（真机现场）。
+          generating ? '正在生成树…' : '用 AI 建树（直接生成）',
         ),
         React.createElement(
           'span',
@@ -2058,7 +2120,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       // 内容展示部分（白框），用 modal 吧，执行中不可点击空白取消，只能明确点取消或关闭"）。
       // 原来内联在标题区：① 内容一长就把画布挤下去；② 点空白会连带触发画布"取消选中"，
       // 让人以为弹窗被关掉了 —— 而模型调用其实还在跑。
-      aiPrompt !== undefined || aiResult !== undefined || aiError !== undefined
+      aiPrompt !== undefined || aiResult !== undefined || aiError !== undefined || aiNotice !== undefined || generating
         ? React.createElement(
             'div',
             {
@@ -2066,9 +2128,18 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               role: 'presentation',
               'data-pm-ai-modal': '1',
               /**
+               * **正在生成时弹窗必须自己出现**（0.3.64，用户反馈："生成树时没有停止功能"）。
+               *
+               * 真根因：0.3.21 起"点一次直接建"不再先回 `needs-confirm`，于是生成期间
+               * `aiPrompt` / `aiResult` / `aiError` 三个条件**全为假** ⇒ 整个模态框不渲染 ⇒
+               * 里面那个「停止」按钮自然也不存在，用户眼前只剩一个变灰的按钮。
+               * 现在把 `generating` 也算进渲染条件：生成中一定有进度条 + 停止入口。
+               */
+              'data-pm-ai-busy': generating ? '1' : '0',
+              /**
                * 点遮罩的处置：**执行中一律不关**（`modal-dismiss.ts` 里那条规则的唯一落点）。
                * 执行中关掉没有好处 —— 调用还在跑、token 还在烧，却看不到进度与结果；
-               * 要停就点明确的「取消并中止这次调用」。
+               * 要停就点明确的「停止生成」。
                *
                * **必须判 `event.target === event.currentTarget`**：遮罩是卡片的父元素，
                * 事件会冒泡上来 —— 少了这一判，点卡片里的随便哪里（比如那两个勾选框）
@@ -2077,7 +2148,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                */
               onMouseDown: (event: React.MouseEvent) => {
                 if (event.target !== event.currentTarget) return;
-                if (dismissibleByBackdrop(aiBusy)) closeAiModal();
+                if (dismissibleByBackdrop(generating)) closeAiModal();
               },
             },
             React.createElement(
@@ -2092,14 +2163,47 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
               React.createElement(
                 'div',
                 { style: { fontWeight: 600, marginBottom: 4 } },
-                // 缓存命中时标题就该改口：这不是"花 token"，而是"零 token 复用"。
-                // 旧宿主不给 cache（undefined）→ 按"要花钱"的措辞，宁可保守也不能骗人。
-                aiPrompt?.cache?.state === 'hit' || aiPrompt?.cache?.state === 'resume'
-                  ? '可以直接复用上次结果（不花钱）'
-                  : aiPrompt !== undefined
-                    ? '确认花费 token 建树？'
-                    : 'AI 建树结果',
+                /**
+                 * **生成中优先说"正在生成"**（0.3.64）：原先标题只看 `aiPrompt`，
+                 * 于是生成期间（`aiPrompt` 已清空）会显示"AI 建树结果"这种完成态措辞 ——
+                 * 而这时树还在长。标题是用户第一眼看到的东西，不能倒着说。
+                 */
+                generating
+                  ? aiBusy
+                    ? '正在生成树…'
+                    : '正在生成树…（宿主侧仍在跑）'
+                  : // 缓存命中时标题就该改口：这不是"花 token"，而是"零 token 复用"。
+                    // 旧宿主不给 cache（undefined）→ 按"要花钱"的措辞，宁可保守也不能骗人。
+                    aiPrompt?.cache?.state === 'hit' || aiPrompt?.cache?.state === 'resume'
+                    ? '可以直接复用上次结果（不花钱）'
+                    : aiPrompt !== undefined
+                      ? '确认花费 token 建树？'
+                      : 'AI 建树结果',
               ),
+            /**
+             * **生成中要说清"进度来自谁"**（0.3.64，用户原话："看着生成按钮没变化，
+             * 树却在变化，不知道是不是这次对话引起的"）：
+             * - `aiBusy` 为真 ⇒ 本面板那次请求还在飞，进度就是它；
+             * - 为假而 `generating` 为真 ⇒ **面板这边的请求已经断了，但宿主还在改树** ——
+             *   必须明说，否则用户会以为"点了没反应"/"别处有人乱动"。
+             */
+            generating
+              ? React.createElement(
+                  'div',
+                  { style: { ...styles.note, marginTop: 4 }, 'data-pm-ai-generating': '1' },
+                  aiBusy
+                    ? '已发出建树请求：下面的进度来自宿主，点「停止生成」可以中途停住（已写入的节点会保留）。'
+                    : '面板这边的建树请求已经结束/断开，但**宿主侧这一轮还在跑** —— 树还会继续变化。' +
+                      '进度来自宿主轮询；要停就点下面的「停止生成」。',
+                )
+              : null,
+            generating && board?.aiRun == null
+              ? React.createElement(
+                  'div',
+                  { style: { ...styles.note, marginTop: 2 } },
+                  '正在准备：扫描目录骨架 / 组织提示词（这一步还没有模型输出）。',
+                )
+              : null,
             aiPrompt !== undefined ? React.createElement('div', { style: styles.note }, aiPrompt.description) : null,
             aiPrompt !== undefined
               ? React.createElement(
@@ -2142,7 +2246,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                     // **执行中禁用**（用户实测反馈："生成中 checkbox 可操作"）：
                     // 勾选项只影响"发出去的那一次请求"，跑到一半再改它没有任何作用，
                     // 却让人以为改动生效了 —— 禁用比"改了没用"诚实。
-                    disabled: aiBusy,
+                    // 0.3.64：判据用 `generating`，宿主机在跑时同样不该让人改。
+                    disabled: generating,
                     onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
                       setAiReplaceDraft(event.target.checked),
                   }),
@@ -2161,7 +2266,7 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                   React.createElement('input', {
                     type: 'checkbox',
                     checked: aiForceRebuild,
-                    disabled: aiBusy, // 同上：跑起来之后再改这个勾没有意义
+                    disabled: generating, // 同上：跑起来之后再改这个勾没有意义
                     onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
                       setAiForceRebuild(event.target.checked),
                   }),
@@ -2203,6 +2308,29 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                   ),
                 )
               : null,
+            /**
+             * **中性提示**（0.3.64）：已请求停止 / 面板请求断了但宿主还在跑 这类事实。
+             * 不复用红框（`aiError`）也不复用白框（`aiResult`）：
+             * 前者会把"树还在正常长"说成事故，后者会让人以为一切都结束了。
+             */
+            aiNotice !== undefined
+              ? React.createElement(
+                  'div',
+                  {
+                    style: {
+                      ...styles.note,
+                      marginTop: 8,
+                      padding: '6px 10px',
+                      borderRadius: 4,
+                      background: 'rgba(59,130,246,0.12)',
+                      border: '0.5px solid rgba(59,130,246,0.5)',
+                      whiteSpace: 'pre-line' as const,
+                    },
+                    'data-pm-ai-notice': '1',
+                  },
+                  aiNotice,
+                )
+              : null,
             // 结果（白框）：模态框里给**固定高度 + 滚动**（用户实测："生成后的文字溢出 modal，没有滚动"）
             aiResult !== undefined
               ? React.createElement(
@@ -2228,49 +2356,52 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                * 0.3.21：**点一次就直接建树**，所以"跑起来之后"不该再摆一个"确认并开始建树"按钮 ——
                * 那会让人以为还需要再点一次。只在**旧宿主回了 `needs-confirm`**（它是两段式的）
                * 且**当前不在跑**时，才给出那个确认按钮，让新旧宿主都能用。
+               *
+               * 0.3.64：**生成中第一个按钮必须是「停止生成」**，判据是 `generating`
+               * （宿主事实），而不是本面板那次请求的 `aiBusy` —— 请求断了以后照样要能停。
                */
-              aiResult !== undefined
-                ? // 已有结果：这一个按钮就够了（点空白关不掉，只能显式关）
-                  React.createElement(
+              generating
+                ? React.createElement(
                     'button',
-                    { type: 'button', style: styles.headerButton, onClick: closeAiModal },
-                    '关闭',
+                    {
+                      key: 'stop-run',
+                      type: 'button',
+                      style: styles.headerButton,
+                      onClick: cancelAiBuild,
+                      title: '中止这一轮建树（分批时剩下的分片不再发起；已写入的节点会保留）',
+                      'data-pm-ai-cancel': '1',
+                    },
+                    '停止生成',
                   )
-                : [
-                    /**
-                     * 只有"旧宿主两段式、且不在跑"时才显示这个确认按钮（新宿主点一次就建完了）。
-                     */
-                    !aiBusy && aiPrompt !== undefined
-                      ? React.createElement(
-                          'button',
-                          {
-                            key: 'confirm',
-                            type: 'button',
-                            style: styles.headerButton,
-                            onClick: confirmAiBuild,
-                          },
-                          '确认并开始建树',
-                        )
-                      : null,
-                    // 执行中：**只有这个显式按钮能停**（点空白不会关，见上面 backdrop 的 onMouseDown）
-                    aiBusy
-                      ? React.createElement(
-                          'button',
-                          {
-                            key: 'cancel-run',
-                            type: 'button',
-                            style: styles.headerButton,
-                            onClick: cancelAiBuild,
-                            'data-pm-ai-cancel': '1',
-                          },
-                          '取消并中止这次调用',
-                        )
-                      : React.createElement(
-                          'button',
-                          { key: 'cancel', type: 'button', style: styles.headerButton, onClick: closeAiModal },
-                          '关闭',
-                        ),
-                  ],
+                : aiResult !== undefined
+                  ? // 已有结果：这一个按钮就够了（点空白关不掉，只能显式关）
+                    React.createElement(
+                      'button',
+                      { type: 'button', style: styles.headerButton, onClick: closeAiModal },
+                      '关闭',
+                    )
+                  : [
+                      /**
+                       * 只有"旧宿主两段式、且不在跑"时才显示这个确认按钮（新宿主点一次就建完了）。
+                       */
+                      !generating && aiPrompt !== undefined
+                        ? React.createElement(
+                            'button',
+                            {
+                              key: 'confirm',
+                              type: 'button',
+                              style: styles.headerButton,
+                              onClick: confirmAiBuild,
+                            },
+                            '确认并开始建树',
+                          )
+                        : null,
+                      React.createElement(
+                        'button',
+                        { key: 'cancel', type: 'button', style: styles.headerButton, onClick: closeAiModal },
+                        '关闭',
+                      ),
+                    ],
             ),
             ),  // 卡片（模态正文）闭合
           )
