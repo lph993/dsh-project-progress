@@ -7116,6 +7116,23 @@ export class ProjectService {
     | { status: 'ok'; shards: number; result: AiBuildTreeOk }
     | { status: 'fail'; shards: number; message: string }
   > {
+    /**
+     * **分段计时**（0.3.63，真机诊断驱动）。
+     *
+     * 现场：一次分批建树的 HTTP 请求挂了 **11 分 36 秒**，而日志里
+     * 01:06:01（分片跑完 + 根归位）→ 01:14:54（汇总）之间**一条都没有** ——
+     * 用户看到 `Failed to fetch`，我们却说不清那 9 分钟花在哪。
+     *
+     * 所以每段都记耗时，收尾打一条总账。**慢必须先看得见，才谈得上修。**
+     */
+    const t0 = Date.now();
+    let cursor = t0;
+    const marks: string[] = [];
+    const mark = (stage: string): void => {
+      const now = Date.now();
+      marks.push(`${stage} ${((now - cursor) / 1000).toFixed(1)}s`);
+      cursor = now;
+    };
     const source = (input.entries ?? []).length > 0 ? (input.entries as typeof input.skeleton) : input.skeleton;
     const shards = shardSkeleton(source);
     if (shards.length <= 1) {
@@ -7322,6 +7339,7 @@ export class ProjectService {
       };
     }
 
+    mark('分片调用+落库');
     notes.push(`分批结果：成功 ${okShards}/${shards.length} 片；没成功的片已如实写进 failures。`);
     /**
      * **整轮收口**（0.3.61）：清草稿 + 标 stale 都**推迟到这里**做一次。
@@ -7365,6 +7383,7 @@ export class ProjectService {
      * 所以归位必须在**全部片落库之后**做一次 —— 放在片循环里做会把"某一片的局部根"当成根。
      */
     const shardedNormalized = await this.normalizeProjectRoot(input.sessionId, input.root);
+    mark('根归位');
     if (shardedNormalized.moved > 0) notes.push(`根节点归位：${shardedNormalized.reason}`);
     /**
      * **覆盖回填**（0.3.53）：提示词只能"希望"模型别漏目录，这里用程序保证补上。
@@ -7378,6 +7397,7 @@ export class ProjectService {
       /** 落点核对要拿**本次仓库**做基准（0.3.62）：传 `boundRoot` 等于自己校验自己。 */
       ...(input.root !== undefined ? { expectRoot: input.root } : {}),
     });
+    mark('覆盖回填');
     if (backfilled.status === 'ok') {
       notes.push(`覆盖回填：${backfilled.reason}`);
       calls += 1;
@@ -7402,6 +7422,7 @@ export class ProjectService {
       /** 落点核对（0.3.57）：归拢搬分支走 addNode/reparentNode，不核对就会漂到别的仓库。 */
       ...(input.root !== undefined ? { expectRoot: input.root } : {}),
     });
+    mark('按功能归拢');
     if (regrouped.status === 'ok' && regrouped.createdGroups > 0) {
       notes.push(`按功能归拢：${regrouped.reason}`);
       calls += 1;
@@ -7415,6 +7436,15 @@ export class ProjectService {
      * （0.3.53 我把它夹在回填与归拢之间，报出来的就是"归拢之前"的形状。）
      */
     const shardedHealth = await this.treeHealthSummary(input.sessionId);
+    mark('树体检');
+    /**
+     * 总账：一行看清"这十几分钟花在哪"（0.3.63）。
+     * 这一条让"慢"变成可观测事实，而不是用户看到 Failed to fetch 之后我们一起猜。
+     */
+    debugBus.info(
+      'ai',
+      '分片总耗时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's：' + marks.join(' / '),
+    );
     if (shardedHealth !== undefined) notes.push(shardedHealth);
     notes.push(
       '分批路径**不写整份树缓存**（没有"一份提示词对应一棵树"的产物），所以下次会重新调用模型 —— ' +

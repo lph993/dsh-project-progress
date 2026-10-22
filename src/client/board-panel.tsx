@@ -8,6 +8,7 @@
  * 面板不持有权威状态，只做呈现（§12.4：事实源在宿主）。
  */
 
+import { describeBuildFetchFailure } from './build-failure.ts';
 import * as React from 'react';
 
 import {
@@ -1054,7 +1055,34 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     })
       .then((outcome) => {
         if (!outcome.ok || !outcome.value) {
-          setAiError(outcome.error ?? '未知错误');
+          /**
+           * **连接断了不等于建树失败**（0.3.63，真机现场）。
+           *
+           * 判定收在纯函数 `describeBuildFetchFailure` 里（另一端有单测），
+           * 这里只负责"拿事实 → 按结论呈现"。
+           */
+          const raw = outcome.error ?? '未知错误';
+          void fetchBoard()
+            .then((board) => {
+              const verdict = describeBuildFetchFailure({
+                error: raw,
+                ...(board.ok && board.value
+                  ? {
+                      board: {
+                        runPhase: board.value.aiRun?.phase,
+                        nodeCount: board.value.nodes.length,
+                      },
+                    }
+                  : {}),
+              });
+              if (verdict.kind === 'completed') {
+                setAiResult(verdict.message);
+                refresh();
+                return;
+              }
+              setAiError(verdict.message);
+            })
+            .catch(() => setAiError(describeBuildFetchFailure({ error: raw }).message));
           return;
         }
         const value = outcome.value;
