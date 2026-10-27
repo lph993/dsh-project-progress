@@ -66,6 +66,12 @@ aiPrompt !== undefined || aiResult !== undefined || aiError !== undefined
 - `tests/e2e/concurrent-build.test.ts` 新增 1 条：**建树期间 `board().aiBuildRunning === true`，
   结束后回到 false**；`tests/e2e/plugin-smoke.test.ts` 的 FR-167/168 用例里各补一条同口径断言。
 - 全套 **727/727** 通过（`node --test "tests/**/*.test.ts"`）。
+- **渲染自检的 3 条"假红"一并修掉**（这是编辑这台机器上本来就红的，与本次功能无关）：
+  用例里的 `updatedAt` 写死成 `'2026-09-23T00:00:00Z'`，而旧宿主兜底判据的
+  `LIVE_FRESH_WINDOW_MS` 只有 **10 分钟** —— 日期每过一天就更不新鲜一点，最后**永远不可能通过**。
+  改成相对时间（"昨天" = 真的昨天），并补一条**生产路径**的断言：
+  宿主报了 `activeNodeIds` 就该转圈，**不靠时间戳猜**。
+  `pnpm run render-check` 现已全绿。
 
 ### 四、⚠️ 需要你做两件事
 

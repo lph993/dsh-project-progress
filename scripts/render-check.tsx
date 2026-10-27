@@ -51,7 +51,15 @@ function fakeBoard(): BoardSnapshot {
     unfinishedLeafCount: 1,
     blockedBy: [],
     revision: 1,
-    updatedAt: '2026-09-23T00:00:00Z',
+    /**
+     * **「昨天」必须是相对时间，不能写死**（0.3.65 修的假红）。
+     *
+     * 原先这里是 `'2026-09-23T00:00:00Z'`，而 `isLiveNode` 的旧宿主兜底判据里
+     * `LIVE_FRESH_WINDOW_MS` 只有 **10 分钟** —— 写死的日期每过一天就更"不新鲜"一点，
+     * 到 2026-10-22 时那条"会话在忙 ⇒ 转圈"的断言已经**永远不可能通过**。
+     * 用相对时间，"昨天"才真的等于"昨天"，这组自检不会随时间腐烂。
+     */
+    updatedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
     updatedBy: 'user',
     addedMidway: false,
     subscriptionCount: 0,
@@ -286,7 +294,19 @@ check('FlowCanvas（待审查 → 「审」角标；未标记 → 不出现）',
 check('FlowCanvas（会话在忙 + 节点还是 pending → 转圈）', () => {
   const busy = 'session-busy';
   const nodes = board.nodes.map((n) =>
-    n.id === 'a1' ? { ...n, derivedState: 'pending', lastSessionId: busy } : n,
+    n.id === 'a1'
+      ? {
+          ...n,
+          derivedState: 'pending',
+          lastSessionId: busy,
+          /**
+           * **旧宿主的兜底判据里"刚被写过"是硬条件**（`LIVE_FRESH_WINDOW_MS` = 10 分钟）：
+           * 这条用例钉的正是"没有 `activeNodeIds` 时只能靠会话 + 新鲜度"那条路，
+           * 所以时间戳必须是**现在**（写死的日期会随时间腐烂，见 `fakeBoard` 的说明）。
+           */
+          updatedAt: new Date().toISOString(),
+        }
+      : n,
   );
   const svg = renderToStaticMarkup(
     React.createElement(FlowCanvas, { nodes, onSelect: () => {}, busySessionIds: [busy] }),
@@ -318,12 +338,49 @@ check('FlowCanvas（已完成 + 会话在忙 → 不转圈）', () => {
  */
 check('FlowCanvas（该节点所属会话正在忙 → 转圈）', () => {
   const busy = 'session-busy';
-  const nodes = board.nodes.map((n) => (n.id === 'a1' ? { ...n, derivedState: 'running', lastSessionId: busy } : n));
+  const nodes = board.nodes.map((n) =>
+    n.id === 'a1'
+      ? {
+          ...n,
+          derivedState: 'running',
+          lastSessionId: busy,
+          // 同上：旧宿主兜底路径要求"刚被写过"（写死日期会随时间腐烂）
+          updatedAt: new Date().toISOString(),
+        }
+      : n,
+  );
   const svg = renderToStaticMarkup(
     React.createElement(FlowCanvas, { nodes, onSelect: () => {}, busySessionIds: [busy] }),
   );
   if (!svg.includes('animateTransform')) throw new Error('会话在忙却没有转圈（是不是还画着播放三角？）');
   if (svg.includes('M -1.4 -5 L 4.6 0')) throw new Error('会话在忙却仍画了播放三角（两个图标必须互斥）');
+  return svg;
+});
+
+/**
+ * **宿主报了 `activeNodeIds` ⇒ 只信事实**（生产路径，0.3.11 定稿）。
+ *
+ * 新宿主每次都报这个字段（哪怕空数组），而面板**首选**它、不再拿时间戳猜。
+ * 这里刻意把 `updatedAt` 留在"昨天"：**事实压过时间戳** —— 清单里有它就转，
+ * 哪怕节点已经一天没被写过（长回合里"工具是收尾才补记"正是这个形状）。
+ *
+ * 这组自检原先只覆盖了旧宿主兜底路径，生产路径反而没有断言；补上。
+ */
+check('FlowCanvas（宿主报 activeNodeIds → 转圈，且不靠时间戳）', () => {
+  const nodes = board.nodes.map((n) =>
+    n.id === 'a1' ? { ...n, derivedState: 'pending', lastSessionId: undefined } : n,
+  );
+  const svg = renderToStaticMarkup(
+    React.createElement(FlowCanvas, {
+      nodes,
+      onSelect: () => {},
+      /** 宿主说"这轮真的动了 a1"；`lastSessionId` 故意留空，证明不是靠它猜的。 */
+      activeNodeIds: ['a1'],
+    }),
+  );
+  if (!svg.includes('animateTransform')) {
+    throw new Error('宿主报了 activeNodeIds 却没转圈（生产路径：不能等时间戳）');
+  }
   return svg;
 });
 
@@ -580,6 +637,8 @@ check('RightProgressView（子项目 tabs：多根时切换、只展示当前子
      * 好查看正在操作的节点部分剩余工作"。
      */
     lastSessionId: 'session-live',
+    /** 同上：旧宿主兜底判据要求"刚被写过"，写死日期会随时间腐烂。 */
+    updatedAt: new Date().toISOString(),
     unfinishedLeafCount: 7,
   };
   const multi = { ...board, nodes: [...board.nodes, second], busySessionIds: ['session-live'] };
