@@ -168,50 +168,32 @@ describe('宿主明说"这轮动过它" ⇒ 就转圈（0.3.11：修"该转的�
     assert.equal(isLiveNode({ id: 'n1', lastSessionId: 's1' }, [], undefined, NOW), false);
     assert.equal(isLiveNode({ id: 'n1', lastSessionId: 's1' }, ['s1'], undefined, NOW), false);
   });
-});
-
-describe('进行中的任务：所属会话在跑就该转圈（0.3.65，用户："正在进行中的任务没有 loading"）', () => {
-  /**
-   * 现场：`pm_*` 只在**收尾**才写节点，所以一个长回合里 `activeNodeIds` 是空的；
-   * 而图上那条任务明明标着「进行中」、干它的会话也正在跑，却只显示 ▶。
-   *
-   * 判据加一条（**两个条件同时成立**）：`derivedState === 'running'` ∧ 所属会话在忙。
-   * 不是"有人在忙就全转"——那会把 0.3.9 的坑重新踩回来。
-   */
-  it('running + 所属会话在忙 + 时间戳很旧 ⇒ 转圈（宿主报空 activeNodeIds 也算）', () => {
+  it('节点标着「进行中」、它的会话也忙，但这一轮没写过它 ⇒ **不转**（0.3.65 假 loading 的回归）', () => {
+    /**
+     * 真机现场（而且是我自己刚改坏的）：
+     *
+     * ```
+     * 节点「节点↔云端国密迁移（TLCP）」 derivedState: running   updatedAt: 3 周前
+     * 它的会话正在跑（在改 updater-rust 的 pkgbuild.rs）
+     * activeNodeIds: []      ← 这一轮一个节点都没写过
+     * ```
+     *
+     * 0.3.65 我按"running + 会话在忙"补了一条，结果**唯一的效果**是给这条 3 周前、
+     * 与当前工作毫不相干的节点转圈 —— 用户："节点没看到有新增或者改动，就在那 loading"。
+     *
+     * 根因：本回合写过的节点早就在 `activeNodeIds` 里了，所以"running + 会话在忙"
+     * 能捞到的**只可能是陈旧节点**。这条断言把它钉死：判据不看 `derivedState`。
+     */
+    const runningButStale = {
+      id: 'n1',
+      derivedState: 'running',
+      lastSessionId: 's1',
+      updatedAt: hostStamp(NOW - 21 * 24 * 60 * 60 * 1000),
+    };
     assert.equal(
-      isLiveNode({ id: 'n1', derivedState: 'running', lastSessionId: 's1', updatedAt: stale }, ['s1'], [], NOW),
-      true,
-      '宿主说"这轮没写它"不等于"这条任务没在进行"',
-    );
-    assert.equal(
-      isLiveNode({ id: 'n1', derivedState: 'running', lastSessionId: 's1', updatedAt: stale }, ['s1'], undefined, NOW),
-      true,
-      '旧宿主（不报 activeNodeIds）同样成立',
-    );
-  });
-
-  it('只是待开始 / 已完成 ⇒ 即便会话在忙也不转（不回到"全在转"）', () => {
-    assert.equal(
-      isLiveNode({ id: 'n2', derivedState: 'pending', lastSessionId: 's1', updatedAt: stale }, ['s1'], [], NOW),
+      isLiveNode(runningButStale, ['s1'], [], NOW),
       false,
-    );
-    assert.equal(
-      isLiveNode({ id: 'n3', derivedState: 'done', lastSessionId: 's1', updatedAt: stale }, ['s1'], [], NOW),
-      false,
-    );
-  });
-
-  it('running 但所属会话不忙（或不知道归谁）⇒ 不转，照旧显示 ▶', () => {
-    assert.equal(
-      isLiveNode({ id: 'n1', derivedState: 'running', lastSessionId: 's1', updatedAt: fresh }, ['s2'], [], NOW),
-      false,
-      '别的会话在忙与它无关',
-    );
-    assert.equal(
-      isLiveNode({ id: 'n1', derivedState: 'running', updatedAt: fresh }, ['s1'], [], NOW),
-      false,
-      '没有归属会话 ⇒ 不猜是谁在跑',
+      '宿主报了空清单 ⇒ 这一轮没动它，标着进行中也不许转',
     );
   });
 });
