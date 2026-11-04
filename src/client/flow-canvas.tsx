@@ -225,6 +225,13 @@ export interface FlowCanvasProps {
    */
   lastTurnNodeIds?: readonly string[] | undefined;
   /**
+   * **代码文件刚被改过的节点**（0.3.68；见 `board.hotNodeIds`）。
+   *
+   * 比"会话在忙"更硬：它说的是"**这个节点的 refs 里有文件刚才在变**"，
+   * 覆盖"改了代码、但还没写节点"的长回合。
+   */
+  hotNodeIds?: readonly string[] | undefined;
+  /**
    * **拖拽改父**（用户诉求："移到…/拖拽改父"）：把 `nodeId` 挂到 `newParentId` 下。
    *
    * 不提供时画布不做任何节点拖拽（退回"按在节点上也能平移"的老行为）。
@@ -630,7 +637,7 @@ function subtreeIdsOf(nodes: readonly NodeView[], rootId: string): Set<string> {
 }
 
 export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
-  const { nodes, selectedId, onSelect, busySessionIds, activeNodeIds, lastTurnNodeIds } = props;
+  const { nodes, selectedId, onSelect, busySessionIds, activeNodeIds, lastTurnNodeIds, hotNodeIds } = props;
   // 折叠状态按项目持久化：键变了（切换工作区）就换成那一棵树的折叠集合
   const [collapseKey, setCollapseKey] = useState(() => collapseStorageKey(props.projectId));
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => readCollapsed(collapseKey));
@@ -950,7 +957,11 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
    * 而 `derivedState` 不会因会话停下而回落 ⇒ "已启动但没人跑"的节点画着 ▶、线却在流动，
    * 两边自相矛盾（用户口径："播放三角的连线不应该流动"）。
    */
-  const liveNodeIds = liveNodeIdsOf(nodes, { busySessionIds, activeNodeIds }, isLiveNode);
+  const liveNodeIds = liveNodeIdsOf(
+    nodes,
+    { busySessionIds, activeNodeIds, hotNodeIds },
+    isLiveNode,
+  );
 
   /**
    * **把"判据说该转圈的节点"暴露到 DOM**（0.3.20，为审查/排查服务）。
@@ -965,6 +976,7 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
     'data-pm-live-ids': [...liveNodeIds].join(','),
     'data-pm-lastturn-ids': (props.lastTurnNodeIds ?? []).join(','),
     'data-pm-busy-count': String((busySessionIds ?? []).length),
+    'data-pm-hot-ids': (hotNodeIds ?? []).join(','),
     style: { display: 'none' },
   });
 
@@ -1592,6 +1604,8 @@ export function FlowCanvas(props: FlowCanvasProps): React.ReactElement {
               /* 宿主报的"这轮动过哪些节点"（undefined = 旧宿主 ⇒ 走窗口兜底，不能压成 []） */
               activeNodeIds={activeNodeIds}
               lastTurnNodeIds={lastTurnNodeIds}
+              /* 代码文件刚被改过的节点（0.3.68）：比"会话在忙"更硬，直接画转圈 */
+              hotNodeIds={hotNodeIds}
               onOpenMenu={openMenu}
               onToggleFold={(shiftKey: boolean) => toggleFold(placed.node.id, shiftKey)}
               onHover={showHover}
@@ -2209,6 +2223,8 @@ interface FlowNodeProps {
   activeNodeIds?: readonly string[] | undefined;
   /** 宿主报的"上一轮动过的节点"（0.3.17；虚线圈标记，不转圈、不参与连线流动）。 */
   lastTurnNodeIds?: readonly string[] | undefined;
+  /** 代码文件刚被改过的节点（0.3.68；最硬的"正在改"证据）。 */
+  hotNodeIds?: readonly string[] | undefined;
   /** 右键 → 面板菜单（未提供时不响应右键）。 */
   onOpenMenu: (node: NodeView, event: React.MouseEvent<SVGGElement>) => void;
   /** 折叠/展开（`shiftKey` = 逐层折 / 全展开）。 */
@@ -2302,7 +2318,13 @@ function FlowNode(props: FlowNodeProps): React.ReactElement {
    * （用户当场反馈："你现在在跑，项目进度流程图里我没看到一个 loading"）。
    * 现在改成"**有人在动它**就转圈"：`live && 未完成`，与它自己的 `derivedState` 无关。
    */
-  const live = isLiveNode(node, props.busySessionIds ?? [], props.activeNodeIds);
+  const live = isLiveNode(
+    node,
+    props.busySessionIds ?? [],
+    props.activeNodeIds,
+    undefined,
+    props.hotNodeIds,
+  );
   const running = node.derivedState === 'running';
   const finished = node.derivedState === 'done' || node.derivedState === 'removed';
   const showSpinner = live && !finished;

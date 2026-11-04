@@ -191,12 +191,13 @@ export function RightProgressView(props: RightProgressViewProps): React.ReactEle
    * `busySessionIds` 退成兜底 —— 两处口径必须一致，否则会出现"画布转圈但 tab 不亮"。
    */
   const liveRootIds = (() => {
-    // 两个字段的语义差异（undefined ≠ []）只在 board-liveness.ts 里解释一次，别在这里重写
-    const { busySessionIds: busy, activeNodeIds: active } = livenessArgsOf(board);
+    // 三个字段的语义差异（undefined ≠ []）只在 board-liveness.ts 里解释一次，别在这里重写
+    const { busySessionIds: busy, activeNodeIds: active, hotNodeIds: hot } = livenessArgsOf(board);
     const live = new Set<string>();
     const rootIds = new Set(roots.map((root) => root.id));
     for (const node of board.nodes) {
-      if (!isLiveNode(node, busy, active)) continue;
+      // 与画布同一个判据：写入事实 + 代码文件刚被改过（0.3.68）
+      if (!isLiveNode(node, busy, active, undefined, hot)) continue;
       // 沿 parentId 往上找它属于哪个子项目
       let cursor: NodeView | undefined = node;
       const seen = new Set<string>();

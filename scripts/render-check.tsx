@@ -415,6 +415,52 @@ check('FlowCanvas（进行中 + 会话在忙，但这一轮没写过它 → 不�
 });
 
 /**
+ * **refs 里的文件刚被改过 ⇒ 转圈**（0.3.68）。
+ *
+ * 用户现场：会话在 updater 工作区改 `pkgbuild.rs`，这一轮一个节点都没写
+ * （`activeNodeIds = []`）—— 旧判据下图上什么都没有。而"它覆盖的文件刚才在变"
+ * 是节点自己的事实（宿主按 `git status` + mtime 映射成 `hotNodeIds`）。
+ */
+check('FlowCanvas（refs 里的文件刚被改 → 转圈，哪怕这一轮没写过节点）', () => {
+  const nodes = board.nodes.map((n) => (n.id === 'a1' ? { ...n, derivedState: 'running' } : n));
+  const svg = renderToStaticMarkup(
+    React.createElement(FlowCanvas, {
+      nodes,
+      onSelect: () => {},
+      busySessionIds: ['session-busy'],
+      activeNodeIds: [],
+      hotNodeIds: ['a1'],
+    }),
+  );
+  if (!svg.includes('animateTransform')) {
+    throw new Error('节点的文件在变却没转圈（0.3.68 要修的正是这个）');
+  }
+  return svg;
+});
+
+/**
+ * **但 hot 里的不是它 ⇒ 不许转**（判据必须按 id 对，不许因为"有 hot 字段"就整片亮）。
+ *
+ * 用一个树里不存在的 id：如果实现写成"有 hotNodeIds 就都转"，这条会立刻红。
+ */
+check('FlowCanvas（hot 里是别的节点 → 这个不转）', () => {
+  const nodes = board.nodes.map((n) => (n.id === 'a1' ? { ...n, derivedState: 'running' } : n));
+  const svg = renderToStaticMarkup(
+    React.createElement(FlowCanvas, {
+      nodes,
+      onSelect: () => {},
+      busySessionIds: ['session-busy'],
+      activeNodeIds: [],
+      hotNodeIds: ['node-not-in-this-tree'],
+    }),
+  );
+  if (svg.includes('animateTransform')) {
+    throw new Error('hot 里没有它，却转了（"有 hotNodeIds 就整片亮"的误报）');
+  }
+  return svg;
+});
+
+/**
  * **别的会话在忙 ⇒ 这个节点不转圈**（真机事故的防复发）。
  *
  * 现场证据：那 5 个 `running` 节点 `lastSessionId` 全空、`updatedAt` 是几小时前，

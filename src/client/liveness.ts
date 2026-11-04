@@ -24,13 +24,15 @@
  * 而干活的顺序是"读代码、改代码 → **收尾时**才补记节点"，所以干活途中时间戳本来就是旧的。
  * 真机两个方向都踩过：窗口宽了把 32 小时前写过的 65 个节点转起来、紧了把正在干的掐成 0 个。
  *
- * ## 当前结论：宿主报**事实**，客户端不猜（两条互斥路径）
+ * ## 当前结论：宿主报**事实**，客户端不猜（三条证据）
  *
  * ```
- * 宿主报了 activeNodeIds（哪怕空数组）：
- *     它在清单里 → 转；不在 → **不转**（宿主说没动它，就别拿时间戳去推翻）
- * 宿主没报（旧宿主）：
- *     该节点 lastSessionId 正在忙 ∧ updatedAt 在窗口内 → 转；否则不转
+ * ① 它的 refs 里有文件刚被改过（hotNodeIds，0.3.68） → 转
+ *    最硬的证据：不是"会话在忙"，而是"这个节点的文件刚才在变"
+ * ② 宿主报了 activeNodeIds（哪怕空数组）：
+ *      它在清单里 → 转；不在 → **不转**（宿主说没动它，就别拿时间戳去推翻）
+ * ③ 宿主没报（旧宿主）：
+ *      该节点 lastSessionId 正在忙 ∧ updatedAt 在窗口内 → 转；否则不转
  * ```
  *
  * `activeNodeIds` 由宿主在**写路径的唯一收口**（`patchNode`）记账，与 `busySessionIds`
@@ -170,7 +172,23 @@ export function isLiveNode(
    */
   activeNodeIds: readonly string[] | undefined,
   now: number = Date.now(),
+  /**
+   * **代码文件刚被改过的节点**（0.3.68，宿主按 `git status` + mtime 判定）。
+   *
+   * 这是三条证据里最硬的一条：它说的不是"会话在忙"，而是"**这个节点的文件刚才在变**"。
+   * `undefined` = 宿主不报（旧宿主）⇒ 不影响其它判据。
+   */
+  hotNodeIds: readonly string[] | undefined = undefined,
 ): boolean {
+  // ── 路径 0：它的代码文件刚被改过 ⇒ 一定在跑 ─────────────────────────
+  if (
+    hotNodeIds !== undefined &&
+    node.id !== undefined &&
+    node.id !== '' &&
+    hotNodeIds.includes(node.id)
+  ) {
+    return true;
+  }
   const own = node.lastSessionId;
   const ownedByBusy = own !== undefined && own !== '' && busySessionIds.includes(own);
   // ── 路径 A：宿主报了节点级事实 ⇒ 只信它 ─────────────────────────────

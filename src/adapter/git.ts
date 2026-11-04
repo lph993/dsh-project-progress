@@ -19,7 +19,7 @@
 import { execFile } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -337,4 +337,65 @@ export async function gitTreePaths(cwd: string, tree: string): Promise<string[]>
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line !== '');
+}
+
+/**
+ * **工作区里当前被改动 / 新增的文件**（0.3.68，纯“用来看谁在改什么”的只读查询）。
+ *
+ * ## 为什么用 `git status` 而不是文件监听
+ *
+ * 面板要回答的是"**这一轮在改哪些文件**"——而改文件的动作**大量来自 shell**
+ * （用户现场：会话用 PowerShell 的 `[IO.File]::WriteAllText` 改 Rust 源码）。
+ * `fs/write-intent` 那类钩子只覆盖文件工具；chokidar 监听整个仓库在小仓库没事、
+ * 在大仓库是给宿主加一份常驻开销。`git status` 一次调用就能拿到**全部**改动
+ * （含未跟踪、含 shell 改的），且只在"有会话在跑"时按需轮询。
+ *
+ * ## 口径
+ *
+ * - `--porcelain -z --untracked-files=all --no-renames`：NUL 分隔、逐文件列出未跟踪项；
+ * - **删除的文件不算**（`D`）：它没有"正在被改"的证据，也没有 mtime 可看；
+ * - 路径统一成**工作区相对 + 正斜杠**（仓库根可能在面板工作区的上层）；
+ * - **不是 git 仓库 / 找不到 git ⇒ `undefined`**：调用方据此**不启用**这条信号，
+ *   绝不用"猜"顶上（这也是本项目一贯的 A3 口径）。
+ *
+ * @returns 工作区相对路径（去重）；不可用时 `undefined`。
+ */
+export async function gitChangedPaths(cwd: string): Promise<string[] | undefined> {
+  if (!(await isUsableGitRepo(cwd))) return undefined;
+  /**
+   * ⚠️ **不能用 `path.relative(cwd, repoRoot + p)` 求工作区相对路径**（真机踩过）：
+   * `C:\Users\Admin` 在本机是指向 `D:\Users\Admin` 的**junction**，
+   * 于是 cwd 报 `C:\…`、`rev-parse --show-toplevel` 报 `D:/…` —— 跨盘符的 `relative`
+   * 会原样返回绝对路径，所有改动都会被当成"工作区外"而丢掉。
+   * 改用 git 自己的 `--show-prefix`（cwd 相对仓库根的路径），纯字符串裁剪，不碰文件系统。
+   */
+  const prefixResult = await git(cwd, ['rev-parse', '--show-prefix']);
+  if (!prefixResult.ok) return undefined;
+  const prefix = prefixResult.stdout.trim().replace(/^\/+/, '');
+  const status = await git(cwd, [
+    // 子目录里跑也要拿到**仓库根相对**的路径，否则拼出来的工作区相对路径会错一层
+    '-c',
+    'status.relativePaths=false',
+    'status',
+    '--porcelain',
+    '-z',
+    '--untracked-files=all',
+    '--no-renames',
+  ]);
+  if (!status.ok) return undefined;
+  const out = new Set<string>();
+  for (const entry of status.stdout.split('\0')) {
+    // 形如 `XY <path>`（前两个字符是状态，第三个是空格）
+    if (entry.length < 4) continue;
+    const xy = entry.slice(0, 2);
+    if (xy.includes('D')) continue;
+    const repoRelative = entry.slice(3).replace(/^\/+/, '');
+    if (repoRelative === '') continue;
+    // 工作区（= cwd）之外的文件不归本项目管
+    if (prefix !== '' && !repoRelative.startsWith(prefix)) continue;
+    const workspaceRelative = prefix === '' ? repoRelative : repoRelative.slice(prefix.length);
+    if (workspaceRelative === '') continue;
+    out.add(workspaceRelative.split(sep).join('/'));
+  }
+  return [...out];
 }

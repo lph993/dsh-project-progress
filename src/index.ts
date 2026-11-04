@@ -390,6 +390,8 @@ async function applyInner(ctx: Context, config: Config): Promise<void> {
       disposeService();
       // 监听与路由一样必须在卸载时释放
       void service.stopWatcher();
+      // 文件活动轮询是定时器，卸载时必须清掉（否则插件热重载会留下孤儿轮询）
+      service.stopActivityPolling();
       debugBus.info('services', '服务已注销');
     };
   }, 'project-manager: services');

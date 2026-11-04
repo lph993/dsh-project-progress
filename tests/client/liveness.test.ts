@@ -198,6 +198,38 @@ describe('宿主明说"这轮动过它" ⇒ 就转圈（0.3.11：修"该转的�
   });
 });
 
+describe('代码文件刚被改过 ⇒ 转圈（0.3.68，比"会话在忙"更硬）', () => {
+  /**
+   * 现场：会话在 updater 工作区改 `pkgbuild.rs`，这一轮一个节点都没写（`activeNodeIds = []`）。
+   * 而那个文件落在某个节点的 `refs` 里 ⇒ 宿主把该节点放进 `hotNodeIds`。
+   * 这条证据说的是"**这个节点的文件刚才在变**"，不需要再猜时间戳。
+   */
+  it('hot 命中就转：清单为空、时间戳很旧都不影响', () => {
+    assert.equal(
+      isLiveNode({ id: 'n1', lastSessionId: 's1', updatedAt: stale }, [], [], NOW, ['n1']),
+      true,
+    );
+    assert.equal(
+      isLiveNode({ id: 'n1', updatedAt: stale }, [], [], NOW, ['n1']),
+      true,
+      '连归属会话都不需要：文件在变是节点自己的事',
+    );
+  });
+
+  it('hot 没命中 ⇒ 照常按清单/兜底判（不许因为"有 hot 字段"就乱转）', () => {
+    assert.equal(
+      isLiveNode({ id: 'n1', lastSessionId: 's1', updatedAt: stale }, ['s1'], [], NOW, ['n2']),
+      false,
+      '清单里没有它、它也不热 ⇒ 不转',
+    );
+    assert.equal(
+      isLiveNode({ id: 'n1', lastSessionId: 's1', updatedAt: stale }, ['s1'], undefined, NOW, undefined),
+      false,
+      '旧宿主没有 hot 字段 ⇒ 退回原判据（这里 3 小时前写的，超窗）',
+    );
+  });
+});
+
 describe('parseHostUtcStamp：宿主的时间戳按 UTC 解（别再偏一个时区）', () => {
   it('`MM/DD/YYYY HH:mm:ss` 按 UTC 解，不按本地时间', () => {
     const parsed = parseHostUtcStamp('10/12/2026 08:07:16');

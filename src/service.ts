@@ -9,7 +9,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 // 纯类型导入：加载 DSH 的服务接口增补（`ctx.fs` / `ctx.storageDomain` / `ctx.settings`）。
 // 这些增补写在各自包的 `.d.ts` 里，只有该模块进入编译图时才会生效。
@@ -21,6 +21,8 @@ import type { ConfirmRouter } from './adapter/confirm.ts';
 import { effectiveSandboxMode, resolveSnapshotMode, serviceOf, type CapabilityReport } from './adapter/capabilities.ts';
 import { sessionOfAgent } from './adapter/exec-view.ts';
 import { SnapshotManager, type CaptureResult, type RollbackResult } from './adapter/snapshots.ts';
+import { gitChangedPaths } from './adapter/git.ts';
+import { hotNodeIdsOf, normalizeWorkspacePath, refCoversPath } from './domain/refs-activity.ts';
 import {
   deleteWorkspaceFile,
   listHandoffFiles,
@@ -521,6 +523,24 @@ const BUSY_SESSION_TTL_MS = 5 * 60_000;
  * 反而看不出"它在弄哪块"。
  */
 const MAX_LAST_TURN_NODES = 40;
+
+/**
+ * **文件活动**采集的三个参数（0.3.68）。
+ *
+ * 现场：用户在 updater 工作区看着一个会话改 Rust 代码（`pkgbuild.rs`），
+ * 而这一轮一个节点都没写 ⇒ 图上什么都没有。节点的 `refs` 声明了"它覆盖哪些文件"，
+ * 所以"**这些文件刚被改过**"就是"这个节点的代码正在被改"的**事实**。
+ *
+ * - `ACTIVITY_POLL_MS`：只在本工作区**有会话在跑**时轮询（没有就停），
+ *   一次 `git status` + 若干 `stat`，4 秒一次对宿主可忽略；
+ * - `HOT_FILE_WINDOW_MS`：改动在 10 分钟内算"正在改"（一个工作步的量级，
+ *   与 `LIVE_FRESH_WINDOW_MS` 同一口径）；
+ * - `MAX_ACTIVITY_FILES`：脏仓库里 `git status` 可能列出几千个文件，
+ *   单次只看前 400 个（够覆盖"正在改的那几个"），防止轮询被拖成几秒。
+ */
+const ACTIVITY_POLL_MS = 4_000;
+const HOT_FILE_WINDOW_MS = 10 * 60_000;
+const MAX_ACTIVITY_FILES = 400;
 interface PendingRemoval {
   confirmToken: string;
   policy: 'record' | 'code' | 'comment';
@@ -571,6 +591,16 @@ export interface BoardSnapshot {
    * 根取不到 ⇒ 不计入（宁可不报，也不替它认领一个工作区）。
    */
   busySessionIdsHere: string[];
+  /**
+   * **代码正在被改的节点**（0.3.68）：窗口内（10 分钟）改动的文件落在节点的 `refs` 里。
+   *
+   * 只在"本工作区有会话在跑"时才非空 —— 人自己改文件不算"会话在动它"。
+   * 这是"节点级 loading"的**第三条事实**（前两条：宿主报的 `activeNodeIds`、
+   * 旧宿主的"会话在忙 + 时间窗"），也是唯一能覆盖"改了代码但还没写节点"的证据。
+   */
+  hotNodeIds: string[];
+  /** 窗口内改动文件的数量与最新时间（角标文案用）；没有就是 `null`。 */
+  activity: { files: number; at: string; uncovered: number } | null;
   /**
    * **这一轮里真的被忙碌会话动过的节点**（0.3.11）。
    *
@@ -1158,6 +1188,21 @@ export class ProjectService {
   private watcher: WatcherHandle | undefined;
   /** 是否已被显式关闭（关闭后不再惰性启动，除非工作区根变化）。 */
   private watcherStopped = false;
+  /**
+   * **文件活动**采集状态（0.3.68）：只在"本工作区有会话在跑"时轮询 `git status`。
+   *
+   * `hotFiles` 的键是**工作区相对、小写、正斜杠**的路径（与 `refs` 同一种形状），
+   * 值是文件的 mtime（epoch 毫秒）—— 用 mtime 而不是"第一次看到的时刻"，
+   * 是为了让"改完又改"能刷新，也为了把"很久以前就脏着"的文件排除在窗口外。
+   */
+  private activityRoot: string | undefined;
+  private activityTimer: ReturnType<typeof setInterval> | undefined;
+  private activityPolling = false;
+  /** 当前根是否是 git 仓库（不是就别每 4 秒试一次；换根时重置）。 */
+  private activitySupported = true;
+  /** 最近一次"面板来读看板"的时刻：面板关掉后轮询要自己停下（没人看就别花这台机器的 git）。 */
+  private activitySeenAt = 0;
+  private readonly hotFiles = new Map<string, number>();
   /** 最近一次外部改动（看板面包屑；R4/R6）。 */
   private externalChange:
     | {
@@ -1991,6 +2036,122 @@ export class ProjectService {
     this.watcher = undefined;
     this.watcherStopped = true;
     if (handle) await handle.close();
+  }
+
+  /**
+   * **文件活动采集的开/关**（0.3.68）。只在"本工作区有会话在跑"时开着。
+   *
+   * 为什么由 `board()` 驱动而不是常驻：面板不开就没人看，轮询纯属白花；
+   * 而面板每 2 秒读一次看板，正好是"现在有没有人在跑"的最新事实。
+   * 换工作区（根变了）就重建 —— 旧根上的 `hotFiles` 不能冒充新根。
+   */
+  private ensureActivityPolling(root: string | undefined, active: boolean): void {
+    if (!active || root === undefined || root === '' || !this.activitySupported) {
+      this.stopActivityPolling();
+      return;
+    }
+    if (
+      this.activityTimer !== undefined &&
+      this.activityRoot !== undefined &&
+      isSameRoot(this.activityRoot, root)
+    ) {
+      // 同一根：只刷新"有人还在看"的时间戳（轮询本身照旧）
+      this.activitySeenAt = Date.now();
+      return;
+    }
+    this.stopActivityPolling();
+    this.activityRoot = root;
+    this.activitySeenAt = Date.now();
+    const tick = (): void => {
+      /**
+       * **调试点/测试里反复踩的坑**：不要在 `board()` 里同步跑第一次轮询 ——
+       * 那会让 `git` 子进程的 cwd 正好卡在临时工作区目录上，测试删目录时 `EBUSY`。
+       * 第一次轮询延后一个周期（4 秒），完全够用（"文件在改"本来就是分钟级的事实）。
+       */
+      if (Date.now() - this.activitySeenAt > 60_000) {
+        this.stopActivityPolling();
+        return;
+      }
+      // 根已经不在了（测试删了临时目录 / 用户删了仓库）⇒ 立刻收摊，别对着空气跑 git
+      if (this.activityRoot === undefined || !existsSync(this.activityRoot)) {
+        this.stopActivityPolling();
+        return;
+      }
+      if (!this.activityPolling) void this.pollWorkspaceActivity();
+    };
+    this.activityTimer = setInterval(tick, ACTIVITY_POLL_MS);
+    // 不拖住宿主退出：这是"看板开着才有意义"的辅助轮询
+    this.activityTimer.unref?.();
+    debugBus.debug('activity', `开始采集文件活动：${root}`);
+  }
+
+  /** 关闭文件活动采集（换根、没人在跑、插件卸载时都调它）。 */
+  stopActivityPolling(): void {
+    if (this.activityTimer !== undefined) {
+      clearInterval(this.activityTimer);
+      this.activityTimer = undefined;
+    }
+    this.activityRoot = undefined;
+    this.activityPolling = false;
+  }
+
+  /**
+   * 轮询一次：`git status` 拿改动清单 → 逐个 stat 拿 mtime → 落在窗口内的记成"热"。
+   *
+   * 为什么用 mtime 而不是"第一次看到它脏了的时刻"：仓库可能一直脏着（用户没提交的改动），
+   * 那种"脏"与"这一轮在改"无关。mtime 才回答"**这个文件刚刚被写过没有**"。
+   *
+   * 不是 git 仓库 / 找不到 git ⇒ 关掉这条信号并留一条日志，**不拿别的猜测顶上**。
+   */
+  private async pollWorkspaceActivity(): Promise<void> {
+    const root = this.activityRoot;
+    if (root === undefined) return;
+    this.activityPolling = true;
+    try {
+      const changed = await gitChangedPaths(root);
+      if (changed === undefined) {
+        this.activitySupported = false;
+        this.stopActivityPolling();
+        debugBus.info(
+          'activity',
+          `这个工作区不是 git 仓库（或找不到 git）：不再采集文件活动；` +
+            `节点级 loading 仍只来自写入事实（${root}）`,
+        );
+        return;
+      }
+      const now = Date.now();
+      for (const relativePath of changed.slice(0, MAX_ACTIVITY_FILES)) {
+        try {
+          const info = statSync(join(root, relativePath));
+          if (!info.isFile()) continue;
+          const mtime = info.mtimeMs;
+          if (now - mtime <= HOT_FILE_WINDOW_MS) {
+            this.hotFiles.set(normalizeWorkspacePath(relativePath), mtime);
+          }
+        } catch {
+          // 刚被删/改名：这一轮看不到就算了（下一轮它会以新路径出现）
+        }
+      }
+      for (const [file, mtime] of this.hotFiles) {
+        if (now - mtime > HOT_FILE_WINDOW_MS) this.hotFiles.delete(file);
+      }
+    } finally {
+      this.activityPolling = false;
+    }
+  }
+
+  /** 窗口内"刚被改过"的文件（工作区相对、小写）；顺带清掉过期的。 */
+  private hotFilePaths(): Array<{ path: string; at: number }> {
+    const now = Date.now();
+    const out: Array<{ path: string; at: number }> = [];
+    for (const [path, at] of this.hotFiles) {
+      if (now - at > HOT_FILE_WINDOW_MS) {
+        this.hotFiles.delete(path);
+        continue;
+      }
+      out.push({ path, at });
+    }
+    return out;
   }
 
   /**
@@ -5701,6 +5862,40 @@ export class ProjectService {
       const root = this.sessionWorkspaceRootOf(id);
       return root !== undefined && resolution.root !== undefined && isSameRoot(root, resolution.root);
     });
+    /**
+     * **文件活动 → 节点**（0.3.68）。
+     *
+     * 只在"本工作区有会话在跑"时才采集/采信：没人在跑的时候改文件，是**人**在改，
+     * 不该让节点转圈（那也是谎称"有会话在动它"）。
+     *
+     * 窗口内的改动文件按 `refs` 映射到节点（纯函数 `domain/refs-activity.ts`），
+     * 命中的节点就是"**代码正在被改**"—— 这是比"会话在忙"强得多的证据。
+     */
+    this.ensureActivityPolling(resolution.root, busyHere.length > 0);
+    const hotFiles = this.hotFilePaths();
+    const hotNodeIds = busyHere.length > 0 ? hotNodeIdsOf(views, hotFiles.map((f) => f.path)) : [];
+    /**
+     * **有多少改动文件不归任何节点**（0.3.68，给用户一句能照做的提示）。
+     *
+     * 用户现场：会话在改 `pkgbuild.rs`，而树里**没有**任何节点覆盖这个文件 ⇒
+     * 按 refs 映射当然一个都不亮。这不是 bug，是"树该补了"——把它说出来，
+     * 比沉默或乱点亮都有用。
+     */
+    const uncovered =
+      busyHere.length > 0
+        ? hotFiles.filter(
+            (file) =>
+              !views.some((view) => (view.refs ?? []).some((ref) => refCoversPath(ref, file.path))),
+          ).length
+        : 0;
+    const activity =
+      busyHere.length > 0 && hotFiles.length > 0
+        ? {
+            files: hotFiles.length,
+            at: new Date(Math.max(...hotFiles.map((f) => f.at))).toISOString(),
+            uncovered,
+          }
+        : null;
 
     return {
       projectId: this.projectId,
@@ -5746,6 +5941,13 @@ export class ProjectService {
        * 与 `busySessionIds` 的区别是**作用域**，不是口径 —— 后者是跨项目的全局记账。
        */
       busySessionIdsHere: busyHere,
+      /**
+       * **代码正在被改的节点**（0.3.68）：窗口内被改动/新增的文件落在它的 `refs` 里。
+       * 只在"本工作区有会话在跑"时非空（人自己改文件不算"会话在动它"）。
+       */
+      hotNodeIds,
+      /** 窗口内改动文件的摘要（给角标用）；没有就是 `null`（不编 0）。 */
+      activity,
       activeNodeIds: liveLiveness.activeNodeIds.filter((id) => ownNodeIds.has(id)),
       lastTurnNodeIds: liveLiveness.lastTurnNodeIds.filter((id) => ownNodeIds.has(id)),
       // 每个节点有几个可用回滚点：菜单要**同步**决定「回滚 / 整枝回滚」显不显示

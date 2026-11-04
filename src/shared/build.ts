@@ -489,7 +489,28 @@
  *
  * ⚠️ **本批必须重启宿主**才生效（新字段）；之后刷新页面。
  */
-export const HOST_BATCH = 84;
+/**
+ * ## 批次 85 的用途
+ *
+ * **0.3.68：文件活动 → 节点（`hotNodeIds`）**。
+ *
+ * 用户现场：updater 工作区的会话在改 `updater-rust/src/bin/updater/pkgbuild.rs`
+ * （PowerShell 写的，文件工具钩子收不到），这一轮一个节点都没写 ⇒ 图上什么都不亮。
+ *
+ * 宿主侧改动：
+ * - 本工作区**有会话在跑**时，每 4 秒跑一次
+ *   `git status --porcelain -z --untracked-files=all --no-renames`，
+ *   对改动文件取 mtime，10 分钟窗口内的记为"刚被改过"（`hotFiles`）；
+ * - 用纯函数 `domain/refs-activity.ts` 把"热文件"映射到节点 ⇒ `board.hotNodeIds`；
+ * - `board.activity = { files, at, uncovered }`：角标文案 + "有多少改动没有节点归属"；
+ * - 面板关掉 1 分钟、没人在跑、不是 git 仓库 ⇒ 自动停（`stopActivityPolling`）。
+ *
+ * 客户端：`hotNodeIds` 并入 `isLiveNode`（最硬的一条证据）⇒ 转圈 + 连线流动 + tab 标记；
+ * 角标显示「N 个会话在跑 · M 个文件在改」。
+ *
+ * ⚠️ **本批必须重启宿主**才生效；之后刷新页面。
+ */
+export const HOST_BATCH = 85;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

@@ -36,6 +36,13 @@ export interface LivenessBoardFields {
    * 这个清单是"**它在跑，上次弄的是这几个**"，用另一种视觉标，**不混进"正在动"**。
    */
   lastTurnNodeIds?: readonly string[] | undefined;
+  /**
+   * 最近改动的文件落在其 `refs` 里的节点（0.3.68，宿主按 `git status` + mtime 判定）。
+   *
+   * 与 `activeNodeIds` 的区别：那是"写过节点"，这是"**它的代码文件在变**"。
+   * 缺省视为"没有"（旧宿主）；`[]` 同样是"没有"——这条信号不会因为少了字段就变成瞎转。
+   */
+  hotNodeIds?: readonly string[] | undefined;
 }
 
 /**
@@ -63,6 +70,8 @@ export type LivenessJudge = (
   node: { id?: string | undefined; lastSessionId?: string | undefined; updatedAt?: string | undefined },
   busy: readonly string[],
   active: readonly string[] | undefined,
+  now?: number,
+  hot?: readonly string[] | undefined,
 ) => boolean;
 
 /**
@@ -96,6 +105,8 @@ export interface LivenessArgs {
   activeNodeIds: readonly string[] | undefined;
   /** 忙会话上一轮动过的节点（0.3.17）。缺省即"没有"：这条标记弱于转圈，少标几个也不会撒谎。 */
   lastTurnNodeIds: readonly string[];
+  /** 代码文件刚被改过的节点（0.3.68）。缺省即"没有"。 */
+  hotNodeIds: readonly string[];
 }
 
 /**
@@ -109,6 +120,7 @@ export function livenessArgsOf(board: LivenessBoardFields | undefined): Liveness
     busySessionIds: idsOf(board?.busySessionIds) ?? [],
     activeNodeIds: idsOf(board?.activeNodeIds),
     lastTurnNodeIds: idsOf(board?.lastTurnNodeIds) ?? [],
+    hotNodeIds: idsOf(board?.hotNodeIds) ?? [],
   };
 }
 
@@ -118,8 +130,10 @@ export function liveNodeIdsOf(
   board: LivenessBoardFields | undefined,
   isLiveNode: LivenessJudge,
 ): Set<string> {
-  const { busySessionIds, activeNodeIds } = livenessArgsOf(board);
+  const { busySessionIds, activeNodeIds, hotNodeIds } = livenessArgsOf(board);
   return new Set(
-    nodes.filter((node) => isLiveNode(node, busySessionIds, activeNodeIds)).map((node) => node.id),
+    nodes
+      .filter((node) => isLiveNode(node, busySessionIds, activeNodeIds, undefined, hotNodeIds))
+      .map((node) => node.id),
   );
 }

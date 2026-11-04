@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  gitChangedPaths,
   gitCapture,
   gitDeleteSnapshotRef,
   gitDiffAgainstTree,
@@ -187,5 +188,33 @@ test('git 档：非 git 目录明确拒绝而不是假装成功', { skip: !HAS_G
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test('gitChangedPaths：改动 + 未跟踪都列出、删除不列、子目录只报自己范围内的', { skip: !HAS_GIT }, async () => {
+  const repo = makeRepo();
+  const plain = mkdtempSync(join(tmpdir(), 'pm-not-git-'));
+  try {
+    // 已跟踪：改 + 删；未跟踪：新增
+    writeFileSync(join(repo, 'a.txt'), 'a2\n');
+    writeFileSync(join(repo, 'new.txt'), 'n\n');
+    rmSync(join(repo, 'src', 'b.txt'));
+
+    const changed = await gitChangedPaths(repo);
+    assert.deepEqual(
+      [...(changed ?? [])].sort(),
+      ['a.txt', 'new.txt'],
+      '删除没有"正在改"的证据（也没有 mtime 可看），不该列出来',
+    );
+
+    // 子目录作为工作区：只报它范围内的改动；这里唯一的改动是删除 ⇒ 空
+    assert.deepEqual(await gitChangedPaths(join(repo, 'src')), []);
+
+    // 不是 git 仓库 ⇒ undefined（调用方据此**不启用**这条信号，而不是假装没有改动）
+    assert.equal(await gitChangedPaths(plain), undefined);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(plain, { recursive: true, force: true });
   }
 });

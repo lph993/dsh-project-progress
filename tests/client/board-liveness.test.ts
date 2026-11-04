@@ -92,4 +92,20 @@ describe('liveNodeIdsOf：同一份数据，旧宿主与新宿主的结论必须
     );
     assert.deepEqual([...none], [], '宿主明确报了"没动过任何节点" ⇒ 一个都不转');
   });
+
+  it('`hotNodeIds` 必须被转发到判据（0.3.68）：否则"文件刚被改"这条永远不生效', () => {
+    const judge = (
+      _n: unknown,
+      busy: readonly string[],
+      active: readonly string[] | undefined,
+      _now: number | undefined,
+      hot: readonly string[] | undefined,
+    ) => isLiveNode(_n as never, busy, active, NOW, hot);
+    const ids = liveNodeIdsOf(
+      nodes as never,
+      { busySessionIds: [], activeNodeIds: [], hotNodeIds: ['n2'] },
+      judge as never,
+    );
+    assert.deepEqual([...ids], ['n2'], 'hot 里的节点要判成在跑（清单为空也不影响）');
+  });
 });

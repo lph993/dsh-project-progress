@@ -156,6 +156,17 @@ export interface BoardSnapshot {
    */
   busySessionIdsHere?: string[];
   /**
+   * **代码正在被改的节点**（0.3.68）：最近 10 分钟内改动的文件落在节点的 `refs` 里。
+   *
+   * 这是"节点级 loading"最硬的证据（比"会话在忙"强：它说的是**这个节点的文件在变**），
+   * 用来覆盖"改了代码、但还没写节点"的长回合。只在"本工作区有会话在跑"时才有值。
+   *
+   * 允许缺席：旧宿主不返回 ⇒ 当作"没有"（不猜）。
+   */
+  hotNodeIds?: string[];
+  /** 最近改动文件的摘要（角标文案用）；没有就是 `null`。 */
+  activity?: { files: number; at: string; uncovered?: number } | null;
+  /**
    * **这轮真的被忙碌会话动过的节点**（0.3.11）。
    *
    * 这是"该不该转圈"的首选依据：`busySessionIds` 只说明"有会话在忙"，

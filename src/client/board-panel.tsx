@@ -1754,10 +1754,20 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                 'data-pm-session-live': String(board.busySessionIdsHere?.length ?? 0),
                 title:
                   `${board.busySessionIdsHere?.length ?? 0} 个会话正在这个工作区里跑。\n` +
-                  '具体在动哪个节点，要等它 pm_progress 标记后才会转圈 —— 没标记时不假装知道。',
+                  (board.activity != null
+                    ? `最近 10 分钟改了 ${board.activity.files} 个文件（最近一次 ${new Date(board.activity.at).toLocaleTimeString()}）。\n` +
+                      (board.activity.uncovered !== undefined && board.activity.uncovered > 0
+                        ? `其中 ${board.activity.uncovered} 个文件**不在任何节点的 refs 里** —— 这棵树该补节点了。\n`
+                        : '')
+                    : '') +
+                  '被改文件落在某个节点的 refs 里时，那个节点会转圈；' +
+                  '其余节点要等它 pm_progress 标记 —— 没依据时不假装知道。',
               },
               React.createElement('span', { className: 'pm-live-dot', 'aria-hidden': 'true' }, '●'),
-              `${board.busySessionIdsHere?.length ?? 0} 个会话在跑`,
+              `${board.busySessionIdsHere?.length ?? 0} 个会话在跑` +
+                (board.activity != null && board.activity.files > 0
+                  ? ` · ${board.activity.files} 个文件在改`
+                  : ''),
             )
           : null,
         React.createElement(

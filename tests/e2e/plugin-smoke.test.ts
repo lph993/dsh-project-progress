@@ -5909,3 +5909,155 @@ test('工作区级忙会话：只报属于本工作区的那些，全局清单�
   rmSync(wsA, { recursive: true, force: true });
   rmSync(wsB, { recursive: true, force: true });
 });
+
+/**
+ * **代码活动 → 节点**（0.3.68）：`hotNodeIds` 按 `refs` 命中，且只在"有会话在跑"时成立。
+ *
+ * 这条覆盖的是"改了代码、但还没写节点"的长回合：`pm_*` 收尾才调，
+ * 而节点的 `refs` 声明了它覆盖哪些文件 —— 文件刚被改过，就是"这个节点的代码在变"。
+ */
+test('代码活动 → 节点：hotNodeIds 按 refs 命中，没人跑时不采信', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-hot-'));
+  mkdirSync(join(workspace, 'src'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'a.ts'), 'export const a = 1;\n');
+  const ctx = createFakeContext({
+    workspace,
+    agents: {
+      get: () => ({ status: 'running', session: { header: { cwd: workspace } } }),
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    board(sessionId?: string, root?: string): Promise<{
+      hotNodeIds: string[];
+      activity: { files: number } | null;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const hot = (await service.addNode({
+    parentId: null,
+    name: '甲',
+    refs: [{ type: 'code', target: 'src/a.ts' }],
+  })).nodeId as string;
+  await service.addNode({
+    parentId: null,
+    name: '乙',
+    refs: [{ type: 'code', target: 'src/b.ts' }],
+  });
+
+  const internals = service as unknown as {
+    hotFiles: Map<string, number>;
+    busySessions: Map<string, { at: string; nodeIds: Map<string, number> }>;
+  };
+  internals.hotFiles.set('src/a.ts', Date.now());
+  /** 一个**没有节点覆盖**的改动文件：用来验证 uncovered 这句提示 */
+  internals.hotFiles.set('src/c.ts', Date.now());
+  internals.busySessions.set('session-a', { at: new Date().toISOString(), nodeIds: new Map() });
+
+  const board = await service.board(undefined, workspace);
+  assert.deepEqual(board.hotNodeIds, [hot], '只有 refs 命中的那个节点是"热的"');
+  assert.equal(board.activity?.files, 2, '角标要能说"改了 2 个文件"');
+  assert.equal(board.activity?.uncovered, 1, '其中一个文件不归任何节点 —— 要如实说"树该补了"');
+
+  /**
+   * **没人跑 ⇒ 不采信**：人自己改文件不是"会话在动它"，图上不该转圈
+   * （否则就变成另一种谎称）。
+   */
+  internals.busySessions.clear();
+  const idle = await service.board(undefined, workspace);
+  assert.deepEqual(idle.hotNodeIds, [], '没有会话在跑时不许点亮任何节点');
+  assert.equal(idle.activity, null, '没有会话在跑时也不报"文件在改"');
+
+  // 先停掉活动轮询再删目录：Windows 上 git 子进程的 cwd 还挂在里面会 EBUSY
+  (service as unknown as { stopActivityPolling(): void }).stopActivityPolling();
+  await (service as unknown as { stopWatcher(): Promise<void> }).stopWatcher();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+
+/**
+ * **完整的文件活动链路**（0.3.68）：真实 git 仓库 → 轮询 → mtime 窗口 → refs 映射。
+ *
+ * 上一条只验证了"看板把 hotFiles 映射成节点"这一段；这里把 `git status` 那段也跑起来，
+ * 否则"解析错了 / 路径算错"这类问题只能等真机发现（`gitChangedPaths` 的跨盘符坑就是这么来的）。
+ */
+test('文件活动轮询（真 git 仓库）：改过的文件 → 对应节点进 hotNodeIds', { skip: !hasGit() }, async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-activity-'));
+  const git = (args: string[]): void => {
+    execFileSync('git', args, { cwd: workspace, stdio: 'ignore' });
+  };
+  git(['init', '-q']);
+  git(['config', 'user.email', 'test@local']);
+  git(['config', 'user.name', 'test']);
+  mkdirSync(join(workspace, 'src'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'a.ts'), 'export const a = 1;\n');
+  writeFileSync(join(workspace, 'src', 'other.ts'), 'export const o = 1;\n');
+  git(['add', '-A']);
+  git(['commit', '-q', '-m', 'init']);
+
+  const ctx = createFakeContext({
+    workspace,
+    agents: { get: () => ({ status: 'running', session: { header: { cwd: workspace } } }) },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    board(sessionId?: string, root?: string): Promise<{ hotNodeIds: string[] }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const covered = (await service.addNode({
+    parentId: null,
+    name: '甲',
+    refs: [{ type: 'code', target: 'src/a.ts' }],
+  })).nodeId as string;
+  await service.addNode({
+    parentId: null,
+    name: '乙',
+    refs: [{ type: 'dir', target: 'src/other-dir' }],
+  });
+
+  // 会话在跑（宿主的忙记账）
+  const internals = service as unknown as {
+    busySessions: Map<string, { at: string; nodeIds: Map<string, number> }>;
+    pollWorkspaceActivity(): Promise<void>;
+  };
+  internals.busySessions.set('session-a', { at: new Date().toISOString(), nodeIds: new Map() });
+
+  // 第一次读看板：绑定项目 + 起轮询（首跳是延后的，这里不会真的跑 git）
+  await service.board(undefined, workspace);
+  // 改一个被 refs 覆盖的文件，然后手动跑一次轮询（不用等 4 秒）
+  writeFileSync(join(workspace, 'src', 'a.ts'), 'export const a = 2;\n');
+  await internals.pollWorkspaceActivity();
+
+  const board = await service.board(undefined, workspace);
+  assert.deepEqual(board.hotNodeIds, [covered], '刚改过的文件对应的节点才是热的');
+
+  (service as unknown as { stopActivityPolling(): void }).stopActivityPolling();
+  await (service as unknown as { stopWatcher(): Promise<void> }).stopWatcher();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+/** git 可用性（不可用就跳过，而不是假装通过）。 */
+function hasGit(): boolean {
+  try {
+    execFileSync('git', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
