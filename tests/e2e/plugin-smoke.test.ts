@@ -5854,3 +5854,58 @@ test('骨架被截断：直接分批（不先发整仓），且分批不许把�
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+/**
+ * **工作区级的"有会话在跑"**（0.3.67）。
+ *
+ * 用户现场：一个会话正在 updater 工作区里改代码（这一轮一个节点都没写），
+ * 图上静止 —— 他自己都不知道该看哪。看板需要一个**工作区级**的事实：
+ * "这个工作区里有会话在跑"，但**不许**把别的工作区的忙会话算进来
+ * （`busySessionIds` 是跨项目全局记账，真机上我在这边写节点、PEIS 的面板也会看到我）。
+ */
+test('工作区级忙会话：只报属于本工作区的那些，全局清单口径不变', async () => {
+  const wsA = mkdtempSync(join(tmpdir(), 'pm-busy-here-a-'));
+  const wsB = mkdtempSync(join(tmpdir(), 'pm-busy-here-b-'));
+  const agents = {
+    get: (id: string) =>
+      id === 'session-a'
+        ? { status: 'running', session: { header: { cwd: wsA } } }
+        : id === 'session-b'
+          ? { status: 'running', session: { header: { cwd: wsB } } }
+          : undefined,
+  };
+  const ctx = createFakeContext({ workspace: wsA, agents });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    board(sessionId?: string, root?: string): Promise<{
+      busySessionIds: string[];
+      busySessionIdsHere: string[];
+    }>;
+  };
+  /**
+   * 直接摆出"两个会话都在忙"的记账（事件路径的替代品）：
+   * `busySessionAndActiveNodes` 只读这张表 + agent 状态，两者都在这里备好了。
+   */
+  const internals = service as unknown as {
+    busySessions: Map<string, { at: string; nodeIds: Map<string, number> }>;
+  };
+  const now = new Date().toISOString();
+  internals.busySessions.set('session-a', { at: now, nodeIds: new Map() });
+  internals.busySessions.set('session-b', { at: now, nodeIds: new Map() });
+
+  const boardA = await service.board(undefined, wsA);
+  assert.deepEqual(boardA.busySessionIdsHere, ['session-a'], 'A 工作区只认 session-a');
+  assert.ok(
+    boardA.busySessionIds.includes('session-b'),
+    '全局清单仍包含两者（口径不变；过滤只发生在新增的 Here 字段上）',
+  );
+
+  const boardB = await service.board(undefined, wsB);
+  assert.deepEqual(boardB.busySessionIdsHere, ['session-b'], 'B 工作区只认 session-b');
+
+  ctx.disposeAll();
+  rmSync(wsA, { recursive: true, force: true });
+  rmSync(wsB, { recursive: true, force: true });
+});

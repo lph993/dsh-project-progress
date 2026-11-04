@@ -47,6 +47,14 @@ export const inject: string[] = ['slots', 'sidebarRightTabs', 'sidebarRight', 'l
 const CSS = `
 .pm-glyph { display: block; }
 .pm-glyph rect { transition: fill 120ms ease-out; }
+/*
+ * 「有会话正在这个工作区里跑」的呼吸点（0.3.67）。
+ * 不用 SMIL：那是 SVG 内部才有的；这个点长在 HTML 标题行里。
+ * 减少动效时保持静态（语义还在：一个蓝点 = 有人在跑）。
+ */
+@keyframes pm-live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+.pm-live-dot { display: inline-block; animation: pm-live-pulse 1.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .pm-live-dot { animation: none; } }
 `;
 
 /** 注入样式：符合 DSH 约定（`data-plugin` + `data-plugin-css`，HMR 按属性回收）。 */

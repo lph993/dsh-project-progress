@@ -466,7 +466,30 @@
  * ⚠️ **本批必须重启宿主**才生效；只刷新页面只能拿到客户端那一半（停止按钮会出现，
  * 但"请求断了宿主还在跑"的判据会退回 `aiRun.phase`）。
  */
-export const HOST_BATCH = 83;
+/**
+ * ## 批次 84 的用途
+ *
+ * **0.3.67：看板新增 `busySessionIdsHere`（工作区级的"有会话在跑"）**。
+ *
+ * 用户现场：updater 工作区的会话 turn 182 在改 `pkgbuild.rs`、跑 `cargo test`，
+ * 可这棵树 12 个节点**这一轮一个都没写**（`pm_*` 是收尾才调的）⇒ 图上静止。
+ * 0.3.66 撤回"running + 会话在忙 ⇒ 转圈"之后，面板对这种长回合**完全沉默**。
+ *
+ * 两件事必须分开：
+ * - **工作区级**"有没有人在干活" —— 宿主知道（`busySessions` + agent cwd），本批补上；
+ * - **节点级**"这个节点正在被写" —— 只能来自 `activeNodeIds`（写入事实），不许猜。
+ *
+ * 宿主侧改动：
+ * - `board()` 新增 `busySessionIdsHere`：`busySessionIds`（跨项目全局）按**每个会话
+ *   自己的工作区根**过滤后的子集；根取 `sessionRoots` 优先、其次 agent 的
+ *   `session.header.cwd`（`sessionWorkspaceRootOf`），两处都没有 ⇒ 不计入。
+ *
+ * 客户端：标题行一个蓝点角标「N 个会话在跑」（有呼吸动效，减少动效时静态）；
+ * 它**不指向任何节点**，悬停说明"具体动哪个节点要等它 pm_progress 标记"。
+ *
+ * ⚠️ **本批必须重启宿主**才生效（新字段）；之后刷新页面。
+ */
+export const HOST_BATCH = 84;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

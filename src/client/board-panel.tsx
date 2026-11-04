@@ -215,6 +215,22 @@ const styles = {
   },
   titleRow: { display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' as const },
   projectName: { fontSize: 15, fontWeight: 600 },
+  /**
+   * 「有会话正在这个工作区里跑」的角标（0.3.67）。
+   * 蓝色 = "有人在干活"（与关注枝同色系），不带红/黄 —— 这不是异常。
+   */
+  sessionLive: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 4,
+    fontSize: 11,
+    padding: '1px 7px',
+    borderRadius: 10,
+    border: '0.5px solid rgba(59,130,246,0.55)',
+    background: 'rgba(59,130,246,0.12)',
+    color: '#3b82f6',
+    whiteSpace: 'nowrap' as const,
+  },
   metrics: { display: 'flex', gap: 20, flexWrap: 'wrap' as const },
   metric: { display: 'flex', flexDirection: 'column' as const, gap: 2 },
   metricLabel: { fontSize: 11, opacity: 0.65 },
@@ -1720,6 +1736,30 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         'div',
         { style: styles.titleRow },
         React.createElement('span', { style: styles.projectName }, board?.projectName ?? '项目进度'),
+        /**
+         * **"有会话正在这个工作区里跑"**（0.3.67）。
+         *
+         * 用户现场：一个会话在 updater 工作区里改 Rust 代码、跑了二十几步，而这一轮
+         * **一个节点都没写**（`pm_*` 是收尾才调的）⇒ 图上静止，用户以为没人在干活。
+         *
+         * 这一行只说**工作区级**的事实（宿主按会话自己的工作区根过滤过），
+         * **不指向任何节点** —— 节点级 loading 仍然只能来自 `activeNodeIds`（写入事实）。
+         * 反过来，它也不许沉默：沉默会让人以为"插件没反应"。
+         */
+        board && (board.busySessionIdsHere?.length ?? 0) > 0
+          ? React.createElement(
+              'span',
+              {
+                style: styles.sessionLive,
+                'data-pm-session-live': String(board.busySessionIdsHere?.length ?? 0),
+                title:
+                  `${board.busySessionIdsHere?.length ?? 0} 个会话正在这个工作区里跑。\n` +
+                  '具体在动哪个节点，要等它 pm_progress 标记后才会转圈 —— 没标记时不假装知道。',
+              },
+              React.createElement('span', { className: 'pm-live-dot', 'aria-hidden': 'true' }, '●'),
+              `${board.busySessionIdsHere?.length ?? 0} 个会话在跑`,
+            )
+          : null,
         React.createElement(
           'label',
           { style: styles.toggleLabel, title: '只看未完成：把已完成节点从图中滤掉（FR-48）' },

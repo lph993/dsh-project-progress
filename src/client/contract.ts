@@ -147,6 +147,15 @@ export interface BoardSnapshot {
    */
   busySessionIds?: string[];
   /**
+   * **只属于本工作区**的忙会话（0.3.67；`busySessionIds` 的子集）。
+   *
+   * 看板据此显示"有会话正在这个工作区里跑"（**不指向任何节点**）。
+   * 为什么不直接用 `busySessionIds`：那是跨项目的全局记账，别的窗口在跑也会算进来。
+   *
+   * 允许缺席：旧宿主不返回 ⇒ 不显示这一行（不猜）。
+   */
+  busySessionIdsHere?: string[];
+  /**
    * **这轮真的被忙碌会话动过的节点**（0.3.11）。
    *
    * 这是"该不该转圈"的首选依据：`busySessionIds` 只说明"有会话在忙"，

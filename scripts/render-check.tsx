@@ -546,6 +546,41 @@ check('BoardView（只有告警 → 灰标，不借红色）', () => {
 });
 
 /**
+ * **"有会话正在这个工作区里跑"**（0.3.67，用户："会话在跑，图上却什么都没有"）。
+ *
+ * 这一行只说**工作区级**事实（宿主已按会话自己的工作区根过滤），**不指向节点**；
+ * 但反向的错也必须挡住：`busySessionIds` 是**跨项目全局**的，
+ * 别的窗口在跑不能算到本工作区头上。
+ */
+check('BoardView（有会话正在本工作区跑 → 蓝点角标；跨项目的忙会话不算）', () => {
+  const here = renderToStaticMarkup(
+    React.createElement(BoardView, {
+      board: { ...board, busySessionIds: ['s-here'], busySessionIdsHere: ['s-here'] },
+      error: undefined,
+      refresh: () => {},
+      sessionId: 'session-test',
+    }),
+  );
+  if (!here.includes('data-pm-session-live="1"')) throw new Error('工作区里有会话在跑，却没画角标');
+  if (!here.includes('1 个会话在跑')) throw new Error('角标没写清数量');
+  if (!here.includes('pm-live-dot')) throw new Error('角标没有呼吸点（静态文字看不出"正在"）');
+
+  const elsewhere = renderToStaticMarkup(
+    React.createElement(BoardView, {
+      // 全局记账里有忙会话，但**不属于本工作区**（旧宿主也不会给 Here 这个字段）
+      board: { ...board, busySessionIds: ['s-other'] },
+      error: undefined,
+      refresh: () => {},
+      sessionId: 'session-test',
+    }),
+  );
+  if (elsewhere.includes('data-pm-session-live')) {
+    throw new Error('别的工作区的忙会话被算到了本工作区（跨项目误报）');
+  }
+  return here;
+});
+
+/**
  * 防复发的**重复**断言（用户口径："右键有这个功能，功能性重复。又是重复，你全局审查下吧"）：
  * 「重复」在本项目已经发生多次 —— ① 同一个删除入口同时出现在右键菜单与画布工具条；
  * ② 同一个数字串在同一格/同一屏里说两遍（FR-153 ③/④）。

@@ -561,6 +561,17 @@ export interface BoardSnapshot {
    */
   busySessionIds: string[];
   /**
+   * **只属于本工作区**的忙会话（0.3.67，`busySessionIds` 的子集）。
+   *
+   * 用户现场：一个会话正在 updater 工作区里改 Rust 代码（这一轮一个节点都没写），
+   * 而 `busySessionIds` 是**跨项目全局**的 —— 拿它直接显示"有人在跑"会连别的窗口
+   * 一起算进来。这里按每个会话自己的工作区根过滤，客户端据此显示
+   * "**有会话正在这个工作区里跑**"（不指向任何节点）。
+   *
+   * 根取不到 ⇒ 不计入（宁可不报，也不替它认领一个工作区）。
+   */
+  busySessionIdsHere: string[];
+  /**
    * **这一轮里真的被忙碌会话动过的节点**（0.3.11）。
    *
    * 这是"该不该转圈"的**首选依据**（见 `client/liveness.ts`）：会话忙 ≠ 在动某个节点，
@@ -4612,6 +4623,30 @@ export class ProjectService {
   }
 
   /**
+   * **某个会话的工作区根**（0.3.67）：`sessionRoots` 优先，其次问 agent 自己的 cwd。
+   *
+   * 为什么需要第二条：`sessionRoots` 只在**这个会话调过 `pm_*` 工具**时才写
+   * （见 `noteWorkspaceRoot` 的调用点）。一个整回合都在改代码、没碰过树的长会话
+   * —— 恰恰是最需要被看见的那种 —— 在这里是**空的**。
+   * agent 对象上的 `session.header.cwd` 由宿主持有，**任何工具调用**都让它存在。
+   *
+   * 两处都拿不到就返回 `undefined`：调用方据此**不认领**（不许拿"最近绑定"去猜）。
+   */
+  private sessionWorkspaceRootOf(sessionId: string): string | undefined {
+    const known = this.sessionRoots.get(sessionId);
+    if (known !== undefined && known !== '') return known;
+    try {
+      const agent = this.agentFor(sessionId) as unknown as
+        | { session?: { header?: { cwd?: unknown } } }
+        | undefined;
+      const cwd = agent?.session?.header?.cwd;
+      return typeof cwd === 'string' && cwd !== '' ? cwd : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * **agents 注册表本身**（服务在不在），与"某个会话在不在"是**两件事** —— 必须分开判。
    *
    * 为什么要拆：真机诊断里出现过这样一条 warn：
@@ -5651,6 +5686,21 @@ export class ProjectService {
      */
     const liveLiveness = await this.busySessionAndActiveNodes();
     const ownNodeIds = new Set(liveNodes.map((d) => d.node.id));
+    /**
+     * **这个工作区里正在跑哪些会话**（0.3.67，用户："会话在跑，图上却什么都没有"）。
+     *
+     * `busySessionIds` 是**跨项目全局**的：同一台宿主里别的窗口/工作区在跑也会进来
+     * （真机：我在 `E:\thirty` 写节点时，PEIS 的看板里也有我）。所以"有没有人在这个工作区
+     * 里干活"必须按**每个会话自己的工作区根**过滤，不能拿全局清单冒充。
+     *
+     * 根从两处取：`sessionRoots`（这个会话调过 `pm_*` 时记下的 cwd）优先；
+     * 其次问 agent 自己的 `session.header.cwd`（任何工具调用都有它，覆盖面更广）。
+     * **两处都拿不到 ⇒ 不计入**（宁可不报，也不替它认领一个工作区）。
+     */
+    const busyHere = liveLiveness.busySessionIds.filter((id) => {
+      const root = this.sessionWorkspaceRootOf(id);
+      return root !== undefined && resolution.root !== undefined && isSameRoot(root, resolution.root);
+    });
 
     return {
       projectId: this.projectId,
@@ -5691,6 +5741,11 @@ export class ProjectService {
        * 里出现了**同一个 nodeId**（那棵树里根本没有这个节点）。
        */
       busySessionIds: liveLiveness.busySessionIds,
+      /**
+       * **只属于本工作区**的忙会话（0.3.67）：看板据此显示"有会话正在这个工作区里跑"。
+       * 与 `busySessionIds` 的区别是**作用域**，不是口径 —— 后者是跨项目的全局记账。
+       */
+      busySessionIdsHere: busyHere,
       activeNodeIds: liveLiveness.activeNodeIds.filter((id) => ownNodeIds.has(id)),
       lastTurnNodeIds: liveLiveness.lastTurnNodeIds.filter((id) => ownNodeIds.has(id)),
       // 每个节点有几个可用回滚点：菜单要**同步**决定「回滚 / 整枝回滚」显不显示
