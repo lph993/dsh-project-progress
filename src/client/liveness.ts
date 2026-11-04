@@ -11,6 +11,9 @@
  * 3. 「**不相关的节点也在 loading**」⇒ 我加了一道"90 秒内被写过"的窗口，结果
  *    **0 个**节点转圈（用户下一句："**该转的没转**"）。
  * 4. 「loading 应该放到正在跑的会话的**相关节点**上」⇒ 这才是对的判据（本文件当前实现）。
+ * 5. 「**正在进行中的任务没有 loading**」（0.3.65）⇒ 在 4 的基础上补一条：
+ *    节点自己标着进行中、且它的主会话在跑，就算在跑（见下面路径 C）。
+ *    这不算推翻 4：4 说的是"别把**所有**节点都当在跑"，5 说的是"**已经标成进行中**的那些"。
  *
  * ## 前三次错在同一个假设（这是本文件最该记住的一条）
  *
@@ -19,14 +22,20 @@
  * 而干活的顺序是"读代码、改代码 → **收尾时**才补记节点"，所以干活途中时间戳本来就是旧的。
  * 真机两个方向都踩过：窗口宽了把 32 小时前写过的 65 个节点转起来、紧了把正在干的掐成 0 个。
  *
- * ## 当前结论：宿主报**事实**，客户端不猜（两条互斥路径）
+ * ## 当前结论：宿主报**事实**，客户端不猜（两条互斥路径 + 一条"进行中"补充）
  *
  * ```
- * 宿主报了 activeNodeIds（哪怕空数组）：
- *     它在清单里 → 转；不在 → **不转**（宿主说没动它，就别拿时间戳去推翻）
- * 宿主没报（旧宿主）：
- *     该节点 lastSessionId 正在忙 ∧ updatedAt 在窗口内 → 转；否则不转
+ * ① 节点自己 derivedState === 'running' 且 lastSessionId 正在忙  → 转（0.3.65）
+ * ② 宿主报了 activeNodeIds（哪怕空数组）：
+ *      它在清单里 → 转；不在 → **不转**（宿主说没动它，就别拿时间戳去推翻）
+ * ③ 宿主没报（旧宿主）：
+ *      该节点 lastSessionId 正在忙 ∧ updatedAt 在窗口内 → 转；否则不转
  * ```
+ *
+ * ① 是用户第 5 条口径（"正在进行中的任务没有 loading"）的落点：
+ * 一条**已经标成进行中**的任务，只要干它的会话此刻在跑，图上就该转圈 ——
+ * 而 `pm_*` 收尾才写节点，所以长回合里 `activeNodeIds` 必然是空的。
+ * 条件是**两个**（running + 会话在跑），不是"有人在忙就全转"（那是 0.3.9 踩过的坑）。
  *
  * `activeNodeIds` 由宿主在**写路径的唯一收口**（`patchNode`）记账，与 `busySessionIds`
  * 同源计算 —— 它答的是"这个忙碌会话这一轮真的动过哪些节点"，这正是用户第 4 条口径。
@@ -54,6 +63,13 @@ export interface LivenessInput {
   lastSessionId?: string | undefined;
   /** 该节点最后一次写入时间（宿主的 **UTC** 时间戳串）。缺它就无法判新鲜度 ⇒ 不转。 */
   updatedAt?: string | undefined;
+  /**
+   * 节点自身的派生状态（`NodeView.derivedState`）。
+   *
+   * **只用来判"它自己标着进行中"**（见下面的路径 C）：那是"这条任务已经开工"的声明，
+   * 与"谁此刻在动它"是两件事，所以不能拿它单独下结论 —— 必须**再加上**"所属会话正在跑"。
+   */
+  derivedState?: string | undefined;
 }
 
 /**
@@ -162,16 +178,34 @@ export function isLiveNode(
   activeNodeIds: readonly string[] | undefined,
   now: number = Date.now(),
 ): boolean {
+  const own = node.lastSessionId;
+  const ownedByBusy = own !== undefined && own !== '' && busySessionIds.includes(own);
+  /**
+   * ── 路径 C：**节点自己标着"进行中"，而它的会话此刻在跑**（0.3.65）────────
+   *
+   * 用户原话："**正在进行中的任务没有 loading**"。
+   *
+   * 为什么单独加这一条：`activeNodeIds` 只装"这一轮真的写过它"的节点，而 `pm_*`
+   * 是**收尾时**才补记的 —— 一个长回合里，图上那条 `进行中` 的任务会一直停在 ▶，
+   * 哪怕干它的会话正在跑。用户看到的正是"任务明明是进行中，却没有 loading"。
+   *
+   * 与"全在转"（0.3.9）的区别：那条事故是**任何**节点（含 50 个已完成）都转；
+   * 这里要求两个条件同时成立 —— **节点自己的状态就是 `running`**（用户/模型明确声明过
+   * "这条开工了"）+ **它的主会话正在跑**。`pending` / `done` 一个都不转，
+   * 所以不会把"某会话忙 ⇒ 整棵树转"那个坑重新踩回来。
+   *
+   * 为什么放在"路径 A"之前：宿主说"这轮没写它"是**关于写入的事实**，
+   * 不等于"这条任务没在进行" —— 一条从上一回合起就标着进行中的任务，
+   * 本轮没被写是常态。两个事实不冲突，这里取"更该让用户看见"的那一个。
+   */
+  if (node.derivedState === 'running' && ownedByBusy) return true;
   // ── 路径 A：宿主报了节点级事实 ⇒ 只信它 ─────────────────────────────
   if (activeNodeIds !== undefined) {
     return node.id !== undefined && node.id !== '' && activeNodeIds.includes(node.id);
   }
   // ── 路径 B：旧宿主不报 ⇒ "会话在忙 + 刚被写过"兜底 ──────────────────
-  const own = node.lastSessionId;
   // 不知道归谁 ⇒ 不转（不猜）
-  if (own === undefined || own === '') return false;
-  // 那条会话得真的在忙
-  if (!busySessionIds.includes(own)) return false;
+  if (!ownedByBusy) return false;
   // 时间戳读不出来 ⇒ 不转（宁可不转，也不编）
   const stamp = parseHostUtcStamp(node.updatedAt);
   if (stamp === undefined) return false;

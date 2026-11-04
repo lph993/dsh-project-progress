@@ -385,6 +385,47 @@ check('FlowCanvas（宿主报 activeNodeIds → 转圈，且不靠时间戳）',
 });
 
 /**
+ * **"进行中"的任务也要 loading**（0.3.65，用户原话："正在进行中的任务没有 loading"）。
+ *
+ * 现场：`pm_*` 收尾才写节点 ⇒ 长回合里 `activeNodeIds` 为空；而那条任务明明标着
+ * `进行中`、干它的会话也正在跑，图上却只有 ▶。判据加一条：**running ∧ 所属会话在忙**。
+ * 这里刻意保留"昨天"的时间戳：它证明转圈**不靠新鲜度**，靠的是那两个事实。
+ */
+check('FlowCanvas（进行中 + 所属会话在忙 → 转圈，哪怕很久没写它）', () => {
+  const busy = 'session-busy';
+  const nodes = board.nodes.map((n) =>
+    n.id === 'a1' ? { ...n, derivedState: 'running', lastSessionId: busy } : n,
+  );
+  const svg = renderToStaticMarkup(
+    React.createElement(FlowCanvas, { nodes, onSelect: () => {}, busySessionIds: [busy] }),
+  );
+  if (!svg.includes('animateTransform')) {
+    throw new Error('标着进行中、会话也在跑，却没有 loading（用户报的就是这一条）');
+  }
+  return svg;
+});
+
+/**
+ * **但"待开始"的节点不许因为会话在忙就转圈**（0.3.9 事故的边界）。
+ *
+ * 那条事故里 65/86 个节点（含 50 个已完成）整片转圈。这里钉住新判据的两个前提：
+ * `derivedState === 'running'` 与"所属会话在忙"**缺一不可**。
+ */
+check('FlowCanvas（待开始 + 会话在忙 → 不转圈）', () => {
+  const busy = 'session-busy';
+  const nodes = board.nodes.map((n) =>
+    n.id === 'a1' ? { ...n, derivedState: 'pending', lastSessionId: busy } : n,
+  );
+  const svg = renderToStaticMarkup(
+    React.createElement(FlowCanvas, { nodes, onSelect: () => {}, busySessionIds: [busy] }),
+  );
+  if (svg.includes('animateTransform')) {
+    throw new Error('待开始的节点不该因为会话在忙就转圈（"全在转"的老毛病）');
+  }
+  return svg;
+});
+
+/**
  * **别的会话在忙 ⇒ 这个节点不转圈**（真机事故的防复发）。
  *
  * 现场证据：那 5 个 `running` 节点 `lastSessionId` 全空、`updatedAt` 是几小时前，
