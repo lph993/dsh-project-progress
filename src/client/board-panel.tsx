@@ -40,6 +40,7 @@ import { alertChipOf } from './alerts.ts';
 import { nodeCountLabel } from './labels.ts';
 import { dismissibleByBackdrop } from './modal-dismiss.ts';
 import { isAiBuildGenerating } from './build-state.ts';
+import { refTypeOf, suggestNodeName } from './uncovered.ts';
 import { legendSections } from './legend.ts';
 import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
 import { NodeInspector } from './node-inspector.tsx';
@@ -224,12 +225,15 @@ const styles = {
     alignItems: 'center',
     gap: 4,
     fontSize: 11,
+    font: 'inherit',
+    lineHeight: 1.6,
     padding: '1px 7px',
     borderRadius: 10,
     border: '0.5px solid rgba(59,130,246,0.55)',
     background: 'rgba(59,130,246,0.12)',
     color: '#3b82f6',
     whiteSpace: 'nowrap' as const,
+    cursor: 'pointer',
   },
   metrics: { display: 'flex', gap: 20, flexWrap: 'wrap' as const },
   metric: { display: 'flex', flexDirection: 'column' as const, gap: 2 },
@@ -895,6 +899,146 @@ export function CanvasLegendModal(props: { onClose: () => void }): React.ReactEl
   );
 }
 
+/**
+ * **「为未归属的改动新建节点」弹窗**（0.3.69）。
+ *
+ * 抽成独立组件（而不是塞在 `BoardView` 的内联 JSX 里）的两个理由：
+ * ① 渲染自检能直接把它渲染出来 —— 这是本插件唯一能验证"点了会看到什么"的手段；
+ * ② 它只吃 props、不碰视图状态，改起来不会牵连画布。
+ *
+ * 数据来源是宿主的 `activity.uncoveredPaths`（最近改过、但不在任何节点 `refs` 里的文件）。
+ * 界面上**不猜**：没选父节点时明确说"先在画布上选中父节点"，并禁用新建按钮。
+ */
+export function UncoveredFilesModal(props: {
+  /** 未归属的改动文件（工作区相对路径）。 */
+  paths: readonly string[];
+  /** 已勾选的路径。 */
+  picked: ReadonlySet<string>;
+  /** 节点名（可编辑）。 */
+  name: string;
+  /** 挂载目标的显示名；`undefined` = 当前没有可用的父节点。 */
+  parentName: string | undefined;
+  /** 请求在飞：按钮禁用、遮罩点了也不关。 */
+  busy: boolean;
+  error?: string | undefined;
+  onToggle: (path: string) => void;
+  onName: (name: string) => void;
+  onCreate: () => void;
+  onClose: () => void;
+}): React.ReactElement {
+  const canCreate = props.paths.length > 0 && props.picked.size > 0 && props.parentName !== undefined;
+  return React.createElement(
+    'div',
+    {
+      style: styles.modalBackdrop,
+      role: 'presentation',
+      'data-pm-uncovered-modal': '1',
+      onMouseDown: (event: React.MouseEvent) => {
+        if (event.target !== event.currentTarget || props.busy) return;
+        props.onClose();
+      },
+    },
+    React.createElement(
+      'div',
+      {
+        style: styles.modalCard,
+        role: 'dialog',
+        'aria-modal': true,
+        onMouseDown: (event: React.MouseEvent) => event.stopPropagation(),
+      },
+      React.createElement(
+        'div',
+        { style: { fontWeight: 600, marginBottom: 4 } },
+        '为"没有归属"的改动新建节点',
+      ),
+      React.createElement(
+        'div',
+        { style: styles.note },
+        props.paths.length === 0
+          ? '现在没有未归属的改动（所有刚改过的文件都在某个节点的 refs 里）。'
+          : '这些文件刚被改过，但不在任何节点的 refs 里 —— 新建的节点会关联它们，下一轮轮询就会亮。',
+      ),
+      props.paths.length === 0
+        ? null
+        : React.createElement(
+            'div',
+            {
+              style: { ...styles.note, ...styles.modalScroll, marginTop: 6 },
+              'data-pm-uncovered-list': '1',
+            },
+            props.paths.map((path) =>
+              React.createElement(
+                'label',
+                {
+                  key: path,
+                  style: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0' },
+                },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: props.picked.has(path),
+                  disabled: props.busy,
+                  onChange: () => props.onToggle(path),
+                }),
+                React.createElement('code', { style: { fontSize: 11 } }, path),
+              ),
+            ),
+          ),
+      React.createElement(
+        'label',
+        { style: { ...styles.note, display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 } },
+        '节点名：',
+        React.createElement('input', {
+          type: 'text',
+          value: props.name,
+          disabled: props.busy || props.paths.length === 0,
+          'data-pm-uncovered-name': '1',
+          onChange: (event: React.ChangeEvent<HTMLInputElement>) => props.onName(event.target.value),
+          style: { flex: 1, minWidth: 200, padding: '4px 6px' },
+        }),
+      ),
+      React.createElement(
+        'div',
+        { style: { ...styles.note, marginTop: 4 }, 'data-pm-uncovered-parent': '1' },
+        `挂到：${
+          props.parentName ?? '（树里没有唯一的根，请先在画布上选中父节点）'
+        }`,
+      ),
+      props.error !== undefined
+        ? React.createElement(
+            'div',
+            { style: { ...styles.error, marginTop: 8 }, 'data-pm-uncovered-error': '1' },
+            props.error,
+          )
+        : null,
+      React.createElement(
+        'div',
+        { style: { display: 'flex', gap: 8, marginTop: 10 } },
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: styles.headerButton,
+            'data-pm-uncovered-create': '1',
+            disabled: props.busy || !canCreate,
+            onClick: props.onCreate,
+          },
+          props.busy ? '正在新建…' : `新建节点（${props.picked.size} 个文件）`,
+        ),
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: styles.headerButton,
+            disabled: props.busy,
+            onClick: props.onClose,
+          },
+          '取消',
+        ),
+      ),
+    ),
+  );
+}
+
 /** 纯呈现：三段式布局（FR-40）+ 交互状态。不取数据，因此可被自检直接渲染。 */
 export function BoardView(props: BoardViewProps): React.ReactElement {
   const { board, error, refresh, sessionId } = props;
@@ -1007,6 +1151,24 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [aiReplaceDraft, setAiReplaceDraft] = useState(false);
   /** 忽略缓存强制重算（T6 逃生口）：默认关闭，勾了必然花钱。 */
   const [aiForceRebuild, setAiForceRebuild] = useState(false);
+  /**
+   * **"为未归属的改动新建节点"**（0.3.69）。
+   *
+   * 来源：宿主报的 `activity.uncoveredPaths` —— 最近改过、但不在任何节点 `refs` 里的文件。
+   * 用户现场（updater 的 `pkgbuild.rs`）：会话在改它，图上却没有任何节点亮 ——
+   * 因为树里没有覆盖它的节点。与其沉默，不如给一个**就地补节点**的入口。
+   */
+  const [uncoveredOpen, setUncoveredOpen] = useState(false);
+  const [uncoveredPicked, setUncoveredPicked] = useState<ReadonlySet<string>>(new Set());
+  const [uncoveredName, setUncoveredName] = useState('');
+  const [uncoveredBusy, setUncoveredBusy] = useState(false);
+  const [uncoveredError, setUncoveredError] = useState<string | undefined>(undefined);
+  const uncoveredPaths = board?.activity?.uncoveredPaths ?? [];
+  /** 父节点：优先"当前选中的"，否则退回唯一的根（多个根时要求先选一个）。 */
+  const singleRootId = (board?.nodes ?? []).find(
+    (node) => node.parentId === null && node.derivedState !== 'removed',
+  )?.id;
+  const uncoveredParentId = selectedId ?? singleRootId;
 
   /**
    * 右键菜单动作的三种落地方式（FR-6.6）：
@@ -1248,6 +1410,76 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         setAiError('停止请求发送失败（宿主路由不可用）。');
       });
   }, [refresh]);
+
+  /**
+   * **打开「为未归属的改动新建节点」**（0.3.69）。
+   *
+   * 默认全选 + 用公共目录给个像样的默认名；用户只需点一下"新建"。
+   */
+  const openUncovered = useCallback(() => {
+    setUncoveredPicked(new Set(uncoveredPaths));
+    setUncoveredName(suggestNodeName(uncoveredPaths));
+    setUncoveredError(undefined);
+    setUncoveredOpen(true);
+  }, [uncoveredPaths]);
+
+  const toggleUncoveredPath = useCallback((path: string) => {
+    setUncoveredPicked((previous) => {
+      const next = new Set(previous);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  /**
+   * **新建节点并关联选中的文件**（0.3.69）。
+   *
+   * 走 `add-child`（和右键菜单同一条面板路径）+ 新增的 `refs` 参数 ——
+   * 这样身份键重算、审计、路径存在性告警仍然只有 `addNode` 一处实现。
+   */
+  const createNodeFromUncovered = useCallback(() => {
+    if (uncoveredParentId === undefined) {
+      setUncoveredError('树里没有唯一的根，也还没选中父节点 —— 先在画布上点一个父节点。');
+      return;
+    }
+    const picked = [...uncoveredPicked];
+    if (picked.length === 0) {
+      setUncoveredError('至少选一个文件（否则新节点没有任何引用）。');
+      return;
+    }
+    const name = uncoveredName.trim();
+    if (name === '') {
+      setUncoveredError('节点名称不能为空。');
+      return;
+    }
+    setUncoveredBusy(true);
+    setUncoveredError(undefined);
+    void postNodeAction({
+      action: 'add-child',
+      nodeId: uncoveredParentId,
+      text: name,
+      kind: 'task',
+      refs: picked.map((path) => ({ type: refTypeOf(path), target: path })),
+    })
+      .then((outcome) => {
+        if (!outcome.ok || !outcome.value) {
+          setUncoveredError(outcome.error ?? '未知错误');
+          return;
+        }
+        if (outcome.value.status === 'denied') {
+          setUncoveredError(outcome.value.message ?? '被拒绝');
+          return;
+        }
+        setUncoveredOpen(false);
+        setRootNotice(`已新建节点「${name}」，关联 ${picked.length} 个文件（下一轮轮询就会亮）`);
+        refresh();
+      })
+      .catch((error: unknown) =>
+        setUncoveredError(error instanceof Error ? error.message : String(error)),
+      )
+      .finally(() => setUncoveredBusy(false));
+  }, [refresh, uncoveredName, uncoveredParentId, uncoveredPicked]);
 
   /**
    * 选中节点 / **取消选中**（`nodeId === undefined`，由画布"点空白处"触发）。
@@ -1748,8 +1980,9 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
          */
         board && (board.busySessionIdsHere?.length ?? 0) > 0
           ? React.createElement(
-              'span',
+              'button',
               {
+                type: 'button',
                 style: styles.sessionLive,
                 'data-pm-session-live': String(board.busySessionIdsHere?.length ?? 0),
                 title:
@@ -1757,16 +1990,20 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
                   (board.activity != null
                     ? `最近 10 分钟改了 ${board.activity.files} 个文件（最近一次 ${new Date(board.activity.at).toLocaleTimeString()}）。\n` +
                       (board.activity.uncovered !== undefined && board.activity.uncovered > 0
-                        ? `其中 ${board.activity.uncovered} 个文件**不在任何节点的 refs 里** —— 这棵树该补节点了。\n`
+                        ? `其中 ${board.activity.uncovered} 个文件**不在任何节点的 refs 里** —— 点这里可以为它们新建一个节点。\n`
                         : '')
                     : '') +
                   '被改文件落在某个节点的 refs 里时，那个节点会转圈；' +
                   '其余节点要等它 pm_progress 标记 —— 没依据时不假装知道。',
+                onClick: openUncovered,
               },
               React.createElement('span', { className: 'pm-live-dot', 'aria-hidden': 'true' }, '●'),
               `${board.busySessionIdsHere?.length ?? 0} 个会话在跑` +
                 (board.activity != null && board.activity.files > 0
                   ? ` · ${board.activity.files} 个文件在改`
+                  : '') +
+                (board.activity != null && (board.activity.uncovered ?? 0) > 0
+                  ? ` · ${board.activity.uncovered} 个未归属`
                   : ''),
             )
           : null,
@@ -2455,6 +2692,30 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             ),
             ),  // 卡片（模态正文）闭合
           )
+        : null,
+      /**
+       * **「为未归属的改动新建节点」弹窗**（0.3.69）。
+       *
+       * 用户现场：会话在改 `pkgbuild.rs`，那文件不在任何节点的 `refs` 里 ⇒ 图上没有节点亮。
+       * 这里把"看到的事实"直接接到"补一个节点"的动作上，而不是让人自己猜该建在哪、带什么引用。
+       * 组件本身（`UncoveredFilesModal`）是独立的，渲染自检能直接覆盖它。
+       */
+      uncoveredOpen
+        ? React.createElement(UncoveredFilesModal, {
+            paths: uncoveredPaths,
+            picked: uncoveredPicked,
+            name: uncoveredName,
+            parentName:
+              uncoveredParentId === undefined
+                ? undefined
+                : (board?.nodes.find((node) => node.id === uncoveredParentId)?.name ?? '未知节点'),
+            busy: uncoveredBusy,
+            error: uncoveredError,
+            onToggle: toggleUncoveredPath,
+            onName: setUncoveredName,
+            onCreate: createNodeFromUncovered,
+            onClose: () => setUncoveredOpen(false),
+          })
         : null,
       // FR-167：运行中的实时进度已挪进模态框（见 AiBuildModal），标题区不再内联显示。
 

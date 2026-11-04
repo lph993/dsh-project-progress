@@ -600,7 +600,13 @@ export interface BoardSnapshot {
    */
   hotNodeIds: string[];
   /** 窗口内改动文件的数量与最新时间（角标文案用）；没有就是 `null`。 */
-  activity: { files: number; at: string; uncovered: number } | null;
+  activity: {
+    files: number;
+    at: string;
+    uncovered: number;
+    /** 未归属改动的路径（≤50）：面板的「为这些文件新建节点」入口用它。 */
+    uncoveredPaths: string[];
+  } | null;
   /**
    * **这一轮里真的被忙碌会话动过的节点**（0.3.11）。
    *
@@ -5889,19 +5895,27 @@ export class ProjectService {
      * 按 refs 映射当然一个都不亮。这不是 bug，是"树该补了"——把它说出来，
      * 比沉默或乱点亮都有用。
      */
-    const uncovered =
+    const uncoveredFiles =
       busyHere.length > 0
-        ? hotFiles.filter(
-            (file) =>
-              !views.some((view) => (view.refs ?? []).some((ref) => refCoversPath(ref, file.path))),
-          ).length
-        : 0;
+        ? hotFiles
+            .filter(
+              (file) =>
+                !views.some((view) => (view.refs ?? []).some((ref) => refCoversPath(ref, file.path))),
+            )
+            .map((file) => file.path)
+            .sort()
+        : [];
     const activity =
       busyHere.length > 0 && hotFiles.length > 0
         ? {
             files: hotFiles.length,
             at: new Date(Math.max(...hotFiles.map((f) => f.at))).toISOString(),
-            uncovered,
+            uncovered: uncoveredFiles.length,
+            /**
+             * **未归属的改动文件**（0.3.69）：面板据此开一个"为这些文件新建节点"的入口。
+             * 上限 50 —— 再多就不是"补一个节点"能解决的事了，列表也只是噪声。
+             */
+            uncoveredPaths: uncoveredFiles.slice(0, 50),
           }
         : null;
 
@@ -10501,6 +10515,15 @@ export class ProjectService {
     confirm?: boolean;
     /** `add-child` / `rename` / `describe` 的文本输入；`set-priority` 传 1–10（空串=清除）；`set-parent` 传目标父节点 id。 */
     text?: string;
+    /**
+     * **`add-child` 一并写入的引用**（0.3.69，配合"未归属的改动"入口）。
+     *
+     * 为什么不让面板另开一条只写 refs 的路：`refs` 是节点的**身份键**输入，
+     * 写错会让下次建树认错节点；所以它必须走**同一条** `addNode`（校验、审计、身份键重算一处都不少）。
+     */
+    refs?: Ref[];
+    /** `add-child` 的节点种类（默认 task）。 */
+    kind?: NodeKind;
     reason?: string;
     by?: 'user' | 'session';
     /** 发起这次面板动作的会话（会话侧 `pm_review` 会传；浏览器面板轮询不传）。 */
@@ -10590,7 +10613,13 @@ export class ProjectService {
         if (name === '') {
           return { status: 'denied', action: 'add-child', code: 'E_NAME', message: '节点名称不能为空' };
         }
-        const added = await this.addNode({ parentId: input.nodeId, name, by });
+        const added = await this.addNode({
+          parentId: input.nodeId,
+          name,
+          by,
+          ...(input.kind !== undefined ? { kind: input.kind } : {}),
+          ...(input.refs !== undefined && input.refs.length > 0 ? { refs: input.refs } : {}),
+        });
         return this.panelResult('add-child', added, {
           ...(added.nodeId !== undefined ? { nodeId: added.nodeId } : {}),
         });

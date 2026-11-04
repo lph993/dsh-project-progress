@@ -19,6 +19,7 @@ import {
   BoardPanel,
   BoardView,
   CanvasLegendModal,
+  UncoveredFilesModal,
   UnfinishedListModal,
 } from '../src/client/board-panel.tsx';
 import { FlowCanvas } from '../src/client/flow-canvas.tsx';
@@ -601,7 +602,17 @@ check('BoardView（只有告警 → 灰标，不借红色）', () => {
 check('BoardView（有会话正在本工作区跑 → 蓝点角标；跨项目的忙会话不算）', () => {
   const here = renderToStaticMarkup(
     React.createElement(BoardView, {
-      board: { ...board, busySessionIds: ['s-here'], busySessionIdsHere: ['s-here'] },
+      board: {
+        ...board,
+        busySessionIds: ['s-here'],
+        busySessionIdsHere: ['s-here'],
+        activity: {
+          files: 3,
+          at: '2026-09-23T00:00:00Z',
+          uncovered: 2,
+          uncoveredPaths: ['updater-rust/src/bin/updater/pkgbuild.rs', 'docs/x.md'],
+        },
+      },
       error: undefined,
       refresh: () => {},
       sessionId: 'session-test',
@@ -610,6 +621,12 @@ check('BoardView（有会话正在本工作区跑 → 蓝点角标；跨项目�
   if (!here.includes('data-pm-session-live="1"')) throw new Error('工作区里有会话在跑，却没画角标');
   if (!here.includes('1 个会话在跑')) throw new Error('角标没写清数量');
   if (!here.includes('pm-live-dot')) throw new Error('角标没有呼吸点（静态文字看不出"正在"）');
+  /**
+   * **角标是入口**（0.3.69）：有未归属改动时，它要能点开"新建节点"，
+   * 并且**在角标上就说清有几个未归属**（否则用户不知道点它有什么用）。
+   */
+  if (!here.includes('<button')) throw new Error('角标应是可点的按钮（打开"为未归属的改动新建节点"）');
+  if (!here.includes('2 个未归属')) throw new Error('有未归属改动却没在角标上说出来');
 
   const elsewhere = renderToStaticMarkup(
     React.createElement(BoardView, {
@@ -624,6 +641,77 @@ check('BoardView（有会话正在本工作区跑 → 蓝点角标；跨项目�
     throw new Error('别的工作区的忙会话被算到了本工作区（跨项目误报）');
   }
   return here;
+});
+
+/**
+ * **「为未归属的改动新建节点」弹窗**（0.3.69）：只吃 props，所以能直接渲染验证。
+ *
+ * 三条边界：① 有路径 + 有父节点 ⇒ 新建按钮可用、列出全部路径；
+ * ② **没有父节点 ⇒ 按钮禁用并说清"先选父节点"**（不许点了没反应）；
+ * ③ 报错要显示出来（被拒/网络失败都不能静默）。
+ */
+check('未归属改动弹窗（可新建：列出路径、显示挂载目标与文件数）', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(UncoveredFilesModal, {
+      paths: ['updater-rust/src/bin/updater/pkgbuild.rs', 'docs/x.md'],
+      picked: new Set(['updater-rust/src/bin/updater/pkgbuild.rs', 'docs/x.md']),
+      name: '未归类改动（updater-rust/src/bin/updater）',
+      parentName: '示例项目',
+      busy: false,
+      onToggle: () => {},
+      onName: () => {},
+      onCreate: () => {},
+      onClose: () => {},
+    }),
+  );
+  if (!html.includes('updater-rust/src/bin/updater/pkgbuild.rs')) throw new Error('没列出未归属文件');
+  if (!html.includes('docs/x.md')) throw new Error('第二个文件丢了');
+  if (!html.includes('挂到：示例项目')) throw new Error('没写清挂到哪');
+  if (!html.includes('新建节点（2 个文件）')) throw new Error('按钮没说清会关联几个文件');
+  const createButton = html.slice(html.indexOf('data-pm-uncovered-create'));
+  if (createButton.slice(0, 120).includes('disabled')) throw new Error('有父节点时按钮不该禁用');
+  return html;
+});
+
+check('未归属改动弹窗（没有父节点 ⇒ 禁用并说清楚）', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(UncoveredFilesModal, {
+      paths: ['a.ts'],
+      picked: new Set(['a.ts']),
+      name: '未归类改动',
+      parentName: undefined,
+      busy: false,
+      onToggle: () => {},
+      onName: () => {},
+      onCreate: () => {},
+      onClose: () => {},
+    }),
+  );
+  if (!html.includes('先在画布上选中父节点')) throw new Error('没有父节点时没给出可照做的提示');
+  const createButton = html.slice(html.indexOf('data-pm-uncovered-create'));
+  if (!createButton.slice(0, 120).includes('disabled')) {
+    throw new Error('没有父节点时"新建"按钮必须禁用（点了只会报错）');
+  }
+  return html;
+});
+
+check('未归属改动弹窗（错误要显示）', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(UncoveredFilesModal, {
+      paths: ['a.ts'],
+      picked: new Set(['a.ts']),
+      name: '未归类改动',
+      parentName: '根',
+      busy: false,
+      error: '节点名称不能为空。',
+      onToggle: () => {},
+      onName: () => {},
+      onCreate: () => {},
+      onClose: () => {},
+    }),
+  );
+  if (!html.includes('data-pm-uncovered-error')) throw new Error('错误没显示（用户只会以为点了没反应）');
+  return html;
 });
 
 /**

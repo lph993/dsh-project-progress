@@ -6061,3 +6061,45 @@ function hasGit(): boolean {
     return false;
   }
 }
+
+/**
+ * **面板动作 `add-child` 支持 `refs`**（0.3.69）。
+ *
+ * 用途："为未归属的改动新建节点"—— 新节点必须**当场带上这些文件的引用**，
+ * 否则下一轮文件活动轮询还是认不出它（refs 是身份键的输入）。
+ * 走的是同一条 `addNode`，所以身份键、审计、路径存在性告警都不另写一份。
+ */
+test('面板动作 add-child 支持 refs：新节点当场带上引用', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-add-refs-'));
+  mkdirSync(join(workspace, 'src'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'a.ts'), 'export const a = 1;\n');
+  const ctx = createFakeContext({ workspace });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    panelNodeAction(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    board(): Promise<{ nodes: Array<{ name: string; refs?: Array<{ target: string }> }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const root = (await service.addNode({ parentId: null, name: '根', kind: 'feature' })).nodeId as string;
+  const created = await service.panelNodeAction({
+    action: 'add-child',
+    nodeId: root,
+    text: '甲（来自改动）',
+    kind: 'task',
+    refs: [{ type: 'code', target: 'src/a.ts' }],
+  });
+  assert.equal(created['status'], 'ok', `新建应当成功：${JSON.stringify(created)}`);
+
+  const node = (await service.board()).nodes.find((n) => n.name === '甲（来自改动）');
+  assert.ok(node, '新节点应当出现在看板里');
+  assert.deepEqual(node?.refs?.map((ref) => ref.target), ['src/a.ts'], '引用必须真的写进去');
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});

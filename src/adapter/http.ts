@@ -443,6 +443,9 @@ export function registerRoutes(
               confirm?: unknown;
               text?: unknown;
               reason?: unknown;
+              /** `add-child` 的引用（0.3.69）：只收 `{type, target}` 形状，最多 50 条。 */
+              refs?: unknown;
+              kind?: unknown;
             };
             try {
               parsed = JSON.parse(body) as typeof parsed;
@@ -477,6 +480,28 @@ export function registerRoutes(
               return;
             }
             /**
+             * **`add-child` 的 refs / kind**（0.3.69）：面板"为未归属的改动新建节点"用。
+             *
+             * 只做**形状**校验，业务校验仍交给 `addNode`（身份键重算、路径存在性告警都在那里）；
+             * 形状不对就当没传 —— 绝不把半个对象塞进事实源。
+             */
+            const refsOf = (value: unknown): Array<{ type: string; target: string }> | undefined => {
+              if (!Array.isArray(value)) return undefined;
+              const out: Array<{ type: string; target: string }> = [];
+              for (const item of value.slice(0, 50)) {
+                if (typeof item !== 'object' || item === null) continue;
+                const record = item as { type?: unknown; target?: unknown };
+                if (typeof record.type !== 'string' || typeof record.target !== 'string') continue;
+                const target = record.target.trim();
+                if (target === '') continue;
+                out.push({ type: record.type, target });
+              }
+              return out.length > 0 ? out : undefined;
+            };
+            const refs = refsOf(parsed.refs);
+            const kind =
+              parsed.kind === 'feature' || parsed.kind === 'task' ? parsed.kind : undefined;
+            /**
              * **面板意图**（0.3.26）：用户在面板右键菜单里点的那一下，目标是**他在看的那个工作区**
              * —— 不是"这个会话碰巧在哪"。原先只给 AI 建树加了这层，于是这些面板写操作
              * （改父/改名/优先级/快照…，以及**删整枝**）照样按会话 cwd 落笔。
@@ -488,6 +513,8 @@ export function registerRoutes(
                 confirm: parsed.confirm === true,
                 ...(typeof parsed.text === 'string' ? { text: parsed.text } : {}),
                 ...(typeof parsed.reason === 'string' ? { reason: parsed.reason } : {}),
+                ...(refs !== undefined ? { refs: refs as never } : {}),
+                ...(kind !== undefined ? { kind } : {}),
               }),
             );
             if (outcome.status !== 'ok') {

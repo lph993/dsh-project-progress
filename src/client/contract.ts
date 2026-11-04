@@ -165,7 +165,13 @@ export interface BoardSnapshot {
    */
   hotNodeIds?: string[];
   /** 最近改动文件的摘要（角标文案用）；没有就是 `null`。 */
-  activity?: { files: number; at: string; uncovered?: number } | null;
+  activity?: {
+    files: number;
+    at: string;
+    uncovered?: number;
+    /** 未归属改动的路径（≤50）；旧宿主没有这个字段 ⇒ 不显示"新建节点"入口。 */
+    uncoveredPaths?: string[];
+  } | null;
   /**
    * **这轮真的被忙碌会话动过的节点**（0.3.11）。
    *

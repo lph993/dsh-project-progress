@@ -510,7 +510,23 @@
  *
  * ⚠️ **本批必须重启宿主**才生效；之后刷新页面。
  */
-export const HOST_BATCH = 85;
+/**
+ * ## 批次 86 的用途
+ *
+ * **0.3.69：给"未归属的改动"一个补节点的入口**。
+ *
+ * 0.3.68 能说"有几个文件在改"，但那些文件若不落在任何节点的 `refs` 里，就一个节点都不亮
+ * （updater 的 `pkgbuild.rs` 正是这种）。本批补两件事：
+ * - `board.activity.uncoveredPaths`（≤50）：把未归属文件的路径交给面板；
+ * - 面板动作 `add-child` 新增 `refs` / `kind`：HTTP 层只校验形状，业务仍走同一条 `addNode`
+ *   （身份键重算、审计、路径存在性告警不另写一份）。
+ *
+ * 客户端：角标变按钮 → 弹窗列出未归属文件（默认全选）→ 默认名取公共目录 →
+ * 新建后下一轮轮询就会点亮（新节点覆盖了正在改的文件）。
+ *
+ * ⚠️ **本批必须重启宿主**才生效；之后刷新页面。
+ */
+export const HOST_BATCH = 86;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

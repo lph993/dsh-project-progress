@@ -360,6 +360,10 @@ export function postNodeAction(
     confirm?: boolean;
     text?: string;
     reason?: string;
+    /** `add-child` 的引用（0.3.69）："为未归属的改动新建节点"用；宿主只收 `{type,target}`。 */
+    refs?: Array<{ type: string; target: string }>;
+    /** `add-child` 的节点种类。 */
+    kind?: 'feature' | 'task';
   },
   signal?: AbortSignal,
 ): Promise<FetchOutcome<PanelActionOutcome>> {
