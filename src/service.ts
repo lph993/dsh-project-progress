@@ -2046,27 +2046,36 @@ export class ProjectService {
    * 换工作区（根变了）就重建 —— 旧根上的 `hotFiles` 不能冒充新根。
    */
   private ensureActivityPolling(root: string | undefined, active: boolean): void {
-    if (!active || root === undefined || root === '' || !this.activitySupported) {
+    if (!active || root === undefined || root === '') {
       this.stopActivityPolling();
       return;
     }
-    if (
-      this.activityTimer !== undefined &&
-      this.activityRoot !== undefined &&
-      isSameRoot(this.activityRoot, root)
-    ) {
+    const sameRoot = this.activityRoot !== undefined && isSameRoot(this.activityRoot, root);
+    if (sameRoot) {
       // 同一根：只刷新"有人还在看"的时间戳（轮询本身照旧）
       this.activitySeenAt = Date.now();
-      return;
+      if (this.activityTimer !== undefined) return;
+      /**
+       * 轮询停过（面板关了一会儿 / 上次轮询发现不是 git 仓库）：
+       * - 已经证明这个根不是 git 仓库 ⇒ **不再重试**（每 2 秒重起一次毫无意义）；
+       * - 否则重新拉起（用户回来看了）。
+       */
+      if (!this.activitySupported) return;
+    } else {
+      this.stopActivityPolling();
+      /**
+       * 换根：**重新允许尝试**。上一个根不是 git，不代表这个也不是
+       * （真机形态：先看一个普通目录，再切到仓库）。
+       */
+      this.activitySupported = true;
+      this.activityRoot = root;
     }
-    this.stopActivityPolling();
-    this.activityRoot = root;
     this.activitySeenAt = Date.now();
     const tick = (): void => {
       /**
-       * **调试点/测试里反复踩的坑**：不要在 `board()` 里同步跑第一次轮询 ——
-       * 那会让 `git` 子进程的 cwd 正好卡在临时工作区目录上，测试删目录时 `EBUSY`。
-       * 第一次轮询延后一个周期（4 秒），完全够用（"文件在改"本来就是分钟级的事实）。
+       * **不要在 `board()` 里同步跑第一次轮询** —— 那会让 `git` 子进程的 cwd
+       * 正好卡在临时工作区目录上（测试删目录时 `EBUSY`）。第一次轮询延后一个周期，
+       * 完全够用（"文件在改"本来就是分钟级的事实）。
        */
       if (Date.now() - this.activitySeenAt > 60_000) {
         this.stopActivityPolling();
@@ -2085,13 +2094,12 @@ export class ProjectService {
     debugBus.debug('activity', `开始采集文件活动：${root}`);
   }
 
-  /** 关闭文件活动采集（换根、没人在跑、插件卸载时都调它）。 */
+  /** 关闭文件活动采集（没人在跑、面板关掉、换根、插件卸载时都调它）。 */
   stopActivityPolling(): void {
     if (this.activityTimer !== undefined) {
       clearInterval(this.activityTimer);
       this.activityTimer = undefined;
     }
-    this.activityRoot = undefined;
     this.activityPolling = false;
   }
 
