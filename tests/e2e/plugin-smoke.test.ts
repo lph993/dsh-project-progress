@@ -6233,3 +6233,97 @@ test('异步建树：POST 立即返回 started，结果随 aiLastBuild 回传（
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+
+/**
+ * **AI 审树路由**（0.3.71）：`POST /pm/ai/repair` 只提议、不改树；坏提议如实回。
+ *
+ * 面板的「AI 审树」按钮就是打这条路由。两个关键口径：
+ * ① **不改任何节点**（这是"只提议"的硬边界，不是文案）；
+ * ② 模型编的 nodeId 会被校验拒掉，并**出现在 `rejected` 里**（不许静默丢 ——
+ *    用户要能分清"树没问题"和"AI 在编"）。
+ */
+test('POST /pm/ai/repair：只提议不改树，坏提议进 rejected（0.3.71）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-repair-route-'));
+  mkdirSync(join(workspace, 'src'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'a.ts'), 'export const a = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  /** 模型输出的"修复方案"（在拿到真实 nodeId 之后才拼出来）。 */
+  let repairText = '';
+  ctx.services.set('llm', {
+    stream: () =>
+      (async function* () {
+        yield { type: 'block-start', index: 0, blockType: 'text' };
+        yield { type: 'text-delta', index: 0, text: repairText };
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: repairText } };
+        yield { type: 'finish', reason: 'stop' };
+      })(),
+  });
+
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    addNode(input: Record<string, unknown>): Promise<{ nodeId?: string }>;
+    board(): Promise<{ nodes: Array<{ id: string; name: string }> }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const root = (await service.addNode({ parentId: null, name: '根', kind: 'feature' })).nodeId as string;
+  const child = (await service.addNode({ parentId: root, name: '旧名字', kind: 'task' })).nodeId as string;
+  repairText = JSON.stringify({
+    summary: '把过时的名字改掉',
+    actions: [
+      { kind: 'rename', nodeId: child, newName: '新名字', reason: '名字过时' },
+      { kind: 'move', nodeId: '不存在的节点', toParentId: root, reason: '编出来的动作' },
+    ],
+    uncertain: [],
+  });
+
+  const route = ctx.registeredRoutes.find((entry) => entry.path === '/pm');
+  assert.ok(route, '未注册 /pm 前缀路由');
+  let status = 0;
+  let text = '';
+  const res = {
+    writeHead(code: number) {
+      status = code;
+    },
+    end(chunk?: string) {
+      text = chunk ?? '';
+    },
+  };
+  const body = JSON.stringify({ sessionId: 'session-repair' });
+  await route.handler(
+    {
+      url: '/pm/ai/repair',
+      method: 'POST',
+      on: (event: string, listener: (...args: unknown[]) => void) => {
+        if (event === 'data') listener(body);
+        if (event === 'end') listener();
+      },
+    },
+    res,
+  );
+  assert.equal(status, 200);
+  const outcome = JSON.parse(text) as {
+    status?: string;
+    actions?: Array<{ kind: string; newName?: string }>;
+    rejected?: Array<{ reason: string }>;
+  };
+  assert.equal(outcome.status, 'ok', `审树应当成功：${text.slice(0, 300)}`);
+  assert.equal(outcome.actions?.[0]?.kind, 'rename');
+  assert.equal(outcome.actions?.[0]?.newName, '新名字');
+  assert.equal(outcome.rejected?.length, 1, '编出来的 nodeId 必须被拒并回告');
+
+  // 只提议：节点名不能被改
+  const node = (await service.board()).nodes.find((item) => item.id === child);
+  assert.equal(node?.name, '旧名字', '审树不许改树（这是"只提议"的硬边界）');
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});

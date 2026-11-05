@@ -14,6 +14,9 @@ import * as React from 'react';
 import {
   postAiBuild,
   postAiCancel,
+  postAiRepair,
+  type AiRepairAction,
+  type AiRepairOutcome,
   postNodeAction,
   postRemoveBranch,
   postMergeRoots,
@@ -1039,6 +1042,219 @@ export function UncoveredFilesModal(props: {
   );
 }
 
+/**
+ * **AI 审树弹窗**（0.3.71）：先确认（会花一次模型调用），再展示方案。
+ *
+ * 与工具 `pm_ai_repair` 是同一份能力，只是给"人"一个入口。**只提议、不执行**：
+ * 安全的三类（重命名 / 补描述 / 移动）给「采纳」按钮（走既有面板动作 + 审计）；
+ * 删除 / 合并 / 拆分只展示 —— 它们必须走会话或审批通道，不能让一次点击就动树。
+ *
+ * 抽成独立组件：渲染自检能直接渲染"确认页"和"方案页"，不用真的调模型。
+ */
+export function AiRepairModal(props: {
+  stage: 'confirm' | 'result';
+  busy: boolean;
+  outcome?: AiRepairOutcome | undefined;
+  error?: string | undefined;
+  /** 已采纳的动作键（`kind:nodeId`），按钮据此显示"已采纳"。 */
+  applied: ReadonlySet<string>;
+  nodeNameOf: (nodeId: string) => string;
+  onStart: () => void;
+  onApply: (action: AiRepairAction) => void;
+  onClose: () => void;
+}): React.ReactElement {
+  const ok = props.outcome !== undefined && props.outcome.status === 'ok' ? props.outcome : undefined;
+  const nodeName = (id: string): string => {
+    const name = props.nodeNameOf(id);
+    return name === '' ? id : name;
+  };
+  const actionTitle = (action: AiRepairAction): string => {
+    switch (action.kind) {
+      case 'rename':
+        return `重命名：${nodeName(action.nodeId)} → 「${action.newName}」`;
+      case 'describe':
+        return `补/改描述：${nodeName(action.nodeId)}`;
+      case 'move':
+        return `移动：${nodeName(action.nodeId)} → 父节点「${nodeName(action.toParentId)}」`;
+      case 'merge':
+        return `合并：${nodeName(action.nodeId)} → 「${nodeName(action.intoNodeId)}」（需会话处理）`;
+      case 'split':
+        return `拆分：${nodeName(action.nodeId)} → ${action.suggestedChildren.length} 个子节点（需会话处理）`;
+      case 'delete':
+        return `删除：${nodeName(action.nodeId)}（需会话/审批）`;
+    }
+  };
+  /** 可直接采纳的三类（安全、可回滚的既有面板动作）。 */
+  const mayApply = (action: AiRepairAction): boolean =>
+    action.kind === 'rename' || action.kind === 'describe' || action.kind === 'move';
+  const actionKey = (action: AiRepairAction): string => `${action.kind}:${action.nodeId}`;
+
+  return React.createElement(
+    'div',
+    {
+      style: styles.modalBackdrop,
+      role: 'presentation',
+      'data-pm-repair-modal': '1',
+      onMouseDown: (event: React.MouseEvent) => {
+        if (event.target !== event.currentTarget || props.busy) return;
+        props.onClose();
+      },
+    },
+    React.createElement(
+      'div',
+      {
+        style: styles.modalCard,
+        role: 'dialog',
+        'aria-modal': true,
+        onMouseDown: (event: React.MouseEvent) => event.stopPropagation(),
+      },
+      React.createElement(
+        'div',
+        { style: { fontWeight: 600, marginBottom: 4 } },
+        props.stage === 'confirm' ? '让 AI 审一遍这棵树？' : 'AI 树修复方案（只提议、不执行）',
+      ),
+      props.stage === 'confirm'
+        ? React.createElement(
+            'div',
+            { style: styles.note },
+            '会**调用一次模型**（按模型计费），只读取树的结构与描述，**不改任何节点**。' +
+              '方案里安全的三类（重命名 / 补描述 / 移动）可以点「采纳」；删除 / 合并 / 拆分仍需会话或审批。',
+          )
+        : React.createElement(
+            'div',
+            { style: styles.note, whiteSpace: 'pre-line' as const },
+            ok?.summary !== undefined && ok.summary !== ''
+              ? `${ok.summary}\n`
+              : '模型没有给总述（不编）。\n',
+            ok !== undefined ? `节点 ${ok.nodeCount} 个 · 模型路由 ${ok.route}` : '',
+          ),
+      props.stage === 'result' && ok !== undefined
+        ? React.createElement(
+            'div',
+            { style: { ...styles.note, ...styles.modalScroll, marginTop: 8 }, 'data-pm-repair-list': '1' },
+            ok.actions.length === 0
+              ? React.createElement('div', undefined, '模型没有提出任何可执行的动作。')
+              : ok.actions.map((action) =>
+                  React.createElement(
+                    'div',
+                    {
+                      key: `${actionKey(action)}:${action.reason}`,
+                      style: {
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        gap: 8,
+                        padding: '4px 0',
+                        borderTop: '0.5px solid rgba(128,128,128,0.2)',
+                      },
+                    },
+                    React.createElement(
+                      'div',
+                      { style: { flex: 1, minWidth: 0 } },
+                      React.createElement('div', undefined, actionTitle(action)),
+                      React.createElement('div', { style: { opacity: 0.7, fontSize: 11 } }, action.reason),
+                      action.kind === 'describe'
+                        ? React.createElement(
+                            'div',
+                            { style: { opacity: 0.7, fontSize: 11, whiteSpace: 'pre-line' as const } },
+                            action.newDescription.slice(0, 200),
+                          )
+                        : null,
+                    ),
+                    mayApply(action)
+                      ? React.createElement(
+                          'button',
+                          {
+                            type: 'button',
+                            style: styles.headerButton,
+                            'data-pm-repair-apply': action.kind,
+                            disabled: props.busy || props.applied.has(actionKey(action)),
+                            onClick: () => props.onApply(action),
+                          },
+                          props.applied.has(actionKey(action)) ? '已采纳' : '采纳',
+                        )
+                      : null,
+                  ),
+                ),
+            ok.uncertain.length > 0
+              ? React.createElement(
+                  'div',
+                  { style: { marginTop: 8 }, 'data-pm-repair-uncertain': '1' },
+                  React.createElement('div', { style: { fontWeight: 600 } }, '模型拿不准的（需要人判断）'),
+                  ok.uncertain.map((item, index) =>
+                    React.createElement(
+                      'div',
+                      { key: `u${index}`, style: { fontSize: 11, opacity: 0.8, padding: '2px 0' } },
+                      `· ${item.question}（${item.nodeIds.map(nodeName).join('、')}）`,
+                    ),
+                  ),
+                )
+              : null,
+            ok.rejected.length > 0
+              ? React.createElement(
+                  'div',
+                  { style: { marginTop: 8 }, 'data-pm-repair-rejected': '1' },
+                  React.createElement(
+                    'div',
+                    { style: { fontWeight: 600 } },
+                    `被校验拒掉的提议（${ok.rejected.length}）`,
+                  ),
+                  ok.rejected.slice(0, 5).map((item, index) =>
+                    React.createElement(
+                      'div',
+                      { key: `r${index}`, style: { fontSize: 11, opacity: 0.8, padding: '2px 0' } },
+                      `· ${item.reason}`,
+                    ),
+                  ),
+                )
+              : null,
+            (ok.mechanical.actions?.length ?? 0) > 0
+              ? React.createElement(
+                  'div',
+                  { style: { ...styles.note, marginTop: 8 } },
+                  `机械判据另有 ${ok.mechanical.actions?.length ?? 0} 条可核对的合并建议（` +
+                    '`pm_consolidate` 只读预览；执行前建议先看一眼）。',
+                )
+              : null,
+          )
+        : null,
+      props.error !== undefined
+        ? React.createElement(
+            'div',
+            { style: { ...styles.error, marginTop: 8 }, 'data-pm-repair-error': '1' },
+            props.error,
+          )
+        : null,
+      React.createElement(
+        'div',
+        { style: { display: 'flex', gap: 8, marginTop: 10 } },
+        props.stage === 'confirm'
+          ? React.createElement(
+              'button',
+              {
+                type: 'button',
+                style: styles.headerButton,
+                'data-pm-repair-start': '1',
+                disabled: props.busy,
+                onClick: props.onStart,
+              },
+              props.busy ? '正在审…' : '开始审查（一次模型调用）',
+            )
+          : null,
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: styles.headerButton,
+            disabled: props.busy && props.stage === 'confirm',
+            onClick: props.onClose,
+          },
+          props.stage === 'confirm' ? '取消' : '关闭',
+        ),
+      ),
+    ),
+  );
+}
+
 /** 纯呈现：三段式布局（FR-40）+ 交互状态。不取数据，因此可被自检直接渲染。 */
 export function BoardView(props: BoardViewProps): React.ReactElement {
   const { board, error, refresh, sessionId } = props;
@@ -1172,6 +1388,17 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const [uncoveredName, setUncoveredName] = useState('');
   const [uncoveredBusy, setUncoveredBusy] = useState(false);
   const [uncoveredError, setUncoveredError] = useState<string | undefined>(undefined);
+  /**
+   * **AI 审树**（0.3.71）：`confirm` = 先问"会花一次模型调用"；`result` = 展示方案。
+   *
+   * 只提议、不执行：安全的三类（重命名/补描述/移动）可以点「采纳」，
+   * 删除/合并/拆分只展示（必须走会话或审批）。
+   */
+  const [repairStage, setRepairStage] = useState<'confirm' | 'result' | undefined>(undefined);
+  const [repairBusy, setRepairBusy] = useState(false);
+  const [repairOutcome, setRepairOutcome] = useState<AiRepairOutcome | undefined>(undefined);
+  const [repairError, setRepairError] = useState<string | undefined>(undefined);
+  const [repairApplied, setRepairApplied] = useState<ReadonlySet<string>>(new Set());
   const uncoveredPaths = board?.activity?.uncoveredPaths ?? [];
   /** 父节点：优先"当前选中的"，否则退回唯一的根（多个根时要求先选一个）。 */
   const singleRootId = (board?.nodes ?? []).find(
@@ -1574,6 +1801,94 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
       )
       .finally(() => setUncoveredBusy(false));
   }, [refresh, uncoveredName, uncoveredParentId, uncoveredPicked]);
+
+  /** 打开 AI 审树确认框（先问"会花一次模型调用"）。 */
+  const openRepair = useCallback(() => {
+    setRepairStage('confirm');
+    setRepairOutcome(undefined);
+    setRepairError(undefined);
+    setRepairApplied(new Set());
+  }, []);
+
+  const closeRepair = useCallback(() => {
+    if (repairBusy) return;
+    setRepairStage(undefined);
+    setRepairError(undefined);
+  }, [repairBusy]);
+
+  /**
+   * **跑一次 AI 审树**（0.3.71）：只提议、不改树。
+   *
+   * 与工具 `pm_ai_repair` 同一个服务方法；面板只是把"人"的入口接上。
+   */
+  const startRepair = useCallback(() => {
+    setRepairBusy(true);
+    setRepairError(undefined);
+    void postAiRepair(sessionId)
+      .then((outcome) => {
+        if (!outcome.ok || !outcome.value) {
+          setRepairError(outcome.error ?? '未知错误');
+          return;
+        }
+        const value = outcome.value;
+        if (value.status === 'denied') {
+          setRepairError(`${value.hint}（${value.reason}）`);
+          return;
+        }
+        if (value.status === 'error') {
+          setRepairError(value.message);
+          return;
+        }
+        setRepairOutcome(value);
+        setRepairStage('result');
+      })
+      .catch((error: unknown) =>
+        setRepairError(error instanceof Error ? error.message : String(error)),
+      )
+      .finally(() => setRepairBusy(false));
+  }, [sessionId]);
+
+  /**
+   * **采纳一条安全动作**（重命名 / 补描述 / 移动）：走既有的面板动作（审计、CAS、成环保护都在）。
+   *
+   * 删除 / 合并 / 拆分**不在这里** —— 它们必须走会话或审批，不能让一次点击就动树。
+   */
+  const applyRepairAction = useCallback(
+    (action: AiRepairAction) => {
+      const request =
+        action.kind === 'rename'
+          ? { action: 'rename' as const, nodeId: action.nodeId, text: action.newName }
+          : action.kind === 'describe'
+            ? { action: 'describe' as const, nodeId: action.nodeId, text: action.newDescription }
+            : action.kind === 'move'
+              ? { action: 'set-parent' as const, nodeId: action.nodeId, text: action.toParentId }
+              : undefined;
+      if (request === undefined) return;
+      void postNodeAction(request)
+        .then((outcome) => {
+          if (!outcome.ok || !outcome.value) {
+            setRepairError(outcome.error ?? '未知错误');
+            return;
+          }
+          if (outcome.value.status !== 'ok') {
+            setRepairError(outcome.value.message ?? '被拒绝');
+            return;
+          }
+          setRepairApplied((previous) => new Set(previous).add(`${action.kind}:${action.nodeId}`));
+          refresh();
+        })
+        .catch((error: unknown) =>
+          setRepairError(error instanceof Error ? error.message : String(error)),
+        );
+    },
+    [refresh],
+  );
+
+  /** 节点的显示名（方案里全是 id，不翻译成人名根本没法看）。 */
+  const nodeNameOf = useCallback(
+    (nodeId: string): string => board?.nodes.find((node) => node.id === nodeId)?.name ?? '',
+    [board?.nodes],
+  );
 
   /**
    * 选中节点 / **取消选中**（`nodeId === undefined`，由画布"点空白处"触发）。
@@ -2402,6 +2717,24 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           // 否则请求被掐断后按钮回到空闲态、树却还在变（真机现场）。
           generating ? '正在生成树…' : '用 AI 建树（直接生成）',
         ),
+        /**
+         * **AI 审树**（0.3.71）：只提议、不改树；会花一次模型调用（点开有确认框）。
+         * 与建树按钮分开：它们是两件不同的事（"从仓库长出树" vs "检查已有树哪里不对"）。
+         */
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            style: { ...styles.headerButton, marginLeft: 8 },
+            onClick: openRepair,
+            disabled: generating,
+            'data-pm-repair-open': '1',
+            title:
+              '让 AI 审一遍这棵树并给出修复方案：只提议、不改树；安全动作（重命名/补描述/移动）可一键采纳，' +
+              '删除/合并/拆分仍需会话或审批。会调用一次模型。',
+          },
+          'AI 审树（只提议）',
+        ),
         React.createElement(
           'span',
           { style: { ...styles.note, marginLeft: 8 } },
@@ -2809,6 +3142,23 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
             onName: setUncoveredName,
             onCreate: createNodeFromUncovered,
             onClose: () => setUncoveredOpen(false),
+          })
+        : null,
+      /**
+       * **AI 审树弹窗**（0.3.71）：`confirm` 先问"会花一次模型调用"，`result` 展示方案。
+       * 删除 / 合并 / 拆分只展示 —— 不能让一次点击就动树（审批与会话通道仍保留）。
+       */
+      repairStage !== undefined
+        ? React.createElement(AiRepairModal, {
+            stage: repairStage,
+            busy: repairBusy,
+            outcome: repairOutcome,
+            error: repairError,
+            applied: repairApplied,
+            nodeNameOf,
+            onStart: startRepair,
+            onApply: applyRepairAction,
+            onClose: closeRepair,
           })
         : null,
       // FR-167：运行中的实时进度已挪进模态框（见 AiBuildModal），标题区不再内联显示。

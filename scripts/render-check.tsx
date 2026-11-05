@@ -16,6 +16,7 @@ import * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import {
+  AiRepairModal,
   BoardPanel,
   BoardView,
   CanvasLegendModal,
@@ -711,6 +712,91 @@ check('未归属改动弹窗（错误要显示）', () => {
     }),
   );
   if (!html.includes('data-pm-uncovered-error')) throw new Error('错误没显示（用户只会以为点了没反应）');
+  return html;
+});
+
+/**
+ * **AI 审树弹窗**（0.3.71）：先确认"会花一次模型调用"，再展示方案。
+ *
+ * 关键是**边界**：重命名/补描述/移动给「采纳」，删除/合并/拆分**只展示** ——
+ * 不能让一次点击就删枝。这一条比"界面好看"重要得多。
+ */
+check('AI 审树：确认页先说明"会调用一次模型、不改树"', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(AiRepairModal, {
+      stage: 'confirm',
+      busy: false,
+      applied: new Set<string>(),
+      nodeNameOf: () => '',
+      onStart: () => {},
+      onApply: () => {},
+      onClose: () => {},
+    }),
+  );
+  if (!html.includes('调用一次模型')) throw new Error('确认页必须说清会花一次模型调用');
+  if (!html.includes('不改任何节点')) throw new Error('确认页必须说清不改树');
+  if (!html.includes('data-pm-repair-start')) throw new Error('确认页没有"开始审查"按钮');
+  return html;
+});
+
+check('AI 审树：方案页只给安全动作「采纳」，删除/合并/拆分只展示', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(AiRepairModal, {
+      stage: 'result',
+      busy: false,
+      applied: new Set<string>(),
+      nodeNameOf: (id) => (id === 'n1' ? '登录页' : id === 'n2' ? '前端' : '未知节点'),
+      outcome: {
+        status: 'ok',
+        summary: '两个同名枝应该合并',
+        route: 'test / model',
+        nodeCount: 12,
+        actions: [
+          { kind: 'rename', nodeId: 'n1', newName: '登录页（旧版）', reason: '名字过时' },
+          { kind: 'move', nodeId: 'n1', toParentId: 'n2', reason: '挂错父节点' },
+          { kind: 'delete', nodeId: 'n1', reason: '与下一节重复' },
+        ],
+        uncertain: [{ nodeIds: ['n1'], question: '这一枝是不是该拆？' }],
+        rejected: [{ reason: 'nodeId 不在白名单', raw: null }],
+        mechanical: { actions: [{}, {}], notes: [] },
+      },
+      error: undefined,
+      onStart: () => {},
+      onApply: () => {},
+      onClose: () => {},
+    }),
+  );
+  if (!html.includes('登录页')) throw new Error('动作里没把 nodeId 翻译成节点名');
+  if (!html.includes('登录页（旧版）')) throw new Error('重命名的新名字丢了');
+  if (!html.includes('前端')) throw new Error('移动的目标父节点名丢了');
+  if (!html.includes('需会话/审批')) throw new Error('删除必须标明要会话/审批，不能给一键采纳');
+  if (!html.includes('data-pm-repair-uncertain')) throw new Error('模型拿不准的部分必须展示');
+  if (!html.includes('data-pm-repair-rejected')) throw new Error('被校验拒掉的提议必须展示（不能静默丢）');
+  /**
+   * 采纳按钮只能出现在安全动作上：三个动作里只有 rename/move 能采纳（delete 不能），
+   * 所以按钮数必须恰好 2。
+   */
+  const applyButtons = occurrences(html, 'data-pm-repair-apply');
+  if (applyButtons !== 2) {
+    throw new Error(`采纳按钮只该出现在安全动作上（实际 ${applyButtons} 个，期望 2）`);
+  }
+  return html;
+});
+
+check('AI 审树：失败要说出来（不许静默）', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(AiRepairModal, {
+      stage: 'result',
+      busy: false,
+      applied: new Set<string>(),
+      nodeNameOf: () => '',
+      error: '模型路由未配置（no-route）',
+      onStart: () => {},
+      onApply: () => {},
+      onClose: () => {},
+    }),
+  );
+  if (!html.includes('data-pm-repair-error')) throw new Error('失败原因没显示');
   return html;
 });
 

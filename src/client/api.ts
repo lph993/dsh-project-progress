@@ -327,6 +327,48 @@ export function postAiCancel(
   return postJson<{ ok: boolean; cancelled: boolean }>('/ai/cancel', {}, signal);
 }
 
+/**
+ * **AI 审树：只提议、不执行**（0.3.71，面板入口）。
+ *
+ * 与工具 `pm_ai_repair` 同一个服务方法 —— 面板只是给"人"一个入口，
+ * 不必先让会话帮忙调一次工具。**它会花一次模型调用**（面板点之前有确认框）。
+ */
+export type AiRepairAction =
+  | { kind: 'merge'; nodeId: string; intoNodeId: string; reason: string }
+  | { kind: 'move'; nodeId: string; toParentId: string; reason: string }
+  | { kind: 'rename'; nodeId: string; newName: string; reason: string }
+  | { kind: 'describe'; nodeId: string; newDescription: string; reason: string }
+  | { kind: 'split'; nodeId: string; suggestedChildren: string[]; reason: string }
+  | { kind: 'delete'; nodeId: string; reason: string };
+
+export type AiRepairOutcome =
+  | {
+      status: 'ok';
+      summary: string;
+      actions: AiRepairAction[];
+      /** 模型自己说拿不准的部分（原样展示，供人判断）。 */
+      uncertain: Array<{ nodeIds: string[]; question: string }>;
+      /** 被校验拒掉的提议（id 不在白名单 / 字段缺失）—— 如实展示，不静默丢。 */
+      rejected: Array<{ reason: string; raw: unknown }>;
+      /** 机械判据（可核对）算出的动作，供"AI 提案 + 规则提案"一起看。 */
+      mechanical: { actions?: unknown[]; notes?: string[] };
+      route: string;
+      nodeCount: number;
+    }
+  | { status: 'denied'; reason: string; hint: string }
+  | { status: 'error'; reason: string; message: string };
+
+export function postAiRepair(
+  sessionId?: string,
+  signal?: AbortSignal,
+): Promise<FetchOutcome<AiRepairOutcome>> {
+  return postJson<AiRepairOutcome>(
+    '/ai/repair',
+    sessionId !== undefined && sessionId !== '' ? { sessionId } : {},
+    signal,
+  );
+}
+
 /** 面板右键菜单的动作（FR-50–58b 的面板路径）。 */
 export type PanelNodeAction =
   | 'focus'

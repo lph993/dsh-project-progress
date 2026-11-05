@@ -18,7 +18,8 @@
  * | GET | `/pm/audit` | 最近写入审计 |
  * | GET | `/pm/health` | 存活与存储路线 |
  * | POST | `/pm/ai/estimate` | AI 建树成本预估（不调模型） |
- * | POST | `/pm/ai/build` | AI 建树（两阶段：先成本后确认） |
+ * | POST | `/pm/ai/build` | AI 建树（异步：立即回 started，结果走看板 `aiLastBuild`） |
+ * | POST | `/pm/ai/repair` | AI 审树（**只提议、不执行**；面板"AI 审树"入口用） |
  * | POST | `/pm/node/action` | 节点菜单动作（FR-50–58b 的面板路径） |
  * | POST | `/pm/branch/remove` | 整枝删除（先 preview 后确认） |
  * | GET | `/pm/snapshots` | 某节点可用的回滚点（`?nodeId=`；菜单要列出快照） |
@@ -399,6 +400,39 @@ export function registerRoutes(
             const result = service.cancelAiBuild();
             debugBus.info('ai', result.cancelled ? '已请求中止建树调用' : '取消请求：当前没有在跑的调用');
             sendJson(res, 200, { ok: true, ...result });
+            return;
+          }
+
+          case 'POST /pm/ai/repair': {
+            /**
+             * **AI 审树（只提议、不执行）**（0.3.71）。
+             *
+             * 与 `pm_ai_repair` 工具同一个服务方法（`aiPlanRepair`）—— 面板只是给"人"一个入口，
+             * 不必先让会话帮忙调一次工具。
+             *
+             * **它会花一次模型调用**：面板在点之前有确认框（"会调用一次模型"）。
+             * 返回体里同时带**被校验拒掉的动作**与**模型自述拿不准的部分**（不静默丢）。
+             */
+            const body = (await readBody(request)).trim();
+            let parsed: { sessionId?: unknown } = {};
+            if (body !== '') {
+              try {
+                parsed = JSON.parse(body) as typeof parsed;
+              } catch {
+                sendJson(res, 400, { ok: false, error: 'invalid-json' });
+                return;
+              }
+            }
+            const sessionId =
+              typeof parsed.sessionId === 'string' && parsed.sessionId !== ''
+                ? parsed.sessionId
+                : (params.get('sessionId') ?? undefined);
+            const outcome = await service.runPanelIntent(sessionId, () =>
+              service.aiPlanRepair({
+                ...(sessionId !== undefined ? { sessionId } : {}),
+              }),
+            );
+            sendJson(res, 200, outcome);
             return;
           }
 

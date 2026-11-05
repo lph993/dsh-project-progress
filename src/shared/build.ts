@@ -547,7 +547,25 @@
  *
  * ⚠️ **本批必须重启宿主**；重启后**刷新面板页面**。
  */
-export const HOST_BATCH = 87;
+/**
+ * ## 批次 88 的用途
+ *
+ * **0.3.71：面板里的「AI 审树」入口**。
+ *
+ * 背景：`pm_ai_repair` 只有模型能用 —— 人想审树得先让会话帮忙调一次工具。
+ * 本批把同一条服务方法接到面板：`POST /pm/ai/repair`（**只提议、不改树**）。
+ *
+ * 宿主侧改动：
+ * - 新路由 `POST /pm/ai/repair` → `runPanelIntent` 包一层 → `service.aiPlanRepair`；
+ * - 返回体带 `actions / uncertain / rejected / mechanical`（被拒的提议与"拿不准"都如实回）。
+ *
+ * 客户端：AI 栏「AI 审树（只提议）」→ 确认（会花一次模型调用）→ 方案弹窗；
+ * **安全动作**（重命名 / 补描述 / 移动）可一键采纳（走既有面板动作，审计/CAS/成环保护都在），
+ * **删除 / 合并 / 拆分只展示**（必须走会话或审批 —— 不能让一次点击就动树）。
+ *
+ * ⚠️ **本批必须重启宿主**；之后刷新页面。
+ */
+export const HOST_BATCH = 88;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {
