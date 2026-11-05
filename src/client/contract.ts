@@ -271,6 +271,8 @@ export interface BoardSnapshot {
     removed?: number;
     proposed?: number;
     failures?: number;
+    /** 失败样例（0.3.73）：面板要能说清"失败的是哪些、为什么"。 */
+    failureSamples?: string[];
     notes?: string[];
     cache?: {
       state: 'hit' | 'resume' | 'miss';

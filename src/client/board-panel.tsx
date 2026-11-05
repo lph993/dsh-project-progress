@@ -1500,13 +1500,19 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     removed?: number;
     proposed?: number;
     failures?: number;
+    failureSamples?: string[];
     notes?: string[];
     cache?: AiCacheView;
   }): string =>
     `AI 建树完成：新建 ${value.created ?? 0} 个、更新 ${value.updated ?? 0} 个` +
     ((value.removed ?? 0) > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
     `（模型提出 ${value.proposed ?? 0} 个节点）` +
-    ((value.failures ?? 0) > 0 ? `，失败 ${value.failures} 个` : '') +
+    ((value.failures ?? 0) > 0
+      ? `，失败 ${value.failures} 个` +
+        ((value.failureSamples?.length ?? 0) > 0
+          ? `\n失败样例：${(value.failureSamples ?? []).join('；')}`
+          : '')
+      : '') +
     (value.cache?.state === 'hit'
       ? `\n本次命中缓存，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
       : value.cache?.state === 'resume'

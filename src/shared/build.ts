@@ -550,22 +550,34 @@
 /**
  * ## 批次 88 的用途
  *
- * **0.3.71：面板里的「AI 审树」入口**。
+ * **0.3.71：面板里的「AI 审树」入口** —— `POST /pm/ai/repair` → `aiPlanRepair`（只提议、不改树）。
+ * 返回 `actions / uncertain / rejected / mechanical`；安全动作（重命名/补描述/移动）可一键采纳，
+ * 删除/合并/拆分只展示（必须走会话或审批）。
  *
- * 背景：`pm_ai_repair` 只有模型能用 —— 人想审树得先让会话帮忙调一次工具。
- * 本批把同一条服务方法接到面板：`POST /pm/ai/repair`（**只提议、不改树**）。
+ * ⚠️ 本批必须重启宿主；之后刷新页面。
+ */
+/**
+ * ## 批次 89 的用途
  *
- * 宿主侧改动：
- * - 新路由 `POST /pm/ai/repair` → `runPanelIntent` 包一层 → `service.aiPlanRepair`；
- * - 返回体带 `actions / uncertain / rejected / mechanical`（被拒的提议与"拿不准"都如实回）。
+ * **0.3.73：修"建树收尾读错项目"（真机：updater 建树，体检却在读插件项目）**。
  *
- * 客户端：AI 栏「AI 审树（只提议）」→ 确认（会花一次模型调用）→ 方案弹窗；
- * **安全动作**（重命名 / 补描述 / 移动）可一键采纳（走既有面板动作，审计/CAS/成环保护都在），
- * **删除 / 合并 / 拆分只展示**（必须走会话或审批 —— 不能让一次点击就动树）。
+ * 现场：2026-11-05 06:11 起 updater 分批建树（188 秒），06:13:50 的收尾阶段日志里
+ * 项目在 `E:\thirty\dsh-project-progress` 与 `e:/Go/updater` 之间每 1~4 秒来回切；
+ * `aiLastBuild.notes` 里的"树体检：46 节点 / 根 dsh-project-progress"其实是**插件项目**的树。
+ * 数据没写错（落点守卫挡住了写入），但结论全错。
+ *
+ * 两个根因，一起修：
+ * 1. **面板作用域用实例字段 + 保存/恢复**，并发面板轮询会互相覆盖 —— 换成 `AsyncLocalStorage`，
+ *    每条异步链看自己的作用域；
+ * 2. **作用域 TTL 120 秒**：建树动辄 2~4 分钟，后半段解析根时作用域已过期、退回"会话 cwd"。
+ *    `withPanelIntent` 现在把作用域标记为 `pinned`（整段操作期间不判 TTL）；
+ *    `treeHealthSummary` 增加 `expectedRoot` 落点核对。
+ *
+ * 顺带：`aiLastBuild` 增加 `failureSamples`（前 5 条失败原因）—— 否则"失败 39 个"没法解释。
  *
  * ⚠️ **本批必须重启宿主**；之后刷新页面。
  */
-export const HOST_BATCH = 88;
+export const HOST_BATCH = 89;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

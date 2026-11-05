@@ -9,6 +9,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 // 纯类型导入：加载 DSH 的服务接口增补（`ctx.fs` / `ctx.storageDomain` / `ctx.settings`）。
@@ -700,6 +701,8 @@ export interface AiLastBuildView {
   removed?: number;
   proposed?: number;
   failures?: number;
+  /** 失败样例（0.3.73）：只留前几条原因，否则"失败 39 个"没法解释、也没法修。 */
+  failureSamples?: string[];
   notes?: string[];
   cache?: {
     state: 'hit' | 'resume' | 'miss';
@@ -1648,37 +1651,24 @@ export class ProjectService {
      * 后果：同一个会话在 A 干活、面板切到 B 时，**工具调用会被绑到 B 的项目**、
      * 交接文档会落进 **B 的工作区**。也就是说我当时在注释里写的"写路径不受影响"是**错的**。
      *
-     * 现在的口径：
-     * - `board()` 用 `withPanelScope()` 把作用域**临时**放进 `activePanelScope`，
-     *   读取结束（含它内部 `derive`/`bindForCall` 的那些调用）就恢复；
-     * - 这个字段的时间戳受 `PANEL_SCOPE_TTL_MS` 约束，过期即视为没有；
-     * - **`activePanelScope` 之外的一切调用（工具、写路径、后台任务）看不到面板作用域** ——
+     * 现在的口径（0.3.73 起是**异步链路隔离**，不再是实例字段）：
+     * - `board()` / `withPanelIntent()` 用 `withPanelReadContext()` 把作用域放进
+     *   `AsyncLocalStorage`，**只有这条异步链**能看到，`await` 期间别人不会读到；
+     * - 这个作用域的时间戳受 `PANEL_SCOPE_TTL_MS` 约束，过期即视为没有；
+     * - **作用域之外的调用（工具、写路径、后台任务）看不到面板作用域** ——
      *   它们只认调用会话自己的 cwd。这个区分有 e2e 专门钉住，不许再被合并。
      */
     /**
-     * **只有"面板读取"上下文才认面板作用域**（0.3.27 修并发泄漏，见 `panelReadDepth` 的注释）。
+     * **只有"面板读取"上下文才认面板作用域**（0.3.27 的闸门，0.3.73 挂到 ALS 的值上）。
      *
-     * 原先这里无条件读 `activePanelScope` ⇒ 面板读取的 `await` 期间，
-     * 同一会话的工具调用也会读到它（写入被绑到面板在看的工作区）。
-     * 现在多一道 `panelReadDepth > 0`：**只有 `board()` 那条链内部才可能为真**，
-     * 工具路径（`bindForCall(sessionId)`）永不置位 ⇒ 看不到面板作用域。
+     * 为什么还需要这道闸门：`sessionRoots` 里没有该会话记录时（进程刚起来、
+     * 该会话还没报过根），分支顺序会让面板作用域接住它 —— 而"面板读得久一点"
+     * 恰好就是这个窗口。`readContext: true` 表示"这次调用是面板自己发起的读取/操作"，
+     * 工具路径（`bindForCall(sessionId)`）拿到的 store 里永远没有这一位。
      */
-    /**
-     * **只有"面板读取/面板意图"上下文才认面板作用域**（0.3.27）。
-     *
-     * ## 先说清楚：这条闸门是**纵深防御**，不是当前唯一防线
-     *
-     * 独立审查报了"面板读取 `await` 期间同一会话的工具写入会被面板作用域劫持"。
-     * 我按那条推理去实测，结论是**在真实路径上不成立**：下面第 ② 条
-     * `sessionRoots.get(sessionId)` **优先级更高**，而工具的 cwd 每轮都会报
-     * （`noteWorkspaceRoot`），所以具名会话**根本走不到这条面板分支**。
-     *
-     * 那为什么还留着这道闸门：`sessionRoots` 里没有该会话记录时（进程刚起来、
-     * 该会话还没报过根），分支顺序就会让面板作用域接住它 —— 而"面板读得久一点"
-     * 恰好就是这个窗口。加一道 `panelReadDepth > 0` 成本为零、语义明确
-     * （**只有面板自己发起的读取/操作才认面板作用域**），把那条理论路径也堵上。
-     */
-    const scope = this.panelReadDepth > 0 ? this.effectivePanelScope(sessionId) : undefined;
+    const activeScope = this.panelScopeStore.getStore();
+    const scope =
+      activeScope?.readContext === true ? this.effectivePanelScope(sessionId, activeScope) : undefined;
     if (scope !== undefined) {
       return {
         root: scope.root,
@@ -1725,89 +1715,97 @@ export class ProjectService {
    * 面板最后一次显式声明的工作区（`GET /pm/board?root=…`）。
    *
    * **持久**保存是因为面板每轮轮询都可能不带 `root`（只带 `sessionId`），需要记住上次声明；
-   * 但它只在 `board()` 读取期间被 `withPanelScope()` 提升为"生效作用域"（`activePanelScope`），
+   * 但它只在 `board()` 读取期间被 `withPanelReadContext()` 提升为"生效作用域"（ALS 里的值），
    * 其它任何路径（工具调用、写路径、后台任务）都看不到它 —— 见 `resolveRoot` 的长注释。
    */
   private panelScopeRoot: { root: string; sessionId?: string; at: number } | undefined;
   /**
-   * **当前正在生效**的面板作用域（只在 `withPanelScope()` 的作用域内非空）。
+   * **当前生效**的面板作用域 —— 用 `AsyncLocalStorage` 做**异步上下文隔离**（0.3.73）。
    *
-   * 为什么要这个中间层：`board()` 内部会经 `derive` → `bindForCall` → `resolveRoot`
-   * 转好几道，"面板在看 B"这个上下文必须**活着穿过这些调用**，否则刚绑好的项目会被
-   * 会话自己的 cwd 拨回去（"切了工作区还是同一棵树"就是它）。
-   * 但同一个字段若长期非空，就会污染写路径（0.3.13 审查抓到的那个缺陷）。
+   * ## 为什么必须换成 ALS（真机事故：建树结尾读错了项目）
+   *
+   * 原实现是**实例字段 + 进入时保存/退出时恢复**。它只对"同一时刻只有一条调用链"成立；
+   * 而本插件的日常形态是 **面板每 2 秒轮询 + 建树跑好几分钟**：两条链交错时，
+   * A 保存的 `previous` 可能是 B 刚设的值，退出时就把对方的上下文**写回去** ——
+   * 于是建树进程里的 `resolveRoot` 读到的是"别人面板刚设的根"。
+   *
+   * 2026-11-05 真机现场：updater 分批建树跑到最后的**树体检/归拢**阶段，
+   * 日志里项目在 `E:\thirty\dsh-project-progress` 与 `e:/Go/updater` 之间每 1~4 秒
+   * 来回切；体检因此读了**另一个项目**（46 节点、根 dsh-project-progress），
+   * 写进 `aiLastBuild.notes` 的"树体检"结论全是错的（数据本身没写错：落点守卫挡住了写入）。
+   *
+   * ALS 让每条异步链看到**自己的**作用域：面板轮询互相覆盖不了，建树也不受轮询影响。
+   * 语义与旧的"瞬时字段"一致（作用域之外看不见），只是并发安全。
    */
-  private activePanelScope: { root: string; sessionId?: string; at: number } | undefined;
+  private readonly panelScopeStore = new AsyncLocalStorage<{
+    root: string;
+    sessionId?: string;
+    at: number;
+    /**
+     * 这条链是不是"面板读取/面板意图"上下文（旧 `panelReadDepth > 0` 的等价物）。
+     * 只有它为真时 `resolveRoot` 才认面板作用域 —— 工具路径永远没有它。
+     */
+    readContext?: boolean;
+    /**
+     * **钉住**（0.3.73）：面板意图一旦提升，**整段操作期间都不再受 `PANEL_SCOPE_TTL_MS` 约束**。
+     *
+     * 真机现场：建树跑了 188 秒，而 TTL 是 120 秒 —— 建树后半段（覆盖回填/归拢/树体检）
+     * 解析根时作用域**已经过期**，于是退回"会话 cwd"，读到了另一个项目。
+     * TTL 的意义是"别拿很久以前的面板声明当现在的意图"，而**已经开始的这一段操作**
+     * 不存在这个问题：它的目标在开始那一刻就定了。
+     */
+    pinned?: boolean;
+  }>();
 
   /**
    * **当前生效的面板作用域**（判据只写在这里一处）。
    *
-   * 生效条件三条，缺一不可：① `withPanelScope` 提升过它（或调用方显式读了持久值）；
+   * 生效条件三条，缺一不可：① 这条异步链上`run`过作用域（或调用方显式读了持久值）；
    * ② 会话一致（`undefined`/空 = 无会话约束）；③ 未超 `PANEL_SCOPE_TTL_MS`。
    */
   private effectivePanelScope(
     sessionId: string | undefined,
-    source: { root: string; sessionId?: string; at: number } | undefined = this.activePanelScope,
+    source:
+      | { root: string; sessionId?: string; at: number; pinned?: boolean }
+      | undefined = this.panelScopeStore.getStore(),
   ): { root: string; sessionId?: string; at: number } | undefined {
     if (source === undefined) return undefined;
     if (sessionId !== undefined && sessionId !== '' && source.sessionId !== sessionId) return undefined;
-    if (Date.now() - source.at > PANEL_SCOPE_TTL_MS) return undefined;
+    /** `pinned`：一段**已经开始**的面板操作（如建树）在整段期间都认自己的落点。 */
+    if (source.pinned !== true && Date.now() - source.at > PANEL_SCOPE_TTL_MS) return undefined;
     return source;
   }
 
   /**
-   * **这次解析是不是"面板读取"上下文**（0.3.27，独立审查抓到的高危）。
+   * **这条异步链是不是"面板读取/面板意图"上下文**（0.3.27 的闸门，0.3.73 改成链路隔离）。
    *
-   * ## 缺陷（我 0.3.13 声称"修好了写路径"，其实只是换了个入口）
+   * 历史：0.3.13 用实例字段当上下文，审查抓出"面板读取的 `await` 期间同一会话的工具写入
+   * 会被面板作用域劫持"；0.3.27 用 `panelReadDepth` 计数器挡住工具路径。
    *
-   * `activePanelScope` 是**实例字段**，`withPanelScope` 只保证"退出时恢复"，
-   * **不保证并发隔离**：`board()` 在 `await derive()/readGraph()` 期间该字段仍是面板根，
-   * 而同一会话此刻发起的 `pm_progress` 会经 `bindForCall(sessionId) → resolveRoot(sessionId)`
-   * 读到它 ⇒ **写入被绑到面板在看的工作区**。触发条件正是这个插件的日常用法
-   * （会话在 A 干活、面板切到 B 看别处）。
-   *
-   * 原有那道 `inFlightProject` 守卫**只护匿名调用**，具名会话（工具调用的形态）绕过它。
-   *
-   * ## 修法：把"读上下文"从隐式字段改成**显式标记**
-   *
-   * 只有 `board()` 这条读路径会把它置位；**工具路径（`pm_*`）永不置位**，
-   * 于是它们解析根时**看不到面板作用域**，与 0.3.13 想要的口径一致。
-   * 用一个**计数器**而不是布尔：面板读取可能嵌套/并发，退出时按层还。
+   * 现在判据挂在 `panelScopeStore` 的值上（`readContext: true`）——
+   * 只有 `withPanelReadContext`（`board()` 与 `withPanelIntent`）会设它，
+   * **工具路径永远没有它**，语义与计数器一致，但并发链之间互不影响。
    */
-  private panelReadDepth = 0;
-
   private async withPanelReadContext<T>(
     scope: { root: string; sessionId?: string; at: number } | undefined,
     run: () => Promise<T>,
   ): Promise<T> {
-    const previous = this.activePanelScope;
-    this.activePanelScope = scope;
-    this.panelReadDepth += 1;
-    try {
-      return await run();
-    } finally {
-      this.panelReadDepth -= 1;
-      this.activePanelScope = previous;
-    }
+    const withFlag =
+      scope === undefined ? undefined : { ...scope, readContext: true as const };
+    return await this.panelScopeStore.run(withFlag, run);
   }
 
   /**
-   * 在"面板作用域生效"的上下文里执行一段代码（只有 `board()` 用）。
+   * 在"面板作用域生效"的上下文里执行一段代码（只想提升作用域、不要 readContext 闸门时用）。
    *
-   * 语义刻意做成**瞬时**：进入时提升、退出时恢复（用 `try/finally`，抛错也要恢复 ——
-   * 否则一次失败的面板读取会把这个会话的写路径永久带偏）。
+   * 语义与旧版一致（瞬时），但**并发隔离**：`AsyncLocalStorage.run` 只影响这条异步链，
+   * 不会像实例字段那样被面板轮询的保存/恢复写成别人的根。
    */
   private async withPanelScope<T>(
     scope: { root: string; sessionId?: string; at: number } | undefined,
     run: () => Promise<T>,
   ): Promise<T> {
-    const previous = this.activePanelScope;
-    this.activePanelScope = scope;
-    try {
-      return await run();
-    } finally {
-      this.activePanelScope = previous;
-    }
+    return await this.panelScopeStore.run(scope, run);
   }
 
   /**
@@ -1838,12 +1836,18 @@ export class ProjectService {
   ): Promise<T> {
     const scope = this.effectivePanelScope(sessionId, this.panelScopeRoot);
     /**
-     * 用 `withPanelReadContext`：面板发起的操作**也需要** `panelReadDepth` 置位，
-     * 否则它内部的 `bindForCall/derive` 解析根时会被那道闸门挡住
-     * （`resolveRoot` 只在深度 > 0 时才认面板作用域）—— 那就把面板意图打成空补丁了。
-     * 它**不会**因此泄漏给工具调用：工具路径根本不经过 `withPanelIntent`。
+     * **钉住整段操作**（0.3.73）：`readContext` 让内部的 `bindForCall/derive` 认面板作用域；
+     * `pinned` 让它在整段期间不受 TTL 约束 —— 建树动辄 2~4 分钟，而 TTL 只有 120 秒。
+     * 不钉住的话，后半段（回填/归拢/体检）会退回"会话 cwd"，读到另一个项目（真机现场）。
+     *
+     * ALS 保证它只影响这条异步链：工具调用与其它面板轮询都看不到。
      */
-    return await this.withPanelReadContext(scope, run);
+    return await this.panelScopeStore.run(
+      scope === undefined
+        ? undefined
+        : { ...scope, at: Date.now(), readContext: true, pinned: true },
+      run,
+    );
   }
 
   /**
@@ -6820,6 +6824,13 @@ export class ProjectService {
         removed: outcome.removed,
         proposed: outcome.proposed,
         failures: outcome.failures.length,
+        ...(outcome.failures.length > 0
+          ? {
+              failureSamples: outcome.failures
+                .slice(0, 5)
+                .map((failure) => `${failure.name}：${failure.reason}`),
+            }
+          : {}),
         notes: outcome.notes,
         cache: outcome.cache,
       };
@@ -7394,7 +7405,7 @@ export class ProjectService {
      *
      * **只报，不改**：体检与修复是两个入口，混在一起出了错就分不清是谁干的。
      */
-    const healthLine = await this.treeHealthSummary(input.sessionId);
+    const healthLine = await this.treeHealthSummary(input.sessionId, root);
     return {
       status: 'ok',
       projectName: applied.projectName,
@@ -7965,7 +7976,7 @@ export class ProjectService {
      * **树体检放在最后**（0.3.54）：它要反映的是**最终**这棵树，而不是某个中间态。
      * （0.3.53 我把它夹在回填与归拢之间，报出来的就是"归拢之前"的形状。）
      */
-    const shardedHealth = await this.treeHealthSummary(input.sessionId);
+    const shardedHealth = await this.treeHealthSummary(input.sessionId, input.root);
     mark('树体检');
     /**
      * 总账：一行看清"这十几分钟花在哪"（0.3.63）。
@@ -9815,9 +9826,17 @@ export class ProjectService {
   }
   /**
    * 树体检的一行摘要（进建树说明用）。**拿不到图就返回 `undefined`** —— 不编。
+   *
+   * `expectedRoot`（0.3.73）：建树收尾阶段传入本次仓库，体检前先核对落点。
+   * 真机现场：面板轮询把绑定拨走时，体检读到了**另一个项目**（46 节点、根 dsh-project-progress），
+   * 于是 updater 的建树说明里写着别人的树 —— 数据没错，结论全错。
    */
-  private async treeHealthSummary(sessionId?: string): Promise<string | undefined> {
+  private async treeHealthSummary(
+    sessionId?: string,
+    expectedRoot?: string,
+  ): Promise<string | undefined> {
     try {
+      await this.ensureLanding(expectedRoot);
       const report = await this.treeHealth(sessionId);
       return summarizeHealth(report);
     } catch (error) {
