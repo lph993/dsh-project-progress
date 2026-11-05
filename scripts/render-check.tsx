@@ -801,6 +801,75 @@ check('AI 审树：失败要说出来（不许静默）', () => {
 });
 
 /**
+ * **上一轮建树的记录**（0.3.72）：异步之后结果只在弹窗里，关掉就没了 ——
+ * 面板上要留一行"上次建树：新建 X、更新 Y（时间）"，并能点「详情」重看。
+ */
+check('BoardView（上一轮建树：留在面板上，可点详情；生成中不显示）', () => {
+  const lastOk = renderToStaticMarkup(
+    React.createElement(BoardView, {
+      board: {
+        ...board,
+        aiLastBuild: {
+          at: '2026-11-05T06:00:00.000Z',
+          projectId: 'pm_test',
+          status: 'ok',
+          created: 5,
+          updated: 2,
+        },
+      },
+      error: undefined,
+      refresh: () => {},
+      sessionId: 'session-test',
+    }),
+  );
+  if (!lastOk.includes('data-pm-last-build="ok"')) throw new Error('上一次建树的结果没有留在面板上');
+  if (!lastOk.includes('上次建树：新建 5、更新 2')) throw new Error('结果文案不对');
+  if (!lastOk.includes('data-pm-last-build-detail')) throw new Error('没有「详情」入口（关掉弹窗就再也看不到了）');
+
+  const failing = renderToStaticMarkup(
+    React.createElement(BoardView, {
+      board: {
+        ...board,
+        aiLastBuild: {
+          at: '2026-11-05T06:00:00.000Z',
+          projectId: 'pm_test',
+          status: 'error',
+          message: '模型路由未配置',
+        },
+      },
+      error: undefined,
+      refresh: () => {},
+      sessionId: 'session-test',
+    }),
+  );
+  if (!failing.includes('data-pm-last-build="error"')) throw new Error('失败也要留下一条记录');
+  if (!failing.includes('上次建树：失败')) throw new Error('失败文案不对');
+
+  const building = renderToStaticMarkup(
+    React.createElement(BoardView, {
+      board: {
+        ...board,
+        aiBuildRunning: true,
+        aiLastBuild: {
+          at: '2026-11-05T06:00:00.000Z',
+          projectId: 'pm_test',
+          status: 'ok',
+          created: 5,
+          updated: 2,
+        },
+      },
+      error: undefined,
+      refresh: () => {},
+      sessionId: 'session-test',
+    }),
+  );
+  if (building.includes('data-pm-last-build=')) {
+    throw new Error('正在生成时不该再显示"上次建树"（会让人以为是这一轮的）');
+  }
+  return lastOk;
+});
+
+/**
  * 防复发的**重复**断言（用户口径："右键有这个功能，功能性重复。又是重复，你全局审查下吧"）：
  * 「重复」在本项目已经发生多次 —— ① 同一个删除入口同时出现在右键菜单与画布工具条；
  * ② 同一个数字串在同一格/同一屏里说两遍（FR-153 ③/④）。

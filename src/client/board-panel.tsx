@@ -1518,6 +1518,16 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
   const aiStoppedNotice =
     '已停止生成：这一轮不再继续（已写入的节点会保留，已拿到的输出会存成续跑缓存）。';
 
+  /** 「上一轮建树」的一行记录（0.3.72）：关掉弹窗之后，结果仍然留在面板上。 */
+  const lastBuildLine = (value: NonNullable<BoardSnapshot['aiLastBuild']>): string => {
+    const time = new Date(value.at).toLocaleTimeString();
+    if (value.status === 'ok') {
+      return `上次建树：新建 ${value.created ?? 0}、更新 ${value.updated ?? 0}（${time}）`;
+    }
+    if (value.status === 'aborted') return `上次建树：已停止（${time}）`;
+    return `上次建树：失败（${time}）`;
+  };
+
   /**
    * **发起一轮建树**（0.3.64 收口）。
    *
@@ -1703,6 +1713,43 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     setAiError(undefined);
     setAiNotice(undefined);
   }, []);
+
+  /**
+   * **Esc 关闭弹窗**（0.3.72）：三个新弹窗（AI / 未归属改动 / AI 审树）此前只能用按钮关。
+   *
+   * 边界与点遮罩完全一致：**执行中不许关**（AI 弹窗在生成中、审树在请求中、新建在飞时）。
+   * 图例与未完成清单各有自己的 Esc 处理，这里只管这三个。
+   */
+  useEffect(() => {
+    const onKey = (event: globalThis.KeyboardEvent): void => {
+      if (event.key !== 'Escape') return;
+      if (uncoveredOpen && !uncoveredBusy) {
+        setUncoveredOpen(false);
+        return;
+      }
+      if (repairStage !== undefined && !repairBusy) {
+        setRepairStage(undefined);
+        return;
+      }
+      if (generating) return;
+      if (aiPrompt !== undefined || aiResult !== undefined || aiError !== undefined || aiNotice !== undefined) {
+        closeAiModal();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [
+    aiError,
+    aiNotice,
+    aiPrompt,
+    aiResult,
+    closeAiModal,
+    generating,
+    repairBusy,
+    repairStage,
+    uncoveredBusy,
+    uncoveredOpen,
+  ]);
 
   /**
    * **中止正在跑的这一轮建树**（FR-168，用户口径："执行中…只能明确点取消或关闭"）。
@@ -2740,6 +2787,39 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
           { style: { ...styles.note, marginLeft: 8 } },
           '只发送目录骨架与关键文件签名；建树、相对工作量、完成度初判在同一次调用里完成。',
         ),
+        /**
+         * **上一轮建树的记录**（0.3.72）：异步建树的结果只存在于弹窗里 ——
+         * 关掉/刷新之后就看不到了。这条让"刚才那轮建了什么"留在面板上，
+         * 「详情」可以重新打开结果（错误也可以重新看）。
+         *
+         * 只对**本项目的**上一轮显示（`aiLastBuild` 由宿主按项目过滤）；旧宿主没有该字段 ⇒ 不显示。
+         */
+        board?.aiLastBuild != null && !generating
+          ? React.createElement(
+              'span',
+              {
+                style: { ...styles.note, flexBasis: '100%', marginTop: 4, marginLeft: 0 },
+                'data-pm-last-build': board.aiLastBuild.status,
+              },
+              `${lastBuildLine(board.aiLastBuild)} `,
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  style: { ...styles.headerButton, marginLeft: 4 },
+                  'data-pm-last-build-detail': '1',
+                  onClick: () => {
+                    const last = board.aiLastBuild;
+                    if (last == null) return;
+                    if (last.status === 'ok') setAiResult(aiAsyncSummary(last));
+                    else if (last.status === 'aborted') setAiNotice(aiStoppedNotice);
+                    else setAiError(last.message ?? '建树失败（宿主没有给出原因）');
+                  },
+                },
+                '详情',
+              ),
+            )
+          : null,
       ),
       /**
        * **「删除此项目」的确认弹窗**（0.3.24，用户口径："删除此项目 没有取消操作，
