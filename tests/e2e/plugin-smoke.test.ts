@@ -6103,3 +6103,133 @@ test('面板动作 add-child 支持 refs：新节点当场带上引用', async (
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+
+/**
+ * **异步建树**（0.3.70）：`POST /pm/ai/build` 立即返回 `started`，结果随看板回传。
+ *
+ * 0.3.63 的真机事实：一次分批建树跑了 **11 分 36 秒**，浏览器/代理把长连接掐断 ⇒
+ * 面板只拿到 `Failed to fetch`，而树其实建好了。长连接必被掐 —— 所以路由不能等结果。
+ *
+ * 这条用例钉三件事：
+ * ① 路由**不阻塞**：模型还在"跑"时响应就已经回来了（用永不结束的假流证明）；
+ * ② 单飞闸门在**异步占位**下仍然有效（第二个请求立刻被拒）；
+ * ③ 结果确实落在 `board.aiLastBuild`（面板就是靠它收尾的）。
+ */
+test('异步建树：POST 立即返回 started，结果随 aiLastBuild 回传（0.3.70）', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-async-build-'));
+  mkdirSync(join(workspace, 'src'), { recursive: true });
+  writeFileSync(join(workspace, 'src', 'a.ts'), 'export const a = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', {
+    currentSelection: () => ({ provider: 'test-provider', model: 'test-model' }),
+  });
+  /** 等测试放行的假流：证明"响应回来时模型调用还没结束"。 */
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let modelStreams = 0;
+  const json = JSON.stringify({
+    projectName: '异步演示',
+    nodes: [{ name: '异步演示', kind: 'feature', parent: null, description: '本体' }],
+  });
+  ctx.services.set('llm', {
+    stream: () => {
+      modelStreams += 1;
+      return (async function* () {
+        await gate;
+        yield { type: 'block-start', index: 0, blockType: 'text' };
+        yield { type: 'text-delta', index: 0, text: json };
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: json } };
+        yield { type: 'finish', reason: 'stop' };
+      })();
+    },
+  });
+
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    board(): Promise<{
+      aiBuildRunning: boolean;
+      aiLastBuild: { status: string; created?: number; at: string } | null;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const route = ctx.registeredRoutes.find((entry) => entry.path === '/pm');
+  assert.ok(route, '未注册 /pm 前缀路由');
+  const call = async (
+    url: string,
+    method: string,
+    body?: string,
+  ): Promise<{ status: number; text: string }> => {
+    let status = 0;
+    let text = '';
+    const res = {
+      writeHead(code: number) {
+        status = code;
+      },
+      end(chunk?: string) {
+        text = chunk ?? '';
+      },
+    };
+    const req = {
+      url,
+      method,
+      on:
+        body === undefined
+          ? undefined
+          : (event: string, listener: (...args: unknown[]) => void) => {
+              if (event === 'data') listener(body);
+              if (event === 'end') listener();
+            },
+    };
+    await route.handler(req, res);
+    return { status, text };
+  };
+
+  const t0 = Date.now();
+  const started = await call('/pm/ai/build', 'POST', JSON.stringify({ confirm: true }));
+  const elapsed = Date.now() - t0;
+  assert.equal(started.status, 200);
+  const startedBody = JSON.parse(started.text) as { status?: string; at?: string };
+  assert.equal(startedBody.status, 'started', `路由必须立即回 started：${started.text}`);
+  assert.ok(
+    elapsed < 1500,
+    `路由不该等模型（等了 ${elapsed}ms）—— 长连接必被掐断，这正是 0.3.63 的现场`,
+  );
+  assert.equal(typeof startedBody.at, 'string', 'started 要带上发起时刻（面板用它分辨结果归属）');
+
+  // 单飞：异步占位之后，第二个请求也必须立刻被拒
+  const second = await call('/pm/ai/build', 'POST', JSON.stringify({ confirm: true }));
+  const secondBody = JSON.parse(second.text) as { status?: string; reason?: string };
+  assert.equal(secondBody.status, 'denied', `第二轮必须被拒：${second.text}`);
+  assert.equal(secondBody.reason, 'build-in-progress');
+
+  // 等后台真的进到模型调用，再放行
+  for (let i = 0; i < 200 && modelStreams === 0; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(modelStreams, 1, '后台应当真的发起了模型调用');
+  assert.equal((await service.board()).aiBuildRunning, true, '看板要如实说"正在跑"');
+  release?.();
+
+  // 结果随看板回传（面板不靠 HTTP 响应收尾）
+  let last: { status: string; created?: number; at: string } | null = null;
+  for (let i = 0; i < 300; i += 1) {
+    last = (await service.board()).aiLastBuild;
+    if (last !== null) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(last, '后台跑完之后 aiLastBuild 必须有值（否则面板永远收不了尾）');
+  assert.equal(last?.status, 'ok');
+  assert.equal(last?.created, 1);
+  assert.equal((await service.board()).aiBuildRunning, false, '结束后必须回到空闲');
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});

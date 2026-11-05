@@ -526,7 +526,28 @@
  *
  * ⚠️ **本批必须重启宿主**才生效；之后刷新页面。
  */
-export const HOST_BATCH = 86;
+/**
+ * ## 批次 87 的用途
+ *
+ * **0.3.70：建树异步化** —— `POST /pm/ai/build` 立即返回 `started`，结果随看板回传。
+ *
+ * 0.3.63 的真机事实：一次分批建树跑了 **11 分 36 秒**，浏览器/代理把长连接掐断 ⇒
+ * 面板只拿到 `Failed to fetch`，而树其实建好了。**长连接必被掐，与阶段快慢无关**。
+ *
+ * 宿主侧改动：
+ * - `service.startAiBuild(input)`：同步占位（`aiBuildPendingToken`，防两个请求同时过闸门）→
+ *   后台跑 `aiBuildTree` → 结果写 `aiLastBuild`（含 `at` = 发起时刻、`projectId`）；
+ * - `aiBuildTree` 的闸门认领占位 token；新增内部回调 `onProjectBound`（结果按项目挂）；
+ * - `board.aiLastBuild`：面板靠 `at` 判断"这是不是我刚发起的那一轮"；
+ * - 路由：`confirm:true` 走 `startAiBuild`；`confirm:false` / `estimateOnly` 仍走同步估价。
+ *
+ * 客户端：识别 `started` → 进入等待态（`aiAwaiting`）；结果 effect 用
+ * `isAiBuildResultFor(at, startedAt)` 认领；异步后**不在 finally 里关 busy**
+ * （请求回了 ≠ 建完了）。取消 → `aiLastBuild.status = 'aborted'` → 「已停止生成」。
+ *
+ * ⚠️ **本批必须重启宿主**；重启后**刷新面板页面**。
+ */
+export const HOST_BATCH = 87;
 
 /** 批次的中文说法（界面直接用，免得每处各写一遍）。 */
 export function describeHostBatch(batch: number | undefined): string {

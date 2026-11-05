@@ -55,7 +55,7 @@ test('生成中必须渲染弹窗（否则里面的停止入口跟着消失）',
   assert.match(source, /isAiBuildGenerating\(aiBusy, board\)/, '生成判据要合并"本地请求 + 宿主事实"');
   assert.match(
     source,
-    /import \{ isAiBuildGenerating \} from '\.\/build-state\.ts'/,
+    /import \{ isAiBuildGenerating(?:, isAiBuildResultFor)? \} from '\.\/build-state\.ts'/,
     '判据收在纯函数模块里（三个来源的语义由 tests/client/build-state.test.ts 钉住）',
   );
   /**
@@ -190,4 +190,24 @@ test('「删除此项目」执行中必须上锁（0.3.37）', () => {
   assert.match(source, /if \(deleting\) return;\s*\n\s*cancelDeleteProject\(\);/, '执行中点遮罩不许关弹窗');
   assert.match(source, /if \(deleting\) return;/, 'doDeleteProject 必须防重入');
   assert.match(source, /deleting \? '删除中…' : '确认删除'/, '确认按钮要改口成"删除中…"');
+});
+/**
+ * **异步建树的接线**（0.3.70）：HTTP 只回 `started`，结果必须从看板收。
+ *
+ * 这是"长连接必被掐断"（0.3.63）的结构性修法 —— 如果面板又把结果挂回 HTTP 响应，
+ * 就等于把那个失败模式请回来。所以这里钉住四段接线：
+ * ① 识别 `started`；② 进入等待态；③ 异步后**不许**在 finally 里关掉 busy；
+ * ④ 用 `aiLastBuild` + 归属判据收尾。
+ */
+test('异步建树：started 后进入等待态，结果从 aiLastBuild 收（0.3.70）', () => {
+  const source = panelSource();
+  assert.match(source, /value\?\.status === 'started'/, '必须识别异步开工的 started');
+  assert.match(source, /setAiAwaiting\(\{ startedAt/, 'started 之后要进入"等结果"状态');
+  assert.match(
+    source,
+    /if \(!aiStartedAsync\.current\) setAiBusy\(false\)/,
+    '异步开工后 finally 不许关掉 busy（请求回了 ≠ 建完了）',
+  );
+  assert.match(source, /isAiBuildResultFor\(lastBuild\.at, aiAwaiting\.startedAt\)/, '结果必须按"发起时刻"认领');
+  assert.match(source, /board\?\.aiLastBuild/, '结果来自看板，不是 HTTP 响应');
 });

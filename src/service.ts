@@ -667,11 +667,45 @@ export interface BoardSnapshot {
    */
   aiBuildRunning: boolean;
   /**
+   * **上一轮建树的最终结果**（0.3.70，异步建树）。
+   *
+   * 异步之后结果不再走 HTTP 响应（长连接必被掐），而是随看板回传：
+   * 面板拿它判断"我刚发起的那一轮结束了没有、结果是什么"。
+   * **按项目过滤**：只有那一轮建的那个项目才看得到。
+   */
+  aiLastBuild: AiLastBuildView | null;
+  /**
    * 工作区根的解析结果（诊断用）。
    *
    * 面板空着的头号原因就是这里为 `none` —— 让它直接可见，省得再猜。
    */
   workspaceRoot: { value: string | null; source: string; detail: string };
+}
+
+/**
+ * **异步建树的结果**（0.3.70）。
+ *
+ * 只放面板渲染需要的东西：成功时的摘要（与原来的 HTTP 成功体同口径）+ 失败时的一句话。
+ * `at` 是**发起时刻**（不是完成时刻）：面板拿它跟自己那次请求的开始时间对，
+ * 判断"这是不是我刚发起的那一轮"，避免把上一轮的结果当成本轮的。
+ */
+export interface AiLastBuildView {
+  at: string;
+  projectId: string;
+  status: 'ok' | 'error' | 'denied' | 'aborted';
+  /** 失败/取消时的一句人话。 */
+  message?: string;
+  created?: number;
+  updated?: number;
+  removed?: number;
+  proposed?: number;
+  failures?: number;
+  notes?: string[];
+  cache?: {
+    state: 'hit' | 'resume' | 'miss';
+    savedTokens?: number;
+    changed?: { added: string[]; removed: string[]; changed: string[] };
+  };
 }
 
 /** 一次写入的对外结果（工具返回与 UI 都用它，保证行为一致 FR-71）。 */
@@ -966,6 +1000,25 @@ export class ProjectService {
    * 不该把自己没干的事说成在干（与 `aiRunProjectId` 的同一条口径）。
    */
   private aiBuildProjectId: string | null = null;
+  /**
+   * **上一轮建树的最终结果**（0.3.70，异步建树）。
+   *
+   * 为什么必须有：`POST /pm/ai/build` 改成立即返回后，"结果"不能再走 HTTP 响应 ——
+   * 长连接必被掐断（0.3.63 真机现场：请求挂了 **11 分 36 秒**后 `Failed to fetch`，
+   * 而树其实建好了）。结果落在服务内存里、随看板回传，面板据 `at` 判断
+   * "这是不是我刚发起的那一轮"。
+   *
+   * 生命周期：新一轮开始时清空；跑完写入；宿主重启即失效（面板会如实说"结果丢了"）。
+   */
+  private aiLastBuild: AiLastBuildView | null = null;
+  /**
+   * **异步建树的"已占位、还没进到运行态"标记**（0.3.70）。
+   *
+   * `startAiBuild` 是同步占位、后台开跑的：从"返回 started"到 `aiBuildTree` 内部
+   * 把 `aiBuildRunning` 置真，中间隔着几个 await（绑定项目）。没有这个标记，
+   * 两个几乎同时的请求都会通过闸门。
+   */
+  private aiBuildPendingToken: symbol | undefined;
   /**
    * **这一轮建树的实际用量**（提供方回报的真实 `usage`，分批时逐片累加）。
    *
@@ -6000,6 +6053,11 @@ export class ProjectService {
        * 只对这一轮建的那个项目为 true —— 别的项目不替它认这件事（同 `aiRun` 的口径）。
        */
       aiBuildRunning: this.aiBuildRunning && this.aiBuildProjectId === this.projectId,
+      /** 异步建树的结果（0.3.70）：只对这一轮建的那个项目可见。 */
+      aiLastBuild:
+        this.aiLastBuild !== null && this.aiLastBuild.projectId === this.projectId
+          ? this.aiLastBuild
+          : null,
       document: {
         path: this.deps.config.documentPath,
         exists: doc.exists,
@@ -6670,6 +6728,122 @@ export class ProjectService {
   }
 
   /**
+   * **异步发起一轮建树**（0.3.70）：立即返回 `started`，结果随看板回传。
+   *
+   * ## 为什么必须异步（0.3.63 的事实）
+   *
+   * 一次分批建树跑了 **11 分 36 秒**，浏览器/代理把长连接掐断 ⇒ 面板只拿到
+   * `Failed to fetch`，而树其实已经建好。**长连接必被掐，这与阶段快慢无关** ——
+   * 所以 `POST /pm/ai/build` 不该等结果：它只负责"占位 + 开跑 + 立刻返回"，
+   * 结果写进 `aiLastBuild`、进度写进 `aiRun`，都由面板轮询看板拿到。
+   *
+   * ## 占位为什么必须是同步的
+   *
+   * 从"返回 started"到内部把 `aiBuildRunning` 置真，中间隔着几个 await（绑定项目）。
+   * 没有 `aiBuildPendingToken`，两个几乎同时的请求会**同时通过单飞闸门**。
+   * 所以这里先在同步段占位，再把 token 交给 `aiBuildTree` 的闸门认领。
+   *
+   * @returns `started`（含发起时刻）；下一轮正在跑 ⇒ `denied`。
+   */
+  async startAiBuild(
+    input: Parameters<ProjectService['aiBuildTree']>[0],
+  ): Promise<
+    | { status: 'started'; at: string }
+    | { status: 'denied'; reason: string; hint: string }
+  > {
+    /**
+     * 估价请求必须走同步路径（它会**立即**返回 needs-confirm）。
+     * 这里显式拒绝，避免调用方误把"异步启动"当成估价。
+     */
+    if (input.estimateOnly === true || input.confirm === false) {
+      return {
+        status: 'denied',
+        reason: 'estimate-only',
+        hint: 'estimateOnly 请求请走 aiBuildTree（同步返回估价）。',
+      };
+    }
+    if (this.aiBuildRunning || this.aiBuildPendingToken !== undefined) {
+      return {
+        status: 'denied',
+        reason: 'build-in-progress',
+        hint:
+          '**有一轮建树正在跑**。等它结束（或先在面板上点"停止生成"）再发起新的 —— ' +
+          '两轮并行会互相覆盖，结果是一棵混合的树。',
+      };
+    }
+    const token = Symbol('ai-build');
+    const at = this.deps.clock.now();
+    this.aiBuildPendingToken = token;
+    /** 新一轮开始：上一轮结果立刻作废（面板靠 `at` 分辨，不留旧结果冒充新结果）。 */
+    this.aiLastBuild = null;
+    let projectId: string | undefined;
+    void this.aiBuildTree({
+      ...input,
+      __reserved: token,
+      onProjectBound: (bound) => {
+        projectId = bound;
+      },
+    })
+      .then((outcome) => {
+        this.aiLastBuild = this.summarizeAiBuild(outcome, projectId ?? this.projectId, at);
+      })
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        debugBus.error('ai', `异步建树异常：${message}`);
+        this.aiLastBuild = {
+          at,
+          projectId: projectId ?? this.projectId,
+          status: 'error',
+          message,
+        };
+      })
+      .finally(() => {
+        if (this.aiBuildPendingToken === token) this.aiBuildPendingToken = undefined;
+      });
+    debugBus.info('ai', `异步建树已开始（${at}）`);
+    return { status: 'started', at };
+  }
+
+  /** 把建树结果压成看板上的 `aiLastBuild`（成功摘要与原来的 HTTP 成功体同口径）。 */
+  private summarizeAiBuild(
+    outcome: Awaited<ReturnType<ProjectService['aiBuildTree']>>,
+    projectId: string,
+    at: string,
+  ): AiLastBuildView {
+    if (outcome.status === 'ok') {
+      return {
+        at,
+        projectId,
+        status: 'ok',
+        created: outcome.created,
+        updated: outcome.updated,
+        removed: outcome.removed,
+        proposed: outcome.proposed,
+        failures: outcome.failures.length,
+        notes: outcome.notes,
+        cache: outcome.cache,
+      };
+    }
+    if (outcome.status === 'denied') {
+      return { at, projectId, status: 'denied', message: `${outcome.hint}（${outcome.reason}）` };
+    }
+    if (outcome.status === 'error') {
+      return {
+        at,
+        projectId,
+        status: outcome.reason === 'aborted' ? 'aborted' : 'error',
+        message: outcome.message,
+      };
+    }
+    return {
+      at,
+      projectId,
+      status: 'error',
+      message: '仍在待确认状态（异步路径不应出现）',
+    };
+  }
+
+  /**
    * 用 AI 从仓库生成功能/任务树（FR-39 默认建树路径）。
    *
    * 两阶段：`confirm !== true` 只回成本预估；确认后才调用模型并落库。
@@ -6715,6 +6889,15 @@ export class ProjectService {
      * 不如把这件事说清楚并给用户一个"我就是要重算"的开关。
      */
     forceRebuild?: boolean;
+    /**
+     * **内部：异步启动的占位 token**（0.3.70）。
+     *
+     * 只有 `startAiBuild` 会传它；闸门据此区分"我占位的那一轮"与"别人插进来的调用"。
+     * 非法值等同没传（照样被闸门挡住）。
+     */
+    __reserved?: symbol;
+    /** **内部：绑定完成后回报项目 id**（异步启动据此把结果挂到正确的项目）。 */
+    onProjectBound?: (projectId: string) => void;
   }): Promise<
     | {
         status: 'needs-confirm';
@@ -6829,7 +7012,10 @@ export class ProjectService {
      * 落点锁也会互相覆盖。面板按钮会禁用，但**路由 / 工具 / 连点竞态**都可能绕过 UI，
      * 所以闸门必须落在服务层：第二次调用直接拒绝，并给一句能照做的提示。
      */
-    if (this.aiBuildRunning) {
+    if (
+      this.aiBuildRunning ||
+      (this.aiBuildPendingToken !== undefined && input.__reserved !== this.aiBuildPendingToken)
+    ) {
       return {
         status: 'denied',
         reason: 'build-in-progress',
@@ -6861,6 +7047,8 @@ export class ProjectService {
      * 面板的"正在生成"从这一刻起就该是真的（而不是等第一次模型调用）。
      */
     this.aiBuildProjectId = this.projectId;
+    /** 异步启动者要知道"这一轮落在谁身上"（0.3.70）—— 结果字段按项目过滤。 */
+    input.onProjectBound?.(this.projectId);
     const root = buildRoot;
     const route = resolveAiRoute({
       ctx: this.ctx,

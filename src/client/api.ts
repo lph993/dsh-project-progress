@@ -268,6 +268,11 @@ export type AiBuildOutcome =
       /** 旧宿主不返回它 → 面板按"未知/未命中"渲染，而不是崩。 */
       cache?: AiCacheView;
     }
+  /**
+   * **异步发起成功**（0.3.70）：宿主已占位并开跑，结果要看板上的 `aiLastBuild`。
+   * 收到它**不是**"建完了"，只是"开始了"—— 界面必须继续显示"正在生成"。
+   */
+  | { status: 'started'; at: string }
   | { status: 'denied'; reason: string; hint: string }
   | { status: 'error'; reason: string; message: string; rawText?: string }
   | {

@@ -35,3 +35,23 @@ export function isAiBuildGenerating(localBusy: boolean, board?: BuildStateSource
   if (board?.aiBuildRunning === true) return true;
   return board?.aiRun?.phase === 'running';
 }
+
+/**
+ * **这条结果是不是我刚发起的那一轮**（0.3.70，异步建树的收尾判据）。
+ *
+ * 异步之后结果走 `board.aiLastBuild`，而它是**服务级全局**的：上一轮的结果会一直留着，
+ * 直到下一轮开始。所以必须对时间 —— 只有 `aiLastBuild.at` 不早于我发起的那一刻，才算我的。
+ *
+ * 容差 2 秒：`at` 由宿主时钟生成、`startedAt` 由浏览器时钟生成，两者本来就可能差几百毫秒；
+ * 但**不能放宽到"分钟"** —— 那会把上一轮几分钟前的结果当成本轮的。
+ *
+ * @param lastBuildAt - 宿主给的发起时刻（ISO 串；可能缺失/不可解析）。
+ * @param startedAt - 本面板发起那一刻（epoch 毫秒）。
+ */
+export function isAiBuildResultFor(lastBuildAt: string | undefined, startedAt: number): boolean {
+  if (lastBuildAt === undefined || lastBuildAt === '') return false;
+  const at = Date.parse(lastBuildAt);
+  if (!Number.isFinite(at)) return false;
+  const toleranceMs = 2_000;
+  return at + toleranceMs >= startedAt;
+}

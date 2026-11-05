@@ -39,7 +39,7 @@ import {
 import { alertChipOf } from './alerts.ts';
 import { nodeCountLabel } from './labels.ts';
 import { dismissibleByBackdrop } from './modal-dismiss.ts';
-import { isAiBuildGenerating } from './build-state.ts';
+import { isAiBuildGenerating, isAiBuildResultFor } from './build-state.ts';
 import { refTypeOf, suggestNodeName } from './uncovered.ts';
 import { legendSections } from './legend.ts';
 import { FlowCanvas, type FlowOverlay, type RollbackChoice } from './flow-canvas.tsx';
@@ -1127,6 +1127,15 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
    * 树其实还在正常长），于是最自然的反应变成"再点一次"—— 白花一整轮的钱。
    */
   const [aiNotice, setAiNotice] = useState<string | undefined>(undefined);
+  /**
+   * **已收到 "started"、正在等宿主回结果的异步建树**（0.3.70）。
+   *
+   * 判据是 `at`（发起时刻）：只有 `aiLastBuild.at` 不早于它，才算"我这一轮"的结果 ——
+   * 否则上一轮的旧结果会被当成本轮结果弹出来。
+   */
+  const [aiAwaiting, setAiAwaiting] = useState<{ startedAt: number } | undefined>(undefined);
+  /** 本轮请求是否已转成"异步等待"（决定 `finally` 要不要关掉 `aiBusy`）。 */
+  const aiStartedAsync = useRef(false);
   /** 用户是否已经点过「停止生成」（用来把随后的中断/报错说成"已停止"，而不是失败）。 */
   const stopRequested = useRef(false);
   /**
@@ -1254,6 +1263,30 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         : '') +
     (value.notes.length > 0 ? `\n说明：${value.notes.join('；')}` : '');
 
+  /**
+   * 异步结果的文案（0.3.70）：`aiLastBuild` 是**扁平摘要**（不是原来的成功体），
+   * 所以字段都按"可能缺席"处理；口径与 `aiOkSummary` 完全一致，别让两条路径说法分叉。
+   */
+  const aiAsyncSummary = (value: {
+    created?: number;
+    updated?: number;
+    removed?: number;
+    proposed?: number;
+    failures?: number;
+    notes?: string[];
+    cache?: AiCacheView;
+  }): string =>
+    `AI 建树完成：新建 ${value.created ?? 0} 个、更新 ${value.updated ?? 0} 个` +
+    ((value.removed ?? 0) > 0 ? `、清掉草稿 ${value.removed} 枝` : '') +
+    `（模型提出 ${value.proposed ?? 0} 个节点）` +
+    ((value.failures ?? 0) > 0 ? `，失败 ${value.failures} 个` : '') +
+    (value.cache?.state === 'hit'
+      ? `\n本次命中缓存，没有调用模型（省约 ${value.cache.savedTokens ?? 0} token）。`
+      : value.cache?.state === 'resume'
+        ? `\n本次复用上次被中断的结果，没有调用模型。`
+        : '') +
+    ((value.notes?.length ?? 0) > 0 ? `\n说明：${(value.notes ?? []).join('；')}` : '');
+
   /** 用户点过「停止生成」之后的统一说法（不把它说成失败）。 */
   const aiStoppedNotice =
     '已停止生成：这一轮不再继续（已写入的节点会保留，已拿到的输出会存成续跑缓存）。';
@@ -1271,6 +1304,8 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
     setAiResult(undefined);
     setAiNotice(undefined);
     setAiPrompt(undefined);
+    setAiAwaiting(undefined);
+    aiStartedAsync.current = false;
     stopRequested.current = false;
     setAiBusy(true);
     void postAiBuild({
@@ -1284,6 +1319,19 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
         const stopped = stopRequested.current;
         stopRequested.current = false;
         const value = outcome.ok ? outcome.value : undefined;
+        /**
+         * **异步开工**（0.3.70）：宿主只回 `started`，结果要看板的 `aiLastBuild`。
+         *
+         * 这里**不能**把 `aiBusy` 关掉 —— 关了弹窗会立刻回到"空闲"，而树还在建。
+         * 记下发起时刻，等 `aiLastBuild.at` 追上它再收尾（见下面的 effect）。
+         */
+        if (value?.status === 'started') {
+          aiStartedAsync.current = true;
+          const startedAt = Date.parse(value.at);
+          setAiAwaiting({ startedAt: Number.isFinite(startedAt) ? startedAt : Date.now() });
+          setAiNotice('已开始建树：这一轮在宿主侧跑，进度见下方；结果出来会自动显示。');
+          return;
+        }
         /**
          * **成功优先**（0.3.64）：用户可能在最后一刻点了停止，而这一轮其实已经建完 ——
          * 那种情况必须如实报结果，不能把一次成功的建树写成"已停止"。
@@ -1361,8 +1409,54 @@ export function BoardView(props: BoardViewProps): React.ReactElement {
          */
         setAiPrompt({ description: value.description, route: value.route, cache: value.cache });
       })
-      .finally(() => setAiBusy(false));
+      .finally(() => {
+        /**
+         * 异步开工后**不能**在这里关 `aiBusy` —— 请求回了不等于建完了
+         * （0.3.70：这是"长连接必被掐断"的直接推论）。收尾交给结果 effect。
+         */
+        if (!aiStartedAsync.current) setAiBusy(false);
+      });
   }, [aiForceRebuild, aiReplaceDraft, refresh, sessionId]);
+
+  /**
+   * **收异步建树的结果**（0.3.70）：`POST /pm/ai/build` 只回 `started`，
+   * 结果由看板的 `aiLastBuild` 回传。
+   *
+   * 两件事必须做对：
+   * ① **只认"我这一轮"**：`aiLastBuild.at` 早于发起时刻 ⇒ 那是上一轮的旧结果，丢掉；
+   * ② **兜底**：宿主重启会让结果凭空消失，不能在面板上永远挂着"正在生成"。
+   */
+  useEffect(() => {
+    if (aiAwaiting === undefined) return;
+    const lastBuild = board?.aiLastBuild;
+    if (lastBuild !== undefined && lastBuild !== null) {
+      if (isAiBuildResultFor(lastBuild.at, aiAwaiting.startedAt)) {
+        setAiAwaiting(undefined);
+        setAiBusy(false);
+        stopRequested.current = false;
+        if (lastBuild.status === 'ok') {
+          setAiNotice(undefined);
+          setAiResult(aiAsyncSummary(lastBuild));
+          refresh();
+        } else if (lastBuild.status === 'aborted') {
+          setAiNotice(aiStoppedNotice);
+          refresh();
+        } else {
+          setAiNotice(undefined);
+          setAiError(lastBuild.message ?? '建树失败（宿主没有给出原因）');
+        }
+        return;
+      }
+    }
+    /** 宿主重启/结果丢失：10 分钟后不再假装"还在生成"。 */
+    if (Date.now() - aiAwaiting.startedAt > 10 * 60_000 && board?.aiBuildRunning !== true) {
+      setAiAwaiting(undefined);
+      setAiBusy(false);
+      setAiNotice(
+        '没有收到这一轮的结果（宿主可能重启过）—— 树可能已经建好，刷新看板确认后再决定要不要重来。',
+      );
+    }
+  }, [aiAwaiting, board?.aiBuildRunning, board?.aiLastBuild, refresh]);
 
   /**
    * 面板上那个按钮（0.3.21 起点一次就建）与旧宿主确认框的"确认"共用同一条路径 ——

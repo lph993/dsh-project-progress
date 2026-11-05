@@ -253,5 +253,31 @@ export interface BoardSnapshot {
    * 允许缺席：旧宿主不返回该字段 ⇒ 客户端退回 `aiRun.phase === 'running'` 的旧判据。
    */
   aiBuildRunning?: boolean;
+  /**
+   * **上一轮建树的最终结果**（0.3.70，异步建树）。
+   *
+   * `POST /pm/ai/build` 现在只回 `started`，结果由这里回传（长连接必被掐，这是 0.3.63 的教训）。
+   * `at` 是**发起时刻**：面板拿它跟自己那次请求的开始时间对，判断"这是不是我这一轮"。
+   *
+   * 允许缺席：旧宿主不返回 ⇒ 面板退回"等同步响应"的老路径。
+   */
+  aiLastBuild?: {
+    at: string;
+    projectId: string;
+    status: 'ok' | 'error' | 'denied' | 'aborted';
+    message?: string;
+    created?: number;
+    updated?: number;
+    removed?: number;
+    proposed?: number;
+    failures?: number;
+    notes?: string[];
+    cache?: {
+      state: 'hit' | 'resume' | 'miss';
+      savedTokens?: number;
+      changed?: { added: string[]; removed: string[]; changed: string[] };
+      changedPaths?: { added: string[]; removed: string[]; changed: string[] };
+    };
+  } | null;
 }
 

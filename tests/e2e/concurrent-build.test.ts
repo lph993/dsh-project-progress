@@ -356,3 +356,68 @@ test('建树在跑但当前没有 abort 控制器 ⇒ 取消仍然必须生效�
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+
+/**
+ * **异步建树的取消**（0.3.70）：面板点「停止生成」之后，结果要以 `aborted` 落进 `aiLastBuild`。
+ *
+ * 异步之后"取消"是唯一的止损方式（HTTP 早就返回了），所以它必须能被面板看见 ——
+ * 否则用户点完停止，面板只能靠猜。
+ */
+test('异步建树：取消后 aiLastBuild 记为 aborted，闸门释放', async () => {
+  const workspace = mkdtempSync(join(tmpdir(), 'pm-async-cancel-'));
+  mkdirSync(join(workspace, 'web'), { recursive: true });
+  writeFileSync(join(workspace, 'web', 'index.ts'), 'export const a = 1;\n');
+
+  const ctx = createFakeContext({ workspace });
+  ctx.services.set('agentDefaultModel', { currentSelection: () => ({ provider: 'p', model: 'm' }) });
+  let gateResolve: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    gateResolve = resolve;
+  });
+  let entered = false;
+  ctx.services.set('llm', {
+    stream: () => {
+      entered = true;
+      return (async function* () {
+        await gate;
+        for await (const chunk of streamOf(okTree('异步取消'))) yield chunk;
+      })();
+    },
+  });
+  const module = (await import('../../lib/index.js')) as {
+    apply(ctx: unknown, config: unknown): Promise<void>;
+  };
+  await module.apply(ctx, {});
+  const service = ctx.services.get('projectManager') as {
+    noteWorkspaceRoot(root: string | undefined): void;
+    startAiBuild(input: Record<string, unknown>): Promise<{ status: string }>;
+    cancelAiBuild(): { cancelled: boolean };
+    board(): Promise<{
+      aiBuildRunning: boolean;
+      aiLastBuild: { status: string; message?: string } | null;
+    }>;
+  };
+  service.noteWorkspaceRoot(workspace);
+
+  const started = await service.startAiBuild({ confirm: true });
+  assert.equal(started.status, 'started');
+  for (let i = 0; i < 200 && !entered; i += 1) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(entered, true, '前置条件：后台必须已经进入模型调用');
+  assert.equal((await service.board()).aiBuildRunning, true);
+
+  assert.deepEqual(service.cancelAiBuild(), { cancelled: true });
+  gateResolve?.();
+
+  let last: { status: string; message?: string } | null = null;
+  for (let i = 0; i < 300; i += 1) {
+    last = (await service.board()).aiLastBuild;
+    if (last !== null) break;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.ok(last, '取消之后也必须留下一个结果（否则面板收不了尾）');
+  assert.equal(last?.status, 'aborted', `取消要如实记为 aborted：${JSON.stringify(last)}`);
+  assert.equal((await service.board()).aiBuildRunning, false, '闸门必须释放');
+
+  ctx.disposeAll();
+  rmSync(workspace, { recursive: true, force: true });
+});

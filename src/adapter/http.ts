@@ -340,11 +340,19 @@ export function registerRoutes(
           }
 
           case 'POST /pm/ai/build': {
-            // 两阶段：confirm!==true 只回成本预估；确认后才真的调模型并落库。
-            // 确认人是面板前的用户（§6.7f 第 2 行）；模型侧走不到这里（只有 pm_* 工具）。
+            /**
+             * **异步发起**（0.3.70）：确认建树后**立即返回 `started`**，
+             * 结果随看板的 `aiLastBuild` 回传、进度随 `aiRun` 回传。
+             *
+             * 为什么不再等结果：一次分批建树跑过 **11 分 36 秒**，浏览器/代理把长连接掐断 ⇒
+             * 面板只拿到 `Failed to fetch`，而树其实建好了（0.3.63 真机）。长连接必被掐。
+             *
+             * 只估价（`confirm:false` / `estimateOnly:true`）仍走同步路径 —— 它本来就不调模型。
+             */
             const body = (await readBody(request)).trim();
             let parsed: {
               confirm?: unknown;
+              estimateOnly?: unknown;
               maxNodes?: unknown;
               sessionId?: unknown;
               replaceAutoDraft?: unknown;
@@ -362,14 +370,17 @@ export function registerRoutes(
               typeof parsed.sessionId === 'string' && parsed.sessionId !== ''
                 ? parsed.sessionId
                 : (params.get('sessionId') ?? undefined);
-            const outcome = await service.aiBuildTree({
-              confirm: parsed.confirm === true,
+            const common = {
               ...(sessionId !== undefined ? { sessionId } : {}),
               ...(typeof parsed.maxNodes === 'number' ? { maxNodes: parsed.maxNodes } : {}),
               ...(parsed.replaceAutoDraft === false ? { replaceAutoDraft: false } : {}),
               // T6 逃生口：忽略缓存强制重算（面板上是个明确的勾选框）
               ...(parsed.forceRebuild === true ? { forceRebuild: true } : {}),
-            });
+            };
+            const estimateOnly = parsed.estimateOnly === true || parsed.confirm === false;
+            const outcome = estimateOnly
+              ? await service.aiBuildTree({ ...common, confirm: false })
+              : await service.startAiBuild({ ...common, confirm: true });
             if (outcome.status === 'needs-confirm') {
               debugBus.info('ai', `AI 建树待确认：${outcome.description}`, { route: outcome.route });
             }

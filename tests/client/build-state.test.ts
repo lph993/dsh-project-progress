@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { isAiBuildGenerating } from '../../src/client/build-state.ts';
+import { isAiBuildGenerating, isAiBuildResultFor } from '../../src/client/build-state.ts';
 
 test('本面板那次请求还在飞 ⇒ 正在生成', () => {
   assert.equal(isAiBuildGenerating(true), true);
@@ -50,3 +50,35 @@ test('别的项目在建树时本项目的看板为 false（按项目过滤由�
     '宿主对"不是这一轮的那个项目"如实回 false，客户端不许自行推断',
   );
 });
+
+/**
+ * **异步建树的收尾判据**（0.3.70）：`aiLastBuild` 是全局的，上一轮结果会一直留着 ——
+ * 面板必须靠"发起时刻"分辨"这是不是我这一轮的结果"。
+ */
+test('异步结果归属：只认不早于发起时刻的结果（容忍 2 秒时钟差）', () => {
+  const startedAt = Date.parse('2026-11-05T00:00:10.000Z');
+  assert.equal(
+    isAiBuildResultFor('2026-11-05T00:00:10.000Z', startedAt),
+    true,
+    '同一时刻：是我的',
+  );
+  assert.equal(
+    isAiBuildResultFor('2026-11-05T00:00:12.000Z', startedAt),
+    true,
+    '完成时间晚于发起：当然是我的',
+  );
+  assert.equal(
+    isAiBuildResultFor('2026-11-05T00:00:08.500Z', startedAt),
+    true,
+    '2 秒内的时钟差要容忍（宿主/浏览器时钟不可能完全一致）',
+  );
+  assert.equal(
+    isAiBuildResultFor('2026-11-04T23:50:00.000Z', startedAt),
+    false,
+    '十分钟前的结果 —— 那是上一轮的，不能拿它收尾',
+  );
+  assert.equal(isAiBuildResultFor(undefined, startedAt), false);
+  assert.equal(isAiBuildResultFor('', startedAt), false);
+  assert.equal(isAiBuildResultFor('不是时间', startedAt), false, '解析不了 ⇒ 不认（不猜）');
+});
+
