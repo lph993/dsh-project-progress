@@ -37,7 +37,7 @@ DSH 双面插件（Host 面 + Web Client 面），随 Host 侧 `0.2.x` 系列验
 ```powershell
 pnpm install
 pnpm run build          # tsdown + 包装 client bundle + 产物自检 + 两侧类型检查
-pnpm run test           # 750 个测试（领域单测 + 端到端；`node --test` 直跑 TS 源码）
+pnpm run test           # 754 个测试（领域单测 + 端到端；`node --test` 直跑 TS 源码）
 pnpm run watch          # 重建 client bundle + host 产物（开发循环见 docs/开发须知.md，**还需另起 wrap watcher**）
 ```
 
@@ -195,6 +195,7 @@ src/
 
 本插件是辅助工具，**不保证任何结果**；百分比为估算值，回滚不保证完整恢复。
 请自行核实并承担后果。完整声明见 `立项.md` §0.1 与设置页「诊断」上方。
+
 
 
 

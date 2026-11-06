@@ -6816,6 +6816,21 @@ export class ProjectService {
     at: string,
   ): AiLastBuildView {
     if (outcome.status === 'ok') {
+      /**
+       * **失败节点要有可追溯的落点**（0.3.75）：`aiLastBuild` 只带前 5 条样例，
+       * 而诊断页能看到全部 —— 39 个失败到底是什么，翻 `/pm/debug` 的日志就有答案。
+       */
+      if (outcome.failures.length > 0) {
+        debugBus.warn(
+          'ai',
+          `建树失败 ${outcome.failures.length} 个节点：` +
+            outcome.failures
+              .slice(0, 10)
+              .map((failure) => `${failure.name}（${failure.reason}）`)
+              .join('；') +
+            (outcome.failures.length > 10 ? ' …' : ''),
+        );
+      }
       return {
         at,
         projectId,
@@ -10007,17 +10022,21 @@ export class ProjectService {
         replaceAutoDraft: false,
       });
 
-      /** 再算一次：还剩几个目录没覆盖。 */
+      /** 再算一次：还剩哪几个目录没覆盖（0.3.75：点名，并做大小写归一 —— Windows 上
+       *  目录名 `Updater-Go` 与 refs 里写的 `updater-go` 是同一个目录，精确比较会误报"仍缺"）。 */
       const after = await this.derive(input.sessionId);
+      const normDir = (value: string): string =>
+        value.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
       const refsAfter = Object.values(after.graph.nodes)
         .filter((node) => {
           const state = after.derived.nodes.get(node.id);
           return state !== undefined && state.derivedState !== 'removed';
         })
-        .flatMap((node) => (node.refs ?? []).map((ref) => String(ref.target).replace(/\\/g, '/').replace(/\/+$/, '')));
-      const stillMissing = topDirs.filter(
-        (dir) => !refsAfter.some((ref) => ref === dir || ref.startsWith(`${dir}/`)),
-      ).length;
+        .flatMap((node) => (node.refs ?? []).map((ref) => normDir(String(ref.target))));
+      const stillMissingDirs = topDirs.filter(
+        (dir) => !refsAfter.some((ref) => ref === normDir(dir) || ref.startsWith(`${normDir(dir)}/`)),
+      );
+      const stillMissing = stillMissingDirs.length;
 
       return {
         status: 'ok',
@@ -10029,6 +10048,7 @@ export class ProjectService {
           `（新建 ${applied.created} 个节点）` +
           (uncovered.length > targets.length ? `；另有 ${uncovered.length - targets.length} 个超出单次上限未补` : '') +
           `；补完后仍缺 ${stillMissing} 个` +
+          (stillMissingDirs.length > 0 ? `（${stillMissingDirs.join('、')}）` : '') +
           (landingNote !== undefined ? `。${landingNote}` : ''),
       };
     } catch (error) {
