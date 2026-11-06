@@ -6155,7 +6155,7 @@ test('异步建树：POST 立即返回 started，结果随 aiLastBuild 回传（
     noteWorkspaceRoot(root: string | undefined): void;
     board(): Promise<{
       aiBuildRunning: boolean;
-      aiLastBuild: { status: string; created?: number; at: string } | null;
+      aiLastBuild: { status: string; created?: number; at: string; notes?: string[] } | null;
     }>;
   };
   service.noteWorkspaceRoot(workspace);
@@ -6228,6 +6228,11 @@ test('异步建树：POST 立即返回 started，结果随 aiLastBuild 回传（
   assert.ok(last, '后台跑完之后 aiLastBuild 必须有值（否则面板永远收不了尾）');
   assert.equal(last?.status, 'ok');
   assert.equal(last?.created, 1);
+  /** 0.3.74：建树自己报形状与覆盖，不许等人另外写脚本。 */
+  assert.ok(
+    (last?.notes ?? []).some((note) => note.includes('树验收：')),
+    `建树说明里必须有「树验收」这一行（实际：${JSON.stringify(last?.notes)}）`,
+  );
   assert.equal((await service.board()).aiBuildRunning, false, '结束后必须回到空闲');
 
   ctx.disposeAll();
@@ -6327,3 +6332,4 @@ test('POST /pm/ai/repair：只提议不改树，坏提议进 rejected（0.3.71�
   ctx.disposeAll();
   rmSync(workspace, { recursive: true, force: true });
 });
+

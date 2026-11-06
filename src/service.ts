@@ -212,6 +212,7 @@ import {
 import { AI_REPAIR_SYSTEM_PROMPT, buildRepairPrompt, type RepairNodeView } from './ai/repair.ts';
 import { parseRepairPlan, type RepairParseResult } from './ai/repair-parse.ts';
 import { planConsolidation, type ConsolidateNode, type ConsolidatePlan } from './domain/consolidate.ts';
+import { describeTreeShape, summarizeTreeShape } from './domain/tree-shape.ts';
 import {
   coreNameOf,
   decideRootNormalize,
@@ -7406,6 +7407,17 @@ export class ProjectService {
      * **只报，不改**：体检与修复是两个入口，混在一起出了错就分不清是谁干的。
      */
     const healthLine = await this.treeHealthSummary(input.sessionId, root);
+    /**
+     * **建树自己报"合不合适"**（0.3.74）：形状（根/最宽/深度）+ 文件覆盖，写进说明。
+     *
+     * 真机教训：updater 那次建树报"新建 20、失败 39"，看起来完成了，实际根下 14 支、
+     * 覆盖 82.4% —— 当时是人另外写脚本才算出来的。用户的问题"什么时候算合适"，
+     * 插件自己必须能答。
+     */
+    await this.ensureLanding(root);
+    const shapeLine = describeTreeShape(
+      summarizeTreeShape((await this.derive(input.sessionId)).graph, collected.entries),
+    );
     return {
       status: 'ok',
       projectName: applied.projectName,
@@ -7418,6 +7430,7 @@ export class ProjectService {
         ...applied.notes,
         ...(normalized.moved > 0 ? [`根节点归位：${normalized.reason}`] : []),
         ...(healthLine !== undefined ? [healthLine] : []),
+        shapeLine,
         ...(cache.diff && cache.diff.dirty
           ? [
               `增量：相比上次建树，文件新增 ${cache.diff.added.length}、删除 ${cache.diff.removed.length}、内容变化 ${cache.diff.changed.length}。`,
@@ -7987,6 +8000,17 @@ export class ProjectService {
       '分片总耗时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's：' + marks.join(' / '),
     );
     if (shardedHealth !== undefined) notes.push(shardedHealth);
+    /**
+     * **建树自己报"合不合适"**（0.3.74）：形状 + 文件覆盖。
+     *
+     * 分片建完是"各片并起来"的树，最容易出现**根下摊平**（每片各贡献几个一级节点）——
+     * 这一步就是让数字直接出现在说明里，不合格时点名，而不是等人去写脚本。
+     */
+    await this.ensureLanding(input.root);
+    const shapeGraph = (await this.derive(input.sessionId)).graph;
+    notes.push(
+      describeTreeShape(summarizeTreeShape(shapeGraph, input.entries ?? input.skeleton)),
+    );
     notes.push(
       '分批路径**不写整份树缓存**（没有"一份提示词对应一棵树"的产物），所以下次会重新调用模型 —— ' +
         '这是刻意的：宁可慢，也不要下次命中一棵不完整的树。',
