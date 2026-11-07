@@ -18,7 +18,8 @@
     "lib/client.js",
     "cordis.patch.yml",
     "CHANGELOG.md",
-    "docs/"
+    "docs/README.md",
+    "docs/开发须知.md"
   ],
   "dsh": {
     "client": {
