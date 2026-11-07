@@ -34,6 +34,23 @@ DSH 双面插件（Host 面 + Web Client 面），随 Host 侧 `0.2.x` 系列验
 
 ## 1. 快速开始
 
+### 1.1 装（使用者）
+
+已发布到 npm：<https://www.npmjs.com/package/dsh-project-progress>
+
+```powershell
+dsh plugin --profile <你的 profile> add dsh-project-progress
+# 想钉版本：dsh plugin --profile <你的 profile> add dsh-project-progress@0.3.75
+```
+
+`dsh plugin` 只是把参数转给 profile 目录里的 `pnpm add`，所以**走本机配置的 registry**
+（国内多半是 npmmirror 镜像）。装完**重启宿主**；之后 client 面改动刷新页面即生效。
+
+> 这个包同时是 DSH 的 bundle 与 client 插件（`package.json` 里 `dsh.bundle.patch` +
+> `dsh.client`），所以一条 `add` 就够，不需要再单独装前端。
+
+### 1.2 改（贡献者）
+
 ```powershell
 pnpm install
 pnpm run build          # tsdown + 包装 client bundle + 产物自检 + 两侧类型检查
@@ -41,7 +58,7 @@ pnpm run test           # 754 个测试（领域单测 + 端到端；`node --tes
 pnpm run watch          # 重建 client bundle + host 产物（开发循环见 docs/开发须知.md，**还需另起 wrap watcher**）
 ```
 
-装入 profile 并重启：
+把**本仓库**（而不是 npm 包）装进 profile：
 
 ```powershell
 dsh plugin --profile desktop add '<本仓库路径>'
